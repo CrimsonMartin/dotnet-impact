@@ -8,16 +8,19 @@ import {
   buildProjectGraph,
   ProjectGraph,
   ProjectInfo,
+  projectForFile,
   testProjects,
 } from "./projects";
 import { ImpactMap } from "./map";
-import { exec, git, toRepoRelative } from "./util";
+import { classFilter, exec, git, parseStatusZ, toRepoRelative } from "./util";
 import { ensureShadow, Shadow, syncOverlay } from "./worktree";
 
 export interface TestOutcome {
   classFqn: string;
   method: string;
   passed: boolean;
+  /** Test was skipped (e.g. [Fact(Skip=...)]); passed is false but it is not a failure. */
+  skipped: boolean;
   message?: string;
   durationMs?: number;
 }
@@ -38,6 +41,9 @@ export interface AffectedSet {
   /** Owning test project (repo-relative csproj) for classes not yet in the map. */
   classOwners?: Record<string, string>;
 }
+
+/** Unmapped changed files that justify project-level fallback runs. */
+const FALLBACK_FILE_RE = /\.(cs|csproj|props|targets|config|resx|json|xml|razor|cshtml)$/i;
 
 export class Runner {
   readonly map: ImpactMap;
@@ -68,15 +74,20 @@ export class Runner {
   /** Changed files vs a git base ref plus uncommitted changes (repo-relative). */
   async changedFiles(base?: string, stagedOnly = false): Promise<string[]> {
     const files = new Set<string>();
+    // -z everywhere: NUL separators, no quoting of paths with spaces/specials.
     if (base) {
-      const res = await git(this.repoRoot, ["diff", "--name-only", base]);
-      for (const f of res.stdout.split(/\r?\n/)) if (f.trim()) files.add(f.trim());
+      const res = await git(this.repoRoot, ["diff", "--name-only", "-z", base]);
+      for (const f of res.stdout.split("\0")) if (f) files.add(f);
     }
-    const flags = stagedOnly ? ["diff", "--name-only", "--cached"] : ["status", "--porcelain"];
-    const res = await git(this.repoRoot, flags);
-    for (const line of res.stdout.split(/\r?\n/)) {
-      const f = stagedOnly ? line.trim() : line.slice(3).trim();
-      if (f) files.add(f);
+    if (stagedOnly) {
+      const res = await git(this.repoRoot, ["diff", "--name-only", "-z", "--cached"]);
+      for (const f of res.stdout.split("\0")) if (f) files.add(f);
+    } else {
+      const res = await git(this.repoRoot, ["status", "--porcelain", "-z", "--untracked-files=all"]);
+      for (const e of parseStatusZ(res.stdout)) {
+        files.add(e.file);
+        if (e.origin) files.add(e.origin); // a rename's old path still affects its tests
+      }
     }
     return [...files];
   }
@@ -84,14 +95,23 @@ export class Runner {
   computeAffected(changedFiles: string[]): AffectedSet {
     const graph = this.projectGraph();
     const unknown: string[] = [];
-    const rel = changedFiles.map((f) =>
-      path.isAbsolute(f) ? toRepoRelative(this.repoRoot, f) : f.split(path.sep).join("/")
-    );
+    const rel = changedFiles
+      .map((f) =>
+        path.isAbsolute(f) ? toRepoRelative(this.repoRoot, f) : f.split(path.sep).join("/")
+      )
+      // Build outputs are never inputs; a repo without bin/obj gitignored must
+      // not have generated files (obj/*.cs, deps.json, ...) drive selection.
+      .filter((f) => !/(^|\/)(bin|obj)\//i.test(f));
     const classes = this.map.affectedClasses(rel, unknown);
 
     const fallback = new Map<string, ProjectInfo>();
     for (const f of unknown) {
-      for (const p of affectedTestProjects(graph, path.join(this.repoRoot, f))) {
+      if (!FALLBACK_FILE_RE.test(f)) continue;
+      const abs = path.join(this.repoRoot, f);
+      // Non-.cs files (project files, config) only trigger fallback when they
+      // belong to a project; stray repo-root json/xml shouldn't run everything.
+      if (!/\.cs$/i.test(f) && !projectForFile(graph, abs)) continue;
+      for (const p of affectedTestProjects(graph, abs)) {
         fallback.set(p.csproj.toLowerCase(), p);
       }
     }
@@ -122,10 +142,9 @@ export class Runner {
     }
 
     for (const [csproj, classes] of byProject) {
-      const filter = classes.map((c) => `FullyQualifiedName~${c}`).join("|");
       const res = await this.dotnetTest(this.shadowPath(path.join(this.repoRoot, csproj)), [
         "--filter",
-        filter,
+        classFilter(classes),
       ]);
       ok = ok && res.ok;
       output += res.output;
@@ -269,10 +288,12 @@ export function parseTrx(trxPath: string): TestOutcome[] {
       classByTestId.get(r["@_testId"]) ??
       testName.replace(/\(.*\)$/s, "").split(".").slice(0, -1).join(".");
     const duration: string | undefined = r["@_duration"];
+    const outcome: string = r["@_outcome"] ?? "";
     outcomes.push({
       classFqn: cls,
       method: testName,
-      passed: r["@_outcome"] === "Passed",
+      passed: outcome === "Passed",
+      skipped: outcome === "NotExecuted" || outcome === "Skipped" || outcome === "Inconclusive",
       message: r?.Output?.ErrorInfo?.Message
         ? decodeXml(String(r.Output.ErrorInfo.Message))
         : undefined,

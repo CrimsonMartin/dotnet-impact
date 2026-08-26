@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import { cacheDirFor, git } from "./util";
+import { cacheDirFor, git, parseStatusZ, StatusEntry } from "./util";
 
 export interface Shadow {
   repoRoot: string;
@@ -40,21 +40,9 @@ export async function ensureShadow(repoRoot: string): Promise<Shadow> {
   return { repoRoot, dir };
 }
 
-interface DirtyEntry {
-  status: string;
-  file: string;
-}
-
-async function dirtyFiles(repoRoot: string): Promise<DirtyEntry[]> {
+async function dirtyFiles(repoRoot: string): Promise<StatusEntry[]> {
   const res = await git(repoRoot, ["status", "--porcelain", "-z", "--untracked-files=all"]);
-  const entries: DirtyEntry[] = [];
-  for (const chunk of res.stdout.split("\0")) {
-    if (chunk.length < 4) continue;
-    const status = chunk.slice(0, 2);
-    const file = chunk.slice(3);
-    entries.push({ status, file });
-  }
-  return entries;
+  return parseStatusZ(res.stdout);
 }
 
 /**
@@ -74,7 +62,16 @@ export async function syncOverlay(shadow: Shadow): Promise<string[]> {
   const dirty = await dirtyFiles(shadow.repoRoot);
   const current = new Set<string>();
 
-  for (const { status, file } of dirty) {
+  for (const { status, file, origin } of dirty) {
+    // A rename's origin no longer exists in the real tree; remove it in the shadow.
+    if (origin && status.includes("R")) {
+      try {
+        fs.rmSync(path.join(shadow.dir, origin), { force: true });
+      } catch {
+        /* ignore */
+      }
+      current.add(origin);
+    }
     // Skip anything inside our own cache, and gitignored noise never appears here.
     const src = path.join(shadow.repoRoot, file);
     const dst = path.join(shadow.dir, file);

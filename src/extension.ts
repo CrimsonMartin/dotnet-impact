@@ -5,13 +5,15 @@ import { discoverTestClasses } from "./core/discover";
 import { locateClasses, locateMethod, SourceLocation } from "./core/locate";
 import { testProjects } from "./core/projects";
 import { AffectedSet, Runner, TestOutcome } from "./core/runner";
-import { cacheDirFor, toRepoRelative } from "./core/util";
+import { cacheDirFor, setDotnetPath, toRepoRelative } from "./core/util";
 
 let runner: Runner | undefined;
 let controller: vscode.TestController | undefined;
 let statusBar: vscode.StatusBarItem;
 let output: vscode.OutputChannel;
 let mapBuildCancelled = false;
+/** Active continuous-run sessions; while > 0 the plain auto-run-on-save listener stands down. */
+let continuousSessions = 0;
 
 /** class FQN -> repo-relative csproj of the owning test project */
 const classOwners = new Map<string, string>();
@@ -23,6 +25,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   if (!ws) return;
   const repoRoot = ws.uri.fsPath;
   runner = new Runner(repoRoot);
+
+  const applyDotnetPath = () =>
+    setDotnetPath(vscode.workspace.getConfiguration("dotnetImpact").get<string>("dotnetPath", ""));
+  applyDotnetPath();
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration("dotnetImpact.dotnetPath")) applyDotnetPath();
+    })
+  );
 
   output = vscode.window.createOutputChannel("dotnet-impact");
   statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
@@ -64,6 +75,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(
     vscode.workspace.onDidSaveTextDocument((doc) => {
       if (!doc.fileName.endsWith(".cs")) return;
+      if (continuousSessions > 0) return; // continuous run already watches saves
       if (!vscode.workspace.getConfiguration("dotnetImpact").get<boolean>("autoRunOnSave", true))
         return;
       pending.add(doc.fileName);
@@ -120,6 +132,14 @@ async function eagerDiscover(): Promise<void> {
     fs.writeFileSync(discoveryCachePath(), JSON.stringify(discovered, null, 1));
     rebuildTree(discovered);
     updateStatus(`${classOwners.size} test classes`);
+
+    // Auto-build the map for any classes it doesn't cover yet.
+    const cfg = vscode.workspace.getConfiguration("dotnetImpact");
+    const unmapped = [...classOwners.keys()].filter((c) => !runner!.map.has(c));
+    if (cfg.get<boolean>("autoBuildMap", true) && unmapped.length > 0) {
+      output.appendLine(`auto-building impact map for ${unmapped.length} unmapped test classes`);
+      void buildMapWithProgress(vscode.ProgressLocation.Window);
+    }
   } catch (e) {
     updateStatus("discovery error");
     output.appendLine(String(e));
@@ -180,11 +200,15 @@ async function runHandler(
 
   if (request.continuous) {
     // Native continuous run: watch saves until the user toggles the eye off.
+    continuousSessions++;
     const listener = vscode.workspace.onDidSaveTextDocument(async (doc) => {
       if (!doc.fileName.endsWith(".cs")) return;
       await executeRun(request, [doc.fileName]);
     });
-    token.onCancellationRequested(() => listener.dispose());
+    token.onCancellationRequested(() => {
+      continuousSessions--;
+      listener.dispose();
+    });
     return;
   }
 
@@ -219,14 +243,17 @@ async function executeRun(
 
     for (const cls of affected.classes) {
       const item = findClassItem(cls);
-      if (item) run.enqueued(item);
+      if (item) {
+        run.enqueued(item);
+        run.started(item);
+      }
     }
     const result = await runner.runAffected(affected);
     reportOutcomes(run, result.outcomes);
     updateStatus(
       result.ok
         ? `✓ ${result.outcomes.length} tests (${affected.classes.length} classes)`
-        : `✗ ${result.outcomes.filter((o) => !o.passed).length} failing`
+        : `✗ ${result.outcomes.filter((o) => !o.passed && !o.skipped).length} failing`
     );
     output.appendLine(result.output);
   } catch (e) {
@@ -281,9 +308,11 @@ function reportOutcomes(run: vscode.TestRun, outcomes: TestOutcome[]): void {
     if (!classItem) continue;
 
     const methodItem = ensureMethodItem(classItem, cls, methodFqn);
-    const failed = results.filter((r) => !r.passed);
+    const failed = results.filter((r) => !r.passed && !r.skipped);
     const duration = results.reduce((s, r) => s + (r.durationMs ?? 0), 0);
-    if (failed.length === 0) {
+    if (results.every((r) => r.skipped)) {
+      run.skipped(methodItem);
+    } else if (failed.length === 0) {
       run.passed(methodItem, duration);
     } else {
       const msg = failed.map((f) => `${f.method}: ${f.message ?? "failed"}`).join("\n");
@@ -350,34 +379,43 @@ async function runAffectedNow(): Promise<void> {
   await executeRun(new vscode.TestRunRequest(), undefined);
 }
 
-async function buildMapWithProgress(): Promise<void> {
-  if (!runner) return;
+let mapBuilding = false;
+
+async function buildMapWithProgress(
+  location: vscode.ProgressLocation = vscode.ProgressLocation.Notification
+): Promise<void> {
+  if (!runner || mapBuilding) return;
+  mapBuilding = true;
   mapBuildCancelled = false;
-  await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: "dotnet-impact: building impact map",
-      cancellable: true,
-    },
-    async (progress, token) => {
-      token.onCancellationRequested(() => (mapBuildCancelled = true));
-      await runner!.prepare();
-      const res = await runner!.buildMap({
-        shouldCancel: () => mapBuildCancelled,
-        onProgress: (done, total, current) => {
-          progress.report({
-            message: `${done + 1}/${total} ${current}`,
-            increment: 100 / Math.max(total, 1),
-          });
-        },
-      });
-      updateStatus(`map: ${runner!.map.classCount} classes`);
-      if (res.failed.length > 0) {
-        output.appendLine(`map build finished with ${res.failed.length} failures:`);
-        for (const f of res.failed) output.appendLine(`  ${f}`);
+  try {
+    await vscode.window.withProgress(
+      {
+        location,
+        title: "dotnet-impact: building impact map",
+        cancellable: location === vscode.ProgressLocation.Notification,
+      },
+      async (progress, token) => {
+        token.onCancellationRequested(() => (mapBuildCancelled = true));
+        await runner!.prepare();
+        const res = await runner!.buildMap({
+          shouldCancel: () => mapBuildCancelled,
+          onProgress: (done, total, current) => {
+            progress.report({
+              message: `${done + 1}/${total} ${current}`,
+              increment: 100 / Math.max(total, 1),
+            });
+          },
+        });
+        updateStatus(`map: ${runner!.map.classCount} classes`);
+        if (res.failed.length > 0) {
+          output.appendLine(`map build finished with ${res.failed.length} failures:`);
+          for (const f of res.failed) output.appendLine(`  ${f}`);
+        }
       }
-    }
-  );
+    );
+  } finally {
+    mapBuilding = false;
+  }
 }
 
 export function deactivate(): void {

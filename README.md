@@ -33,8 +33,10 @@ Native Test Explorer integration via the `TestController` API — no custom UI:
 - **Continuous run** — toggle the "eye" on the *Affected tests* profile and affected
   tests re-run on every `.cs` save (also available as plain auto-run-on-save via
   `dotnetImpact.autoRunOnSave`).
-- `dotnet-impact: Build impact map (background)` — initial map build with progress +
-  cancellation.
+- **Automatic map build** — on workspace open, any test classes missing from the map
+  are mapped in the background (status-bar progress; disable via
+  `dotnetImpact.autoBuildMap`). `dotnet-impact: Build impact map (background)` runs
+  the same thing on demand with a cancellable progress notification.
 - `dotnet-impact: Run affected tests now` — affected set for the current dirty files.
 - Status bar shows the last run's result.
 
@@ -70,6 +72,7 @@ scoped to the blast radius of the change, instead of a full CI cycle.
 ```
 npm install
 npm run compile     # or: npm run watch
+npm test            # unit tests (node --test) over the parsing/selection core
 ```
 
 Launch the extension with F5 (Extension Development Host). The shadow worktree and map

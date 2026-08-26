@@ -68,10 +68,12 @@ async function main(): Promise<number> {
             : "")
       );
       const result = await runner.runAffected(affected);
-      const failed = result.outcomes.filter((o) => !o.passed);
+      const failed = result.outcomes.filter((o) => !o.passed && !o.skipped);
+      const skipped = result.outcomes.filter((o) => o.skipped);
       for (const f of failed) console.error(`FAIL ${f.method}\n  ${f.message ?? ""}`);
       console.log(
-        `${result.outcomes.length - failed.length}/${result.outcomes.length} passed` +
+        `${result.outcomes.length - failed.length - skipped.length}/${result.outcomes.length} passed` +
+          (skipped.length ? `, ${skipped.length} skipped` : "") +
           (result.ok ? "" : " — FAILED")
       );
       if (!result.ok && result.outcomes.length === 0) console.error(result.output);

@@ -2,9 +2,13 @@
   "name": "dotnet-impact",
   "displayName": "dotnet-impact — affected-test runner for .NET",
   "description": "NCrunch-style impacted-test selection for .NET: builds a per-test-class coverage map in a background git worktree, then runs only the tests affected by your change. Includes a CLI for pre-commit hooks and AI coding agents.",
-  "version": "0.0.1",
+  "version": "0.0.4",
   "publisher": "crimsonmartin",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/CrimsonMartin/dotnet-impact.git"
+  },
   "engines": {
     "vscode": "^1.90.0",
     "node": ">=18"
@@ -42,6 +46,11 @@
     "configuration": {
       "title": "dotnet-impact",
       "properties": {
+        "dotnetImpact.autoBuildMap": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically build/refresh the impact map in the background when a workspace opens and unmapped test classes exist."
+        },
         "dotnetImpact.autoRunOnSave": {
           "type": "boolean",
           "default": true,
@@ -63,6 +72,11 @@
           ],
           "description": "Globs used to identify test projects."
         },
+        "dotnetImpact.dotnetPath": {
+          "type": "string",
+          "default": "",
+          "description": "Full path to the dotnet executable. Leave empty to auto-detect (PATH, DOTNET_ROOT, ~/.dotnet, system install locations)."
+        },
         "dotnetImpact.maxParallelCoverageRuns": {
           "type": "number",
           "default": 1,
@@ -74,6 +88,7 @@
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
+    "test": "npm run compile && node --test \"out/test/*.test.js\"",
     "vscode:prepublish": "npm run compile"
   },
   "dependencies": {

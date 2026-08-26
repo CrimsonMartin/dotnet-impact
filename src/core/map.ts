@@ -76,8 +76,8 @@ export class ImpactMap {
 
   /**
    * Classes whose tests execute any of the changed files (repo-relative paths).
-   * `unknownFiles` receives changed .cs files no mapped test touches — callers
-   * should fall back to project-level selection for those.
+   * `unknownFiles` receives every changed file no mapped test touches — callers
+   * decide which of those warrant project-level fallback.
    */
   affectedClasses(changedFiles: string[], unknownFiles?: string[]): string[] {
     const idx = this.invert();
@@ -85,7 +85,7 @@ export class ImpactMap {
     for (const f of changedFiles) {
       const hits = idx.get(f.split(path.sep).join("/").toLowerCase());
       if (hits) for (const c of hits) classes.add(c);
-      else if (f.endsWith(".cs")) unknownFiles?.push(f);
+      else unknownFiles?.push(f);
     }
     return [...classes].sort();
   }

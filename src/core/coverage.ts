@@ -1,7 +1,7 @@
 import { XMLParser } from "fast-xml-parser";
 import * as fs from "fs";
 import * as path from "path";
-import { exec } from "./util";
+import { classFilter, exec } from "./util";
 
 export interface ClassCoverageResult {
   classFqn: string;
@@ -30,7 +30,7 @@ export async function collectClassCoverage(
       "test",
       csproj,
       "--filter",
-      `FullyQualifiedName~${classFqn}`,
+      classFilter([classFqn]),
       "--collect",
       "XPlat Code Coverage",
       "--results-directory",
