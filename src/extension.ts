@@ -7,6 +7,7 @@ import { locateClasses, locateMethod, SourceLocation } from "./core/locate";
 import { testProjects } from "./core/projects";
 import { AffectedSet, Runner, TestOutcome } from "./core/runner";
 import { cacheDirFor, setDotnetPath, toRepoRelative } from "./core/util";
+import { SessionRunner } from "./core/vstestSession";
 
 let runner: Runner | undefined;
 let controller: vscode.TestController | undefined;
@@ -30,6 +31,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const applyDotnetPath = () =>
     setDotnetPath(vscode.workspace.getConfiguration("dotnetImpact").get<string>("dotnetPath", ""));
   applyDotnetPath();
+
+  if (vscode.workspace.getConfiguration("dotnetImpact").get<boolean>("persistentTestSessions", true)) {
+    runner.sessions = new SessionRunner(repoRoot, context.asAbsolutePath("helper"), (m) =>
+      output.appendLine(m)
+    );
+  }
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration("dotnetImpact.dotnetPath")) applyDotnetPath();
@@ -139,7 +146,8 @@ async function eagerDiscover(): Promise<void> {
     const unmapped = [...classOwners.keys()].filter((c) => !runner!.map.has(c));
     if (cfg.get<boolean>("autoBuildMap", true) && unmapped.length > 0) {
       output.appendLine(`auto-building impact map for ${unmapped.length} unmapped test classes`);
-      void buildMapWithProgress(vscode.ProgressLocation.Window);
+      // Reuse this discovery: buildMap skips its serial rebuild+re-list lead-in.
+      void buildMapWithProgress(vscode.ProgressLocation.Window, discovered);
     }
   } catch (e) {
     updateStatus("discovery error");
@@ -285,8 +293,11 @@ async function doRun(
         run.started(item);
       }
     }
-    const result = await runner!.runAffected(affected, signal);
-    reportOutcomes(run, result.outcomes);
+    // Stream results into Test Explorer as each test invocation finishes
+    // (failure-first pass lands red results in the first seconds).
+    const result = await runner!.runAffected(affected, signal, (partial) =>
+      reportOutcomes(run, partial)
+    );
     if (result.cancelled) {
       updateStatus("superseded");
     } else {
@@ -450,11 +461,13 @@ async function runAffectedNow(): Promise<void> {
 let mapBuilding = false;
 
 function autoParallel(): number {
-  return Math.max(1, Math.min(8, Math.floor(os.cpus().length / 2)));
+  // Each coverage run's datacollector saturates roughly one core.
+  return Math.max(1, Math.min(12, os.cpus().length - 2));
 }
 
 async function buildMapWithProgress(
-  location: vscode.ProgressLocation = vscode.ProgressLocation.Notification
+  location: vscode.ProgressLocation = vscode.ProgressLocation.Notification,
+  discovered?: Record<string, string[]>
 ): Promise<void> {
   if (!runner || mapBuilding) return;
   mapBuilding = true;
@@ -472,8 +485,11 @@ async function buildMapWithProgress(
         const configured = vscode.workspace
           .getConfiguration("dotnetImpact")
           .get<number>("maxParallelCoverageRuns", 0);
+        const parallel = configured > 0 ? configured : autoParallel();
+        output.appendLine(`map build: parallel=${parallel}`);
         const res = await runner!.buildMap({
-          parallel: configured > 0 ? configured : autoParallel(),
+          parallel,
+          discovered,
           shouldCancel: () => mapBuildCancelled,
           onPhase: (message) => {
             progress.report({ message });
@@ -502,5 +518,5 @@ async function buildMapWithProgress(
 }
 
 export function deactivate(): void {
-  /* nothing to clean up; shadow worktree persists intentionally */
+  runner?.sessions?.dispose(true); // shadow worktree itself persists intentionally
 }

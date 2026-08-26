@@ -52,12 +52,16 @@ export function exec(
   let env = process.env;
   if (cmd === "dotnet") {
     cmd = resolveDotnet();
+    // Persistent MSBuild between runs cuts incremental-build startup.
+    if (env.DOTNET_CLI_USE_MSBUILD_SERVER === undefined) {
+      env = { ...env, DOTNET_CLI_USE_MSBUILD_SERVER: "1" };
+    }
     if (path.isAbsolute(cmd)) {
       // DOTNET_ROOT so the host resolves runtimes, and PATH so build targets
       // that shell out to `dotnet`/tools (NSwag, protoc, etc.) find it too.
       const dir = path.dirname(cmd);
       env = {
-        ...process.env,
+        ...env,
         DOTNET_ROOT: dir,
         PATH: `${dir}${path.delimiter}${process.env.PATH ?? ""}`,
       };

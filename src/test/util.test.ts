@@ -1,6 +1,14 @@
 import * as assert from "node:assert/strict";
 import { test } from "node:test";
 import { classFilter, exec, parseStatusZ, resolveDotnet, setDotnetPath } from "../core/util";
+import { classOf } from "../core/vstestSession";
+
+test("classOf: plain, theory args, and NUnit parameterized fixtures", () => {
+  assert.equal(classOf("Ns.CalcTests.Adds"), "Ns.CalcTests");
+  assert.equal(classOf("Ns.CalcTests.Divides(x: 1.5)"), "Ns.CalcTests");
+  assert.equal(classOf("Ns.Fixture(1).Method(2)"), "Ns.Fixture(1)");
+  assert.equal(classOf("Ns.Outer+Inner.Method"), "Ns.Outer+Inner");
+});
 
 test("resolveDotnet: explicit override wins; otherwise a usable value", () => {
   setDotnetPath("/custom/dotnet");

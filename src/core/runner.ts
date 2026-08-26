@@ -12,7 +12,8 @@ import {
   testProjects,
 } from "./projects";
 import { ImpactMap } from "./map";
-import { classFilter, exec, git, parseStatusZ, toRepoRelative } from "./util";
+import { cacheDirFor, classFilter, exec, git, parseStatusZ, toRepoRelative } from "./util";
+import type { SessionRunner } from "./vstestSession";
 import { ensureShadow, Shadow, syncOverlay } from "./worktree";
 
 export interface TestOutcome {
@@ -58,8 +59,43 @@ export class Runner {
   private graph: ProjectGraph | null = null;
   private settingsFile: string | undefined;
 
+  /** Optional persistent test-session runner; runs fall back to dotnet test without it. */
+  sessions: SessionRunner | null = null;
+
   constructor(readonly repoRoot: string) {
     this.map = new ImpactMap(repoRoot);
+    this.lastFailures = this.loadLastFailures();
+  }
+
+  /** Newest built test dll for a repo-relative csproj, inside the shadow. */
+  private findTestDll(csprojRel: string): string | undefined {
+    const graph = this.projectGraph();
+    const info = [...graph.projects.values()].find(
+      (p) => toRepoRelative(this.repoRoot, p.csproj).toLowerCase() === csprojRel.toLowerCase()
+    );
+    if (!info) return undefined;
+    const binDir = path.join(path.dirname(this.shadowPath(info.csproj)), "bin");
+    let best: { p: string; mtime: number } | undefined;
+    const walk = (d: string, depth: number) => {
+      if (depth > 4) return;
+      let entries: fs.Dirent[];
+      try {
+        entries = fs.readdirSync(d, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const e of entries) {
+        const p = path.join(d, e.name);
+        // ref/ holds metadata-only reference assemblies with the same name.
+        if (e.isDirectory() && e.name.toLowerCase() !== "ref") walk(p, depth + 1);
+        else if (e.isFile() && e.name.toLowerCase() === `${info.assemblyName.toLowerCase()}.dll`) {
+          const mtime = fs.statSync(p).mtimeMs;
+          if (!best || mtime > best.mtime) best = { p, mtime };
+        }
+      }
+    };
+    walk(binDir, 0);
+    return best?.p;
   }
 
   async prepare(): Promise<Shadow> {
@@ -137,8 +173,37 @@ export class Runner {
     return { classes: filteredClasses, fallbackProjects: [...fallback.values()], changedFiles: rel };
   }
 
-  /** Run the affected set inside the shadow worktree. Abort via `signal` to supersede. */
-  async runAffected(affected: AffectedSet, signal?: AbortSignal): Promise<RunResult> {
+  /** Class FQNs that failed in the previous run, for failure-first ordering. */
+  private lastFailures: Set<string>;
+
+  private loadLastFailures(): Set<string> {
+    try {
+      return new Set(
+        JSON.parse(fs.readFileSync(path.join(cacheDirFor(this.repoRoot), "last-failures.json"), "utf8"))
+      );
+    } catch {
+      return new Set();
+    }
+  }
+
+  private saveLastFailures(): void {
+    const p = path.join(cacheDirFor(this.repoRoot), "last-failures.json");
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, JSON.stringify([...this.lastFailures]));
+  }
+
+  /**
+   * Run the affected set inside the shadow worktree. Abort via `signal` to
+   * supersede. Build happens once up front (shared deps compile once), test
+   * runs go `--no-build` in parallel across projects, and classes that failed
+   * last time run in a first quick pass so red results surface early.
+   * `onPartial` streams each test invocation's outcomes as it finishes.
+   */
+  async runAffected(
+    affected: AffectedSet,
+    signal?: AbortSignal,
+    onPartial?: (outcomes: TestOutcome[]) => void
+  ): Promise<RunResult> {
     if (!this.shadow) await this.prepare();
     const outcomes: TestOutcome[] = [];
     let output = "";
@@ -152,25 +217,96 @@ export class Runner {
       if (!byProject.has(csproj)) byProject.set(csproj, []);
       byProject.get(csproj)!.push(cls);
     }
+    const fallbackRel = affected.fallbackProjects.map((p) => toRepoRelative(this.repoRoot, p.csproj));
 
-    for (const [csproj, classes] of byProject) {
-      if (signal?.aborted) break;
-      const res = await this.dotnetTest(
-        this.shadowPath(path.join(this.repoRoot, csproj)),
-        ["--filter", classFilter(classes)],
-        signal
-      );
-      ok = ok && (res.ok || signal?.aborted === true);
-      output += res.output;
-      outcomes.push(...res.outcomes);
+    // Windows keeps loaded assemblies locked: stop warm sessions before builds
+    // can overwrite their dlls. (Elsewhere the helper's mtime check handles it.)
+    const allRels = new Set([...byProject.keys(), ...fallbackRel]);
+    if (process.platform === "win32" && this.sessions?.available) {
+      for (const rel of allRels) {
+        const dll = this.findTestDll(rel);
+        if (dll) await this.sessions.release(dll);
+      }
     }
 
-    for (const p of affected.fallbackProjects) {
+    // Build phase: every involved project once, serially — later builds reuse
+    // the shared dependencies the first ones compiled.
+    for (const rel of allRels) {
       if (signal?.aborted) break;
-      const res = await this.dotnetTest(this.shadowPath(p.csproj), [], signal);
-      ok = ok && (res.ok || signal?.aborted === true);
-      output += res.output;
-      outcomes.push(...res.outcomes);
+      const res = await exec(
+        "dotnet",
+        ["build", this.shadowPath(path.join(this.repoRoot, rel)), "--nologo", "--verbosity", "quiet"],
+        this.shadow!.dir,
+        10 * 60 * 1000,
+        signal
+      );
+      if (res.code !== 0 && !signal?.aborted) {
+        ok = false;
+        output += res.stdout + res.stderr;
+      }
+    }
+
+    // Failure-first: split mapped classes into a quick red pass and the rest.
+    const failedNow = affected.classes.filter((c) => this.lastFailures.has(c));
+    const passes: Array<Array<{ rel: string; filter?: string }>> = [];
+    const invocationsFor = (pick: (cls: string) => boolean) => {
+      const list: Array<{ rel: string; filter?: string }> = [];
+      for (const [rel, classes] of byProject) {
+        const subset = classes.filter(pick);
+        if (subset.length > 0) list.push({ rel, filter: classFilter(subset) });
+      }
+      return list;
+    };
+    if (failedNow.length > 0) passes.push(invocationsFor((c) => this.lastFailures.has(c)));
+    passes.push([
+      ...invocationsFor((c) => failedNow.length === 0 || !this.lastFailures.has(c)),
+      ...fallbackRel.map((rel) => ({ rel, filter: undefined })),
+    ]);
+
+    const runInvocation = async (inv: { rel: string; filter?: string }) => {
+      // Preferred: warm test session (milliseconds of dispatch). Falls back to
+      // dotnet test on any unavailability.
+      if (this.sessions?.available) {
+        const dll = this.findTestDll(inv.rel);
+        if (dll) {
+          const r = await this.sessions.runFilter(dll, inv.filter, signal);
+          if (r) return { ok: r.ok, outcomes: r.outcomes, output: r.output };
+        }
+      }
+      return this.dotnetTest(
+        this.shadowPath(path.join(this.repoRoot, inv.rel)),
+        [...(inv.filter ? ["--filter", inv.filter] : []), "--no-build"],
+        signal
+      );
+    };
+
+    for (const invocations of passes) {
+      if (signal?.aborted) break;
+      let next = 0;
+      await Promise.all(
+        Array.from({ length: Math.min(4, invocations.length) }, async () => {
+          for (;;) {
+            if (signal?.aborted) return;
+            const i = next++;
+            if (i >= invocations.length) return;
+            const res = await runInvocation(invocations[i]);
+            ok = ok && (res.ok || signal?.aborted === true);
+            output += res.output;
+            outcomes.push(...res.outcomes);
+            if (res.outcomes.length > 0) onPartial?.(res.outcomes);
+          }
+        })
+      );
+    }
+
+    // Remember failures for next run's quick pass (skip on cancel: partial data).
+    if (!signal?.aborted) {
+      for (const o of outcomes) {
+        if (o.skipped) continue;
+        if (o.passed) this.lastFailures.delete(o.classFqn);
+        else this.lastFailures.add(o.classFqn);
+      }
+      this.saveLastFailures();
     }
 
     return {
@@ -228,6 +364,12 @@ export class Runner {
     refresh?: boolean;
     /** Concurrent per-class coverage runs (ignored on the Coverlet fallback). */
     parallel?: number;
+    /**
+     * Discovery results to reuse (repo-relative csproj -> class FQNs), e.g.
+     * from the extension's eager discovery. Skips the per-project
+     * build+--list-tests lead-in for projects with no unmapped classes.
+     */
+    discovered?: Record<string, string[]>;
     onProgress?: (done: number, total: number, current: string) => void;
     /** Coarse phase updates before per-class progress exists (restore/build/discovery). */
     onPhase?: (message: string) => void;
@@ -240,29 +382,70 @@ export class Runner {
     const discovered = new Map<string, Set<string>>();
     const failed: string[] = [];
     let cancelled = false;
+    // Cancellation reaps in-flight child processes (no orphaned dotnet test).
+    const ctrl = new AbortController();
+    const wantCancel = () => {
+      if (opts.shouldCancel?.()) {
+        cancelled = true;
+        ctrl.abort();
+      }
+      return cancelled;
+    };
 
     const projects = testProjects(graph);
     const liveProjects = new Set(projects.map((p) => toRepoRelative(this.repoRoot, p.csproj)));
-    let projDone = 0;
-    for (const p of projects) {
-      if (opts.shouldCancel?.()) {
-        cancelled = true;
-        break;
-      }
-      opts.onPhase?.(`building ${p.name} (${++projDone}/${projects.length})`);
-      const csprojRel = toRepoRelative(this.repoRoot, p.csproj);
-      const shadowCsproj = this.shadowPath(p.csproj);
-      // Warm restore/build once per project so per-class runs can use --no-build.
-      await exec("dotnet", ["build", shadowCsproj, "--nologo", "--verbosity", "quiet"], this.shadow!.dir);
-      opts.onPhase?.(`discovering tests in ${p.name} (${projDone}/${projects.length})`);
-      try {
-        const classes = await discoverTestClasses(shadowCsproj, this.shadow!.dir);
+
+    if (opts.discovered) {
+      // Reuse prior discovery; only projects with actual work get a warm build.
+      const needBuild: typeof projects = [];
+      for (const p of projects) {
+        const csprojRel = toRepoRelative(this.repoRoot, p.csproj);
+        const classes = opts.discovered[csprojRel];
+        if (!classes) continue; // discovery failed for it; leave its entries alone
         discovered.set(csprojRel, new Set(classes));
-        for (const cls of classes) {
-          if (opts.refresh || !this.map.has(cls)) work.push({ csprojRel, classFqn: cls });
+        const items = classes.filter((c) => opts.refresh || !this.map.has(c));
+        if (items.length > 0) {
+          needBuild.push(p);
+          work.push(...items.map((classFqn) => ({ csprojRel, classFqn })));
         }
-      } catch (e) {
-        failed.push(`${p.name}: ${(e as Error).message}`);
+      }
+      let built = 0;
+      for (const p of needBuild) {
+        if (wantCancel()) break;
+        opts.onPhase?.(`building ${p.name} (${++built}/${needBuild.length})`);
+        await exec(
+          "dotnet",
+          ["build", this.shadowPath(p.csproj), "--nologo", "--verbosity", "quiet"],
+          this.shadow!.dir,
+          10 * 60 * 1000,
+          ctrl.signal
+        );
+      }
+    } else {
+      let projDone = 0;
+      for (const p of projects) {
+        if (wantCancel()) break;
+        opts.onPhase?.(`building ${p.name} (${++projDone}/${projects.length})`);
+        const csprojRel = toRepoRelative(this.repoRoot, p.csproj);
+        const shadowCsproj = this.shadowPath(p.csproj);
+        // Warm restore/build once per project so per-class runs can use --no-build.
+        await exec(
+          "dotnet",
+          ["build", shadowCsproj, "--nologo", "--verbosity", "quiet"],
+          this.shadow!.dir,
+          10 * 60 * 1000,
+          ctrl.signal
+        );
+        opts.onPhase?.(`discovering tests in ${p.name} (${projDone}/${projects.length})`);
+        try {
+          const classes = await discoverTestClasses(shadowCsproj, this.shadow!.dir);
+          discovered.set(csprojRel, new Set(classes));
+          for (const cls of classes) {
+            if (opts.refresh || !this.map.has(cls)) work.push({ csprojRel, classFqn: cls });
+          }
+        } catch (e) {
+          failed.push(`${p.name}: ${(e as Error).message}`);
+        }
       }
     }
 
@@ -273,16 +456,17 @@ export class Runner {
           this.shadow!.dir,
           this.shadowPath(path.join(this.repoRoot, item.csprojRel)),
           item.classFqn,
-          undefined,
+          ctrl.signal,
           this.settingsFile
         );
+        if (ctrl.signal.aborted) return; // partial coverage: don't poison the row
         this.map.update(item.classFqn, item.csprojRel, repoTreeFiles(cov.files));
         if (!cov.passed) failed.push(item.classFqn);
       } catch (e) {
         failed.push(`${item.classFqn}: ${(e as Error).message}`);
       }
       done++;
-      if (done % 5 === 0) this.map.save();
+      this.map.save(); // per-item: an interrupted build resumes where it stopped
     };
 
     // First item runs alone: it resolves which collector this project set
@@ -298,10 +482,7 @@ export class Runner {
       { length: Math.min(parallel, Math.max(work.length - 1, 0)) },
       async () => {
         for (;;) {
-          if (opts.shouldCancel?.()) {
-            cancelled = true;
-            return;
-          }
+          if (wantCancel()) return;
           const i = next++;
           if (i >= work.length) return;
           opts.onProgress?.(done, work.length, work[i].classFqn);
