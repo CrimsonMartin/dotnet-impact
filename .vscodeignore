@@ -10,3 +10,4 @@ node_modules/**
 *.vsix
 helper/bin/**
 helper/obj/**
+.github/**
