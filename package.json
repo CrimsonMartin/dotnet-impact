@@ -1,0 +1,82 @@
+{
+  "name": "dotnet-impact",
+  "displayName": "dotnet-impact — affected-test runner for .NET",
+  "description": "NCrunch-style impacted-test selection for .NET: builds a per-test-class coverage map in a background git worktree, then runs only the tests affected by your change. Includes a CLI for pre-commit hooks and AI coding agents.",
+  "version": "0.0.1",
+  "publisher": "crimsonmartin",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0",
+    "node": ">=18"
+  },
+  "categories": [
+    "Testing"
+  ],
+  "activationEvents": [
+    "workspaceContains:**/*.sln",
+    "workspaceContains:**/*.csproj"
+  ],
+  "main": "./out/extension.js",
+  "bin": {
+    "dotnet-impact": "./out/cli.js"
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "dotnetImpact.buildMap",
+        "title": "dotnet-impact: Build impact map (background)"
+      },
+      {
+        "command": "dotnetImpact.runAffected",
+        "title": "dotnet-impact: Run affected tests now"
+      },
+      {
+        "command": "dotnetImpact.showStatus",
+        "title": "dotnet-impact: Show status"
+      },
+      {
+        "command": "dotnetImpact.toggleAutoRun",
+        "title": "dotnet-impact: Toggle auto-run on save"
+      }
+    ],
+    "configuration": {
+      "title": "dotnet-impact",
+      "properties": {
+        "dotnetImpact.autoRunOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run affected tests automatically when a .cs file is saved."
+        },
+        "dotnetImpact.debounceMs": {
+          "type": "number",
+          "default": 1500,
+          "description": "Debounce interval after the last save before running affected tests."
+        },
+        "dotnetImpact.testProjectGlobs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": ["**/*Test*.csproj", "**/*.Tests.csproj"],
+          "description": "Globs used to identify test projects."
+        },
+        "dotnetImpact.maxParallelCoverageRuns": {
+          "type": "number",
+          "default": 1,
+          "description": "Concurrent per-class coverage collection runs during background map building."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile"
+  },
+  "dependencies": {
+    "fast-xml-parser": "^4.4.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.5.0"
+  }
+}

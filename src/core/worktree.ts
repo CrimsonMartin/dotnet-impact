@@ -1,0 +1,115 @@
+import * as fs from "fs";
+import * as path from "path";
+import { cacheDirFor, git } from "./util";
+
+export interface Shadow {
+  repoRoot: string;
+  dir: string;
+}
+
+const OVERLAY_MANIFEST = "overlay-manifest.json";
+
+/**
+ * Ensure a detached git worktree exists for the repo and matches its current HEAD.
+ * The worktree lives in the user cache dir, sharing the object store with the real repo.
+ */
+export async function ensureShadow(repoRoot: string): Promise<Shadow> {
+  const cache = cacheDirFor(repoRoot);
+  const dir = path.join(cache, "shadow");
+  fs.mkdirSync(cache, { recursive: true });
+
+  const head = (await git(repoRoot, ["rev-parse", "HEAD"])).stdout.trim();
+
+  if (!fs.existsSync(path.join(dir, ".git"))) {
+    // A stale registration can linger if the folder was deleted manually.
+    await git(repoRoot, ["worktree", "prune"]);
+    const res = await git(repoRoot, ["worktree", "add", "--detach", dir, head]);
+    if (res.code !== 0) {
+      throw new Error(`git worktree add failed: ${res.stderr || res.stdout}`);
+    }
+  } else {
+    const shadowHead = (await git(dir, ["rev-parse", "HEAD"])).stdout.trim();
+    if (shadowHead !== head) {
+      // Drop any previous overlay before moving; checkout -f resets tracked files.
+      const res = await git(dir, ["checkout", "--detach", "-f", head]);
+      if (res.code !== 0) {
+        throw new Error(`shadow checkout failed: ${res.stderr || res.stdout}`);
+      }
+    }
+  }
+  return { repoRoot, dir };
+}
+
+interface DirtyEntry {
+  status: string;
+  file: string;
+}
+
+async function dirtyFiles(repoRoot: string): Promise<DirtyEntry[]> {
+  const res = await git(repoRoot, ["status", "--porcelain", "-z", "--untracked-files=all"]);
+  const entries: DirtyEntry[] = [];
+  for (const chunk of res.stdout.split("\0")) {
+    if (chunk.length < 4) continue;
+    const status = chunk.slice(0, 2);
+    const file = chunk.slice(3);
+    entries.push({ status, file });
+  }
+  return entries;
+}
+
+/**
+ * Mirror the real repo's uncommitted state into the shadow worktree:
+ * copy dirty/untracked files over, delete deleted ones, and restore files
+ * that were overlaid previously but are clean again now.
+ */
+export async function syncOverlay(shadow: Shadow): Promise<string[]> {
+  const manifestPath = path.join(cacheDirFor(shadow.repoRoot), OVERLAY_MANIFEST);
+  let previous: string[] = [];
+  try {
+    previous = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  } catch {
+    /* first run */
+  }
+
+  const dirty = await dirtyFiles(shadow.repoRoot);
+  const current = new Set<string>();
+
+  for (const { status, file } of dirty) {
+    // Skip anything inside our own cache, and gitignored noise never appears here.
+    const src = path.join(shadow.repoRoot, file);
+    const dst = path.join(shadow.dir, file);
+    if (status.includes("D") || !fs.existsSync(src)) {
+      try {
+        fs.rmSync(dst, { force: true });
+      } catch {
+        /* ignore */
+      }
+      current.add(file);
+      continue;
+    }
+    current.add(file);
+    fs.mkdirSync(path.dirname(dst), { recursive: true });
+    fs.copyFileSync(src, dst);
+  }
+
+  // Files overlaid before but clean now: restore committed content in the shadow.
+  const toRestore = previous.filter((f) => !current.has(f));
+  if (toRestore.length > 0) {
+    await git(shadow.dir, ["checkout", "-f", "--", ...toRestore]).catch?.(() => undefined);
+    // Untracked files that were copied earlier and since deleted in the real repo:
+    for (const f of toRestore) {
+      const tracked = await git(shadow.dir, ["ls-files", "--error-unmatch", f]);
+      if (tracked.code !== 0) {
+        try {
+          fs.rmSync(path.join(shadow.dir, f), { force: true });
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  }
+
+  fs.mkdirSync(path.dirname(manifestPath), { recursive: true });
+  fs.writeFileSync(manifestPath, JSON.stringify([...current], null, 2));
+  return [...current];
+}
