@@ -34,6 +34,7 @@ async function main(): Promise<number> {
       await runner.prepare();
       const res = await runner.buildMap({
         refresh: has("--refresh"),
+        onPhase: (message) => process.stderr.write(`${message}\n`),
         onProgress: (done, total, current) =>
           process.stderr.write(`[${done + 1}/${total}] ${current}\n`),
       });

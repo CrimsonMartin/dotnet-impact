@@ -51,8 +51,16 @@ export function exec(
   let env = process.env;
   if (cmd === "dotnet") {
     cmd = resolveDotnet();
-    // An absolute fallback path needs DOTNET_ROOT so the host resolves runtimes.
-    if (path.isAbsolute(cmd)) env = { ...process.env, DOTNET_ROOT: path.dirname(cmd) };
+    if (path.isAbsolute(cmd)) {
+      // DOTNET_ROOT so the host resolves runtimes, and PATH so build targets
+      // that shell out to `dotnet`/tools (NSwag, protoc, etc.) find it too.
+      const dir = path.dirname(cmd);
+      env = {
+        ...process.env,
+        DOTNET_ROOT: dir,
+        PATH: `${dir}${path.delimiter}${process.env.PATH ?? ""}`,
+      };
+    }
   }
   return new Promise((resolve) => {
     execFile(

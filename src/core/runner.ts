@@ -208,6 +208,8 @@ export class Runner {
   async buildMap(opts: {
     refresh?: boolean;
     onProgress?: (done: number, total: number, current: string) => void;
+    /** Coarse phase updates before per-class progress exists (restore/build/discovery). */
+    onPhase?: (message: string) => void;
     shouldCancel?: () => boolean;
   }): Promise<{ mapped: number; failed: string[] }> {
     if (!this.shadow) await this.prepare();
@@ -215,11 +217,16 @@ export class Runner {
     const work: Array<{ csprojRel: string; classFqn: string }> = [];
     const alive = new Set<string>();
 
-    for (const p of testProjects(graph)) {
+    const projects = testProjects(graph);
+    let projDone = 0;
+    for (const p of projects) {
+      if (opts.shouldCancel?.()) return { mapped: 0, failed: [] };
+      opts.onPhase?.(`building ${p.name} (${++projDone}/${projects.length})`);
       const csprojRel = toRepoRelative(this.repoRoot, p.csproj);
       const shadowCsproj = this.shadowPath(p.csproj);
       // Warm restore/build once per project so per-class runs can use --no-restore.
       await exec("dotnet", ["build", shadowCsproj, "--nologo", "--verbosity", "quiet"], this.shadow!.dir);
+      opts.onPhase?.(`discovering tests in ${p.name} (${projDone}/${projects.length})`);
       const classes = await discoverTestClasses(shadowCsproj, this.shadow!.dir);
       for (const cls of classes) {
         alive.add(cls);

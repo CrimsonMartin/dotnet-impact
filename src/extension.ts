@@ -399,11 +399,18 @@ async function buildMapWithProgress(
         await runner!.prepare();
         const res = await runner!.buildMap({
           shouldCancel: () => mapBuildCancelled,
+          onPhase: (message) => {
+            progress.report({ message });
+            updateStatus(`map: ${message}`, true);
+          },
           onProgress: (done, total, current) => {
+            const pct = Math.round((done / Math.max(total, 1)) * 100);
+            const cls = current.split(".").pop() ?? current;
             progress.report({
-              message: `${done + 1}/${total} ${current}`,
+              message: `${pct}% — ${done + 1}/${total} ${cls}`,
               increment: 100 / Math.max(total, 1),
             });
+            updateStatus(`map: ${pct}% (${done + 1}/${total})`, true);
           },
         });
         updateStatus(`map: ${runner!.map.classCount} classes`);
