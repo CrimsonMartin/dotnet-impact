@@ -11,6 +11,17 @@ test("resolveDotnet: explicit override wins; otherwise a usable value", () => {
   assert.ok(resolved === "dotnet" || resolved.endsWith("dotnet") || resolved.endsWith("dotnet.exe"));
 });
 
+test("exec: abort signal cancels the child promptly", async () => {
+  const ctrl = new AbortController();
+  const started = Date.now();
+  const p = exec("sleep", ["30"], process.cwd(), 60000, ctrl.signal);
+  setTimeout(() => ctrl.abort(), 150);
+  const res = await p;
+  assert.ok(Date.now() - started < 5000, "should not wait for the child");
+  assert.notEqual(res.code, 0);
+  assert.match(res.stderr, /cancelled/);
+});
+
 test("exec: missing executable yields an actionable error, not silence", async () => {
   const res = await exec("definitely-not-a-real-command-xyz", [], process.cwd());
   assert.equal(res.code, 1);

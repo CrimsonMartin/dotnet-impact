@@ -46,7 +46,8 @@ export function exec(
   cmd: string,
   args: string[],
   cwd: string,
-  timeoutMs = 10 * 60 * 1000
+  timeoutMs = 10 * 60 * 1000,
+  signal?: AbortSignal
 ): Promise<ExecResult> {
   let env = process.env;
   if (cmd === "dotnet") {
@@ -66,12 +67,14 @@ export function exec(
     execFile(
       cmd,
       args,
-      { cwd, env, timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024, windowsHide: true },
+      { cwd, env, timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024, windowsHide: true, signal },
       (err, stdout, stderr) => {
         const e = err as (NodeJS.ErrnoException & { code?: number | string }) | null;
         const code = typeof e?.code === "number" ? e.code : e ? 1 : 0;
         let errText = stderr ?? "";
-        if (e?.code === "ENOENT") {
+        if (e?.code === "ABORT_ERR" || signal?.aborted) {
+          errText = "cancelled";
+        } else if (e?.code === "ENOENT") {
           errText =
             `'${cmd}' was not found. Install the .NET SDK or point the ` +
             `dotnetImpact.dotnetPath setting at the dotnet executable.` +

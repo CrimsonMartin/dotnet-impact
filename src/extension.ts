@@ -1,4 +1,5 @@
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
 import { discoverTestClasses } from "./core/discover";
@@ -215,23 +216,59 @@ async function runHandler(
   await executeRun(request, undefined);
 }
 
+/** The in-flight run, so a newer save can supersede it. */
+let activeRun: { ctrl: AbortController; files: string[] | undefined } | undefined;
+/** Serializes shadow access: runs execute one at a time, in order. */
+let runChain: Promise<void> = Promise.resolve();
+let refreshAbort: AbortController | undefined;
+let refreshing = false;
+
 /** Run either explicitly requested test items, or the affected set for changed files. */
 async function executeRun(
   request: vscode.TestRunRequest,
   changedFiles: string[] | undefined
 ): Promise<void> {
   if (!runner || !controller) return;
-  const run = controller.createTestRun(request);
+
+  // Preempt background work: pause map refresh, supersede the in-flight run.
+  refreshAbort?.abort();
+  if (activeRun) {
+    activeRun.ctrl.abort();
+    // Carry the superseded run's files into this one so its tests still run.
+    if (activeRun.files && changedFiles) {
+      changedFiles = [...new Set([...activeRun.files, ...changedFiles])];
+    }
+  }
+  const ctrl = new AbortController();
+  const mine = { ctrl, files: changedFiles };
+  activeRun = mine;
+
+  const prev = runChain;
+  runChain = (async () => {
+    await prev.catch(() => undefined);
+    if (ctrl.signal.aborted) return; // superseded while queued
+    await doRun(request, changedFiles, ctrl.signal);
+  })();
+  await runChain;
+  if (activeRun === mine) activeRun = undefined;
+}
+
+async function doRun(
+  request: vscode.TestRunRequest,
+  changedFiles: string[] | undefined,
+  signal: AbortSignal
+): Promise<void> {
+  const run = controller!.createTestRun(request);
   updateStatus("running…", true);
   try {
-    await runner.prepare();
+    await runner!.prepare();
     let affected: AffectedSet;
     if (changedFiles) {
-      affected = runner.computeAffected(changedFiles);
+      affected = runner!.computeAffected(changedFiles);
     } else if (request.include && request.include.length > 0) {
       affected = affectedFromSelection(request.include);
     } else {
-      affected = runner.computeAffected(await runner.changedFiles());
+      affected = runner!.computeAffected(await runner!.changedFiles());
     }
     affected.classOwners = Object.fromEntries(classOwners);
 
@@ -248,19 +285,50 @@ async function executeRun(
         run.started(item);
       }
     }
-    const result = await runner.runAffected(affected);
+    const result = await runner!.runAffected(affected, signal);
     reportOutcomes(run, result.outcomes);
-    updateStatus(
-      result.ok
-        ? `✓ ${result.outcomes.length} tests (${affected.classes.length} classes)`
-        : `✗ ${result.outcomes.filter((o) => !o.passed && !o.skipped).length} failing`
-    );
+    if (result.cancelled) {
+      updateStatus("superseded");
+    } else {
+      updateStatus(
+        result.ok
+          ? `✓ ${result.outcomes.length} tests (${affected.classes.length} classes)`
+          : `✗ ${result.outcomes.filter((o) => !o.passed && !o.skipped).length} failing`
+      );
+      // Live map refresh: re-collect coverage for what just ran, in the background.
+      const cfg = vscode.workspace.getConfiguration("dotnetImpact");
+      if (cfg.get<boolean>("liveMapRefresh", true)) {
+        runner!.queueRefreshFromOutcomes(result.outcomes, Object.fromEntries(classOwners));
+        void kickRefresh();
+      }
+    }
     output.appendLine(result.output);
   } catch (e) {
     updateStatus("error");
     output.appendLine(String(e));
   } finally {
     run.end();
+  }
+}
+
+/** Drain the map-refresh queue while the shadow is idle; runs preempt it. */
+async function kickRefresh(): Promise<void> {
+  if (!runner || refreshing || mapBuilding || runner.pendingRefresh.size === 0) return;
+  refreshing = true;
+  refreshAbort = new AbortController();
+  try {
+    const n = await runner.refreshPending({
+      signal: refreshAbort.signal,
+      onProgress: (remaining, cls) =>
+        updateStatus(`refreshing map (${remaining + 1} left): ${cls.split(".").pop()}`, true),
+    });
+    if (n > 0 && !refreshAbort.signal.aborted) {
+      updateStatus(`map: ${runner.map.classCount} classes (fresh)`);
+    }
+  } catch (e) {
+    output.appendLine(`map refresh error: ${String(e)}`);
+  } finally {
+    refreshing = false;
   }
 }
 
@@ -381,6 +449,10 @@ async function runAffectedNow(): Promise<void> {
 
 let mapBuilding = false;
 
+function autoParallel(): number {
+  return Math.max(1, Math.min(8, Math.floor(os.cpus().length / 2)));
+}
+
 async function buildMapWithProgress(
   location: vscode.ProgressLocation = vscode.ProgressLocation.Notification
 ): Promise<void> {
@@ -397,7 +469,11 @@ async function buildMapWithProgress(
       async (progress, token) => {
         token.onCancellationRequested(() => (mapBuildCancelled = true));
         await runner!.prepare();
+        const configured = vscode.workspace
+          .getConfiguration("dotnetImpact")
+          .get<number>("maxParallelCoverageRuns", 0);
         const res = await runner!.buildMap({
+          parallel: configured > 0 ? configured : autoParallel(),
           shouldCancel: () => mapBuildCancelled,
           onPhase: (message) => {
             progress.report({ message });

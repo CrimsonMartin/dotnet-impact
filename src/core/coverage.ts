@@ -12,39 +12,134 @@ export interface ClassCoverageResult {
 }
 
 /**
- * Run one test class with Coverlet coverage collection and return the set of
- * source files its tests execute. Runs inside the shadow worktree.
+ * Preferred: Microsoft.CodeCoverage (ships inside Microsoft.NET.Test.Sdk) —
+ * block-level instrumentation, far lower overhead than Coverlet's
+ * per-sequence-point probes. Fallback: coverlet.collector, for test projects
+ * where the MS collector is unavailable.
+ */
+const COLLECTOR_MS = "Code Coverage;Format=cobertura";
+const COLLECTOR_COVERLET = "XPlat Code Coverage";
+/** Collector that worked for this session; resolved on first successful run. */
+let resolvedCollector: string | null = null;
+
+/** Test-only: reset the per-session collector choice. */
+export function resetCollectorChoice(): void {
+  resolvedCollector = null;
+}
+
+/**
+ * Coverlet instruments assemblies on disk, so concurrent runs against one
+ * project race; callers should serialize when this is true. The MS collector
+ * (profiler-based) parallelizes safely.
+ */
+export function usingCoverletFallback(): boolean {
+  return resolvedCollector === COLLECTOR_COVERLET;
+}
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function escapeXml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/**
+ * Runsettings restricting instrumentation to first-party assemblies (derived
+ * from the project graph — no user configuration). Third-party/NuGet modules
+ * are never useful to the impact map, and skipping them cuts both
+ * instrumentation time and report size. Carries configuration for both
+ * collectors; each reads only its own section.
+ */
+export function buildRunsettings(assemblyNames: string[]): string {
+  const modulePaths = assemblyNames
+    .map((n) => `          <ModulePath>.*[/\\\\]${escapeXml(escapeRegex(n))}\\.(dll|exe)$</ModulePath>`)
+    .join("\n");
+  const coverletInclude = assemblyNames.map((n) => `[${escapeXml(n)}]*`).join(",");
+  return `<?xml version="1.0" encoding="utf-8"?>
+<RunSettings>
+  <DataCollectionRunSettings>
+    <DataCollectors>
+      <DataCollector friendlyName="Code Coverage">
+        <Configuration>
+          <Format>cobertura</Format>
+          <CodeCoverage>
+            <ModulePaths>
+              <Include>
+${modulePaths}
+              </Include>
+            </ModulePaths>
+          </CodeCoverage>
+        </Configuration>
+      </DataCollector>
+      <DataCollector friendlyName="XPlat Code Coverage">
+        <Configuration>
+          <Include>${coverletInclude}</Include>
+        </Configuration>
+      </DataCollector>
+    </DataCollectors>
+  </DataCollectionRunSettings>
+</RunSettings>
+`;
+}
+
+/**
+ * Run one test class with coverage collection and return the set of source
+ * files its tests execute. Runs inside the shadow worktree.
  */
 export async function collectClassCoverage(
   shadowDir: string,
   csproj: string,
-  classFqn: string
+  classFqn: string,
+  signal?: AbortSignal,
+  settingsFile?: string
 ): Promise<ClassCoverageResult> {
   const resultsDir = path.join(shadowDir, ".impact-results", classFqn.replace(/[^A-Za-z0-9_.]/g, "_"));
-  fs.rmSync(resultsDir, { recursive: true, force: true });
-  fs.mkdirSync(resultsDir, { recursive: true });
 
-  const res = await exec(
-    "dotnet",
-    [
-      "test",
-      csproj,
-      "--filter",
-      classFilter([classFqn]),
-      "--collect",
-      "XPlat Code Coverage",
-      "--results-directory",
-      resultsDir,
-      "--nologo",
-      "--no-restore",
-      "--verbosity",
-      "quiet",
-    ],
-    shadowDir
-  );
+  const run = (collector: string) => {
+    fs.rmSync(resultsDir, { recursive: true, force: true });
+    fs.mkdirSync(resultsDir, { recursive: true });
+    // --no-build: callers guarantee a fresh build (map build warm-builds each
+    // project; live refresh follows an affected run). Skipping the per-class
+    // MSBuild spin-up is the single biggest CPU/time saver here.
+    return exec(
+      "dotnet",
+      [
+        "test",
+        csproj,
+        "--filter",
+        classFilter([classFqn]),
+        "--collect",
+        collector,
+        "--results-directory",
+        resultsDir,
+        ...(settingsFile ? ["--settings", settingsFile] : []),
+        "--nologo",
+        "--no-restore",
+        "--no-build",
+        "--verbosity",
+        "quiet",
+      ],
+      shadowDir,
+      10 * 60 * 1000,
+      signal
+    );
+  };
+
+  let res = await run(resolvedCollector ?? COLLECTOR_MS);
+  let reports = findCoberturaFiles(resultsDir);
+  // No report and no explicit choice yet: the MS collector may be missing from
+  // this project (old test SDK); try Coverlet once and stick with what works.
+  if (reports.length === 0 && resolvedCollector === null && !signal?.aborted) {
+    res = await run(COLLECTOR_COVERLET);
+    reports = findCoberturaFiles(resultsDir);
+    if (reports.length > 0) resolvedCollector = COLLECTOR_COVERLET;
+  } else if (reports.length > 0 && resolvedCollector === null) {
+    resolvedCollector = COLLECTOR_MS;
+  }
 
   const files = new Set<string>();
-  for (const cobertura of findCoberturaFiles(resultsDir)) {
+  for (const cobertura of reports) {
     for (const f of parseCoberturaHitFiles(cobertura, shadowDir)) files.add(f);
   }
   fs.rmSync(resultsDir, { recursive: true, force: true });
@@ -69,7 +164,8 @@ function findCoberturaFiles(dir: string): string[] {
     for (const e of entries) {
       const p = path.join(d, e.name);
       if (e.isDirectory()) walk(p);
-      else if (e.name === "coverage.cobertura.xml") out.push(p);
+      // Coverlet emits coverage.cobertura.xml; MS Code Coverage emits <name>.cobertura.xml.
+      else if (e.name.toLowerCase().endsWith(".cobertura.xml")) out.push(p);
     }
   };
   walk(dir);

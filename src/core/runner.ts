@@ -1,7 +1,7 @@
 import { XMLParser } from "fast-xml-parser";
 import * as fs from "fs";
 import * as path from "path";
-import { collectClassCoverage } from "./coverage";
+import { buildRunsettings, collectClassCoverage, usingCoverletFallback } from "./coverage";
 import { discoverTestClasses } from "./discover";
 import {
   affectedTestProjects,
@@ -27,10 +27,17 @@ export interface TestOutcome {
 
 export interface RunResult {
   ok: boolean;
+  /** The run was aborted (superseded by a newer save); results are partial. */
+  cancelled: boolean;
   ranClasses: string[];
   fallbackProjects: string[];
   outcomes: TestOutcome[];
   output: string;
+}
+
+/** Keep only files in the repo tree; drop SDK absolute paths and generated code. */
+function repoTreeFiles(files: string[]): string[] {
+  return files.filter((f) => !path.isAbsolute(f) && !/(^|\/)(obj|bin)\//i.test(f));
 }
 
 export interface AffectedSet {
@@ -49,6 +56,7 @@ export class Runner {
   readonly map: ImpactMap;
   private shadow: Shadow | null = null;
   private graph: ProjectGraph | null = null;
+  private settingsFile: string | undefined;
 
   constructor(readonly repoRoot: string) {
     this.map = new ImpactMap(repoRoot);
@@ -58,6 +66,10 @@ export class Runner {
     this.shadow = await ensureShadow(this.repoRoot);
     await syncOverlay(this.shadow);
     this.graph = buildProjectGraph(this.repoRoot);
+    // Instrument only first-party assemblies (derived from the graph, not config).
+    const names = [...this.graph.projects.values()].map((p) => p.assemblyName);
+    this.settingsFile = path.join(this.shadow.dir, ".impact-runsettings.xml");
+    fs.writeFileSync(this.settingsFile, buildRunsettings(names));
     return this.shadow;
   }
 
@@ -125,8 +137,8 @@ export class Runner {
     return { classes: filteredClasses, fallbackProjects: [...fallback.values()], changedFiles: rel };
   }
 
-  /** Run the affected set inside the shadow worktree. */
-  async runAffected(affected: AffectedSet): Promise<RunResult> {
+  /** Run the affected set inside the shadow worktree. Abort via `signal` to supersede. */
+  async runAffected(affected: AffectedSet, signal?: AbortSignal): Promise<RunResult> {
     if (!this.shadow) await this.prepare();
     const outcomes: TestOutcome[] = [];
     let output = "";
@@ -142,24 +154,28 @@ export class Runner {
     }
 
     for (const [csproj, classes] of byProject) {
-      const res = await this.dotnetTest(this.shadowPath(path.join(this.repoRoot, csproj)), [
-        "--filter",
-        classFilter(classes),
-      ]);
-      ok = ok && res.ok;
+      if (signal?.aborted) break;
+      const res = await this.dotnetTest(
+        this.shadowPath(path.join(this.repoRoot, csproj)),
+        ["--filter", classFilter(classes)],
+        signal
+      );
+      ok = ok && (res.ok || signal?.aborted === true);
       output += res.output;
       outcomes.push(...res.outcomes);
     }
 
     for (const p of affected.fallbackProjects) {
-      const res = await this.dotnetTest(this.shadowPath(p.csproj), []);
-      ok = ok && res.ok;
+      if (signal?.aborted) break;
+      const res = await this.dotnetTest(this.shadowPath(p.csproj), [], signal);
+      ok = ok && (res.ok || signal?.aborted === true);
       output += res.output;
       outcomes.push(...res.outcomes);
     }
 
     return {
       ok,
+      cancelled: signal?.aborted === true,
       ranClasses: affected.classes,
       fallbackProjects: affected.fallbackProjects.map((p) => p.name),
       outcomes,
@@ -169,7 +185,8 @@ export class Runner {
 
   private async dotnetTest(
     csprojAbs: string,
-    extraArgs: string[]
+    extraArgs: string[],
+    signal?: AbortSignal
   ): Promise<{ ok: boolean; outcomes: TestOutcome[]; output: string }> {
     const trxDir = path.join(path.dirname(csprojAbs), ".impact-trx");
     fs.rmSync(trxDir, { recursive: true, force: true });
@@ -187,7 +204,9 @@ export class Runner {
         "--results-directory",
         trxDir,
       ],
-      this.shadow!.dir
+      this.shadow!.dir,
+      10 * 60 * 1000,
+      signal
     );
     const outcomes: TestOutcome[] = [];
     try {
@@ -207,6 +226,8 @@ export class Runner {
    */
   async buildMap(opts: {
     refresh?: boolean;
+    /** Concurrent per-class coverage runs (ignored on the Coverlet fallback). */
+    parallel?: number;
     onProgress?: (done: number, total: number, current: string) => void;
     /** Coarse phase updates before per-class progress exists (restore/build/discovery). */
     onPhase?: (message: string) => void;
@@ -215,50 +236,147 @@ export class Runner {
     if (!this.shadow) await this.prepare();
     const graph = this.projectGraph();
     const work: Array<{ csprojRel: string; classFqn: string }> = [];
-    const alive = new Set<string>();
+    /** Successfully-discovered projects and their live classes, for pruning. */
+    const discovered = new Map<string, Set<string>>();
+    const failed: string[] = [];
+    let cancelled = false;
 
     const projects = testProjects(graph);
+    const liveProjects = new Set(projects.map((p) => toRepoRelative(this.repoRoot, p.csproj)));
     let projDone = 0;
     for (const p of projects) {
-      if (opts.shouldCancel?.()) return { mapped: 0, failed: [] };
+      if (opts.shouldCancel?.()) {
+        cancelled = true;
+        break;
+      }
       opts.onPhase?.(`building ${p.name} (${++projDone}/${projects.length})`);
       const csprojRel = toRepoRelative(this.repoRoot, p.csproj);
       const shadowCsproj = this.shadowPath(p.csproj);
-      // Warm restore/build once per project so per-class runs can use --no-restore.
+      // Warm restore/build once per project so per-class runs can use --no-build.
       await exec("dotnet", ["build", shadowCsproj, "--nologo", "--verbosity", "quiet"], this.shadow!.dir);
       opts.onPhase?.(`discovering tests in ${p.name} (${projDone}/${projects.length})`);
-      const classes = await discoverTestClasses(shadowCsproj, this.shadow!.dir);
-      for (const cls of classes) {
-        alive.add(cls);
-        if (opts.refresh || !this.map.has(cls)) work.push({ csprojRel, classFqn: cls });
+      try {
+        const classes = await discoverTestClasses(shadowCsproj, this.shadow!.dir);
+        discovered.set(csprojRel, new Set(classes));
+        for (const cls of classes) {
+          if (opts.refresh || !this.map.has(cls)) work.push({ csprojRel, classFqn: cls });
+        }
+      } catch (e) {
+        failed.push(`${p.name}: ${(e as Error).message}`);
       }
     }
 
-    const failed: string[] = [];
     let done = 0;
-    for (const item of work) {
-      if (opts.shouldCancel?.()) break;
-      opts.onProgress?.(done, work.length, item.classFqn);
+    const runItem = async (item: { csprojRel: string; classFqn: string }): Promise<void> => {
       try {
         const cov = await collectClassCoverage(
           this.shadow!.dir,
           this.shadowPath(path.join(this.repoRoot, item.csprojRel)),
-          item.classFqn
+          item.classFqn,
+          undefined,
+          this.settingsFile
         );
-        // Keep only files in the repo tree; drop SDK absolute paths and generated code.
-        const repoFiles = cov.files.filter(
-          (f) => !path.isAbsolute(f) && !/(^|\/)(obj|bin)\//i.test(f)
-        );
-        this.map.update(item.classFqn, item.csprojRel, repoFiles);
+        this.map.update(item.classFqn, item.csprojRel, repoTreeFiles(cov.files));
         if (!cov.passed) failed.push(item.classFqn);
       } catch (e) {
         failed.push(`${item.classFqn}: ${(e as Error).message}`);
       }
       done++;
       if (done % 5 === 0) this.map.save();
+    };
+
+    // First item runs alone: it resolves which collector this project set
+    // supports. After that, parallelize — unless we're on the Coverlet
+    // fallback, which rewrites assemblies on disk and must stay serial.
+    if (work.length > 0 && !cancelled) {
+      opts.onProgress?.(0, work.length, work[0].classFqn);
+      await runItem(work[0]);
+    }
+    const parallel = usingCoverletFallback() ? 1 : Math.max(1, opts.parallel ?? 1);
+    let next = 1;
+    const workers = Array.from(
+      { length: Math.min(parallel, Math.max(work.length - 1, 0)) },
+      async () => {
+        for (;;) {
+          if (opts.shouldCancel?.()) {
+            cancelled = true;
+            return;
+          }
+          const i = next++;
+          if (i >= work.length) return;
+          opts.onProgress?.(done, work.length, work[i].classFqn);
+          await runItem(work[i]);
+        }
+      }
+    );
+    await Promise.all(workers);
+
+    // Prune dead entries only after a full, uncancelled sweep — a partial pass
+    // has no evidence about classes it never reached.
+    if (!cancelled) {
+      const removed = this.map.prune(discovered, liveProjects);
+      if (removed.length > 0) opts.onPhase?.(`pruned ${removed.length} stale map entries`);
     }
     this.map.save();
     return { mapped: done, failed };
+  }
+
+  // ---------- live map refresh ----------
+
+  /** Classes queued for background coverage refresh: FQN -> owning csproj (repo-relative). */
+  readonly pendingRefresh = new Map<string, string>();
+
+  /**
+   * Queue every class that just produced results for a coverage refresh, so map
+   * rows track reality as tests re-run. Classes only the run knew about (fallback
+   * discoveries) get owners from `owners` and grow the map organically.
+   */
+  queueRefreshFromOutcomes(outcomes: TestOutcome[], owners?: Record<string, string>): number {
+    for (const o of outcomes) {
+      if (o.skipped) continue;
+      const csproj = this.map.entry(o.classFqn)?.csproj ?? owners?.[o.classFqn];
+      if (csproj) this.pendingRefresh.set(o.classFqn, csproj);
+    }
+    return this.pendingRefresh.size;
+  }
+
+  /**
+   * Drain the refresh queue one class at a time (low-priority coverage runs).
+   * Abort via `signal` to yield to a foreground run; the in-flight class is
+   * requeued. Returns how many rows were refreshed.
+   */
+  async refreshPending(
+    opts: {
+      signal?: AbortSignal;
+      onProgress?: (remaining: number, current: string) => void;
+    } = {}
+  ): Promise<number> {
+    if (!this.shadow) await this.prepare();
+    let done = 0;
+    while (this.pendingRefresh.size > 0 && !opts.signal?.aborted) {
+      const [cls, csprojRel] = this.pendingRefresh.entries().next().value as [string, string];
+      this.pendingRefresh.delete(cls);
+      opts.onProgress?.(this.pendingRefresh.size, cls);
+      try {
+        const cov = await collectClassCoverage(
+          this.shadow!.dir,
+          this.shadowPath(path.join(this.repoRoot, csprojRel)),
+          cls,
+          opts.signal,
+          this.settingsFile
+        );
+        if (opts.signal?.aborted) {
+          this.pendingRefresh.set(cls, csprojRel); // partial result: retry later
+          break;
+        }
+        this.map.update(cls, csprojRel, repoTreeFiles(cov.files));
+        this.map.save();
+        done++;
+      } catch {
+        /* leave the row as-is; the next full build-map covers it */
+      }
+    }
+    return done;
   }
 }
 

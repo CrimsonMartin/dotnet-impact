@@ -23,8 +23,10 @@ expensive per commit.
    conservative fallback: run every test project that transitively references the
    changed file's project (computed from the `ProjectReference` graph).
 
-Test projects need `coverlet.collector` (the default in the xunit template) for map
-building; running affected tests works regardless.
+Map building uses the Microsoft.CodeCoverage collector (bundled with
+`Microsoft.NET.Test.Sdk`) — block-level instrumentation, much faster than Coverlet —
+and falls back to `coverlet.collector` automatically where it's unavailable. Running
+affected tests works regardless.
 
 ## VS Code extension
 
@@ -32,7 +34,12 @@ Native Test Explorer integration via the `TestController` API — no custom UI:
 
 - **Continuous run** — toggle the "eye" on the *Affected tests* profile and affected
   tests re-run on every `.cs` save (also available as plain auto-run-on-save via
-  `dotnetImpact.autoRunOnSave`).
+  `dotnetImpact.autoRunOnSave`). A save during a run supersedes it: the in-flight run
+  is cancelled and its files fold into the new one.
+- **Live map refresh** — after each affected run, coverage is re-collected for the
+  classes that ran (low-priority, background), so map rows track your code as it
+  changes instead of going stale (`dotnetImpact.liveMapRefresh`). Full map builds
+  also prune entries for deleted test classes/projects.
 - **Automatic map build** — on workspace open, any test classes missing from the map
   are mapped in the background (status-bar progress; disable via
   `dotnetImpact.autoBuildMap`). `dotnet-impact: Build impact map (background)` runs

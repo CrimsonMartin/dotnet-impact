@@ -7,6 +7,8 @@ export interface ProjectInfo {
   /** Directory containing the csproj. */
   dir: string;
   name: string;
+  /** Output assembly name (<AssemblyName> override, else project name). */
+  assemblyName: string;
   references: string[]; // absolute csproj paths
   isTestProject: boolean;
 }
@@ -63,10 +65,13 @@ export function buildProjectGraph(root: string): ProjectGraph {
       const rel = m[1].split("\\").join(path.sep).split("/").join(path.sep);
       refs.push(path.resolve(path.dirname(csproj), rel));
     }
+    const name = path.basename(csproj, ".csproj");
+    const asmMatch = content.match(/<AssemblyName>([^<$]+)<\/AssemblyName>/i);
     projects.set(norm(csproj), {
       csproj,
       dir: path.dirname(csproj),
-      name: path.basename(csproj, ".csproj"),
+      name,
+      assemblyName: asmMatch ? asmMatch[1].trim() : name,
       references: refs,
       isTestProject: TEST_PACKAGE_RE.test(content),
     });

@@ -26,6 +26,25 @@ test("affectedClasses: lookup is case-insensitive and slash-normalized", () => {
   assert.deepEqual(map.affectedClasses([`src${path.sep}A.cs`]), ["Ns.ATests"]);
 });
 
+test("prune: removes dead classes and dead projects, keeps undiscovered ones", () => {
+  const map = freshMap();
+  map.update("Ns.Alive", "tests/A/A.csproj", ["src/a.cs"]);
+  map.update("Ns.Dead", "tests/A/A.csproj", ["src/b.cs"]);
+  map.update("Ns.InFailedProject", "tests/B/B.csproj", ["src/c.cs"]);
+  map.update("Ns.InDeletedProject", "tests/Gone/Gone.csproj", ["src/d.cs"]);
+
+  const removed = map.prune(
+    new Map([["tests/A/A.csproj", new Set(["Ns.Alive"])]]), // A discovered; B failed discovery
+    new Set(["tests/A/A.csproj", "tests/B/B.csproj"]) // Gone is no longer a test project
+  );
+
+  assert.deepEqual(removed.sort(), ["Ns.Dead", "Ns.InDeletedProject"]);
+  assert.ok(map.has("Ns.Alive"));
+  assert.ok(map.has("Ns.InFailedProject")); // no evidence it died
+  assert.ok(!map.has("Ns.Dead"));
+  assert.ok(!map.has("Ns.InDeletedProject"));
+});
+
 test("affectedClasses: every unmapped file lands in unknownFiles (not just .cs)", () => {
   const map = freshMap();
   map.update("Ns.ATests", "tests/T.csproj", ["src/a.cs"]);

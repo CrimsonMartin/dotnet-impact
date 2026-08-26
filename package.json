@@ -2,7 +2,7 @@
   "name": "dotnet-impact",
   "displayName": "dotnet-impact — affected-test runner for .NET",
   "description": "NCrunch-style impacted-test selection for .NET: builds a per-test-class coverage map in a background git worktree, then runs only the tests affected by your change. Includes a CLI for pre-commit hooks and AI coding agents.",
-  "version": "0.0.6",
+  "version": "0.0.9",
   "publisher": "crimsonmartin",
   "license": "MIT",
   "repository": {
@@ -51,6 +51,11 @@
           "default": true,
           "description": "Automatically build/refresh the impact map in the background when a workspace opens and unmapped test classes exist."
         },
+        "dotnetImpact.liveMapRefresh": {
+          "type": "boolean",
+          "default": true,
+          "description": "After each affected run, re-collect coverage for the classes that ran (low-priority, background) so map rows stay fresh."
+        },
         "dotnetImpact.autoRunOnSave": {
           "type": "boolean",
           "default": true,
@@ -79,8 +84,8 @@
         },
         "dotnetImpact.maxParallelCoverageRuns": {
           "type": "number",
-          "default": 1,
-          "description": "Concurrent per-class coverage collection runs during background map building."
+          "default": 0,
+          "description": "Concurrent per-class coverage collection runs during map building. 0 = auto (half your cores, max 8). Serial when the Coverlet fallback collector is in use."
         }
       }
     }

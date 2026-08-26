@@ -55,6 +55,24 @@ export class ImpactMap {
     this.inverted = null;
   }
 
+  /**
+   * Drop entries for classes that no longer exist. `discovered` maps each
+   * successfully-discovered test project (repo-relative csproj) to its live
+   * class FQNs: entries in those projects but not those sets die, as do
+   * entries whose project is gone from the graph. Entries in a live project
+   * whose discovery failed this round are kept (no evidence they died).
+   * Returns the removed class FQNs.
+   */
+  prune(discovered: Map<string, Set<string>>, liveProjects: Set<string>): string[] {
+    const removed: string[] = [];
+    for (const [cls, e] of Object.entries(this.data.entries)) {
+      const live = discovered.get(e.csproj);
+      if (live ? !live.has(cls) : !liveProjects.has(e.csproj)) removed.push(cls);
+    }
+    for (const cls of removed) this.remove(cls);
+    return removed;
+  }
+
   save(): void {
     fs.mkdirSync(path.dirname(this.file), { recursive: true });
     fs.writeFileSync(this.file, JSON.stringify(this.data, null, 1));

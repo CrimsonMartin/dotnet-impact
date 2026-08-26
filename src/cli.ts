@@ -8,6 +8,7 @@
  *   dotnet-impact run [--base <ref>] [--staged]        run affected tests; exit 1 on failure
  *   dotnet-impact status                    map coverage stats
  */
+import * as os from "os";
 import * as path from "path";
 import { Runner } from "./core/runner";
 import { git } from "./core/util";
@@ -32,8 +33,11 @@ async function main(): Promise<number> {
   switch (cmd) {
     case "build-map": {
       await runner.prepare();
+      const configured = Number(arg("--parallel") ?? 0);
       const res = await runner.buildMap({
         refresh: has("--refresh"),
+        parallel:
+          configured > 0 ? configured : Math.max(1, Math.min(8, Math.floor(os.cpus().length / 2))),
         onPhase: (message) => process.stderr.write(`${message}\n`),
         onProgress: (done, total, current) =>
           process.stderr.write(`[${done + 1}/${total}] ${current}\n`),
