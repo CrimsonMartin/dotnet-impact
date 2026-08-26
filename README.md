@@ -36,6 +36,12 @@ Native Test Explorer integration via the `TestController` API — no custom UI:
   tests re-run on every `.cs` save (also available as plain auto-run-on-save via
   `dotnetImpact.autoRunOnSave`). A save during a run supersedes it: the in-flight run
   is cancelled and its files fold into the new one.
+- **Persistent test sessions** — a small shipped helper (built once on first use)
+  keeps vstest.console and pre-warmed testhosts alive between runs, so an
+  incremental run costs milliseconds of dispatch instead of seconds of process
+  startup. Sessions are freshness-checked against the build output (never run
+  stale assemblies) and everything falls back to plain `dotnet test` when
+  unavailable (`dotnetImpact.persistentTestSessions`).
 - **Live map refresh** — after each affected run, coverage is re-collected for the
   classes that ran (low-priority, background), so map rows track your code as it
   changes instead of going stale (`dotnetImpact.liveMapRefresh`). Full map builds

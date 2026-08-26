@@ -1,3 +1,4 @@
+.claude/**
 .gitignore
 tsconfig.json
 src/**
@@ -7,3 +8,5 @@ node_modules/**
 !node_modules/fast-xml-parser/**
 !node_modules/strnum/**
 *.vsix
+helper/bin/**
+helper/obj/**
