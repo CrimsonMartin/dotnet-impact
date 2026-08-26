@@ -35,6 +35,8 @@ export interface AffectedSet {
   /** Projects to run in full because changed files aren't in the map yet. */
   fallbackProjects: ProjectInfo[];
   changedFiles: string[];
+  /** Owning test project (repo-relative csproj) for classes not yet in the map. */
+  classOwners?: Record<string, string>;
 }
 
 export class Runner {
@@ -113,7 +115,7 @@ export class Runner {
     // Group mapped classes by owning test project.
     const byProject = new Map<string, string[]>();
     for (const cls of affected.classes) {
-      const csproj = this.map.entry(cls)?.csproj;
+      const csproj = this.map.entry(cls)?.csproj ?? affected.classOwners?.[cls];
       if (!csproj) continue;
       if (!byProject.has(csproj)) byProject.set(csproj, []);
       byProject.get(csproj)!.push(cls);
