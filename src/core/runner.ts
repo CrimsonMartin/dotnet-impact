@@ -13,7 +13,7 @@ import {
   testProjects,
 } from "./projects";
 import { ImpactMap } from "./map";
-import { StaticMapper } from "./staticmap";
+import { findBuiltDll, StaticMapper } from "./staticmap";
 import { cacheDirFor, classFilter, exec, git, parseStatusZ, toRepoRelative } from "./util";
 import type { SessionRunner } from "./vstestSession";
 import { ensureShadow, Shadow, syncOverlay } from "./worktree";
@@ -84,28 +84,7 @@ export class Runner {
       (p) => toRepoRelative(this.repoRoot, p.csproj).toLowerCase() === csprojRel.toLowerCase()
     );
     if (!info) return undefined;
-    const binDir = path.join(path.dirname(this.shadowPath(info.csproj)), "bin");
-    let best: { p: string; mtime: number } | undefined;
-    const walk = (d: string, depth: number) => {
-      if (depth > 4) return;
-      let entries: fs.Dirent[];
-      try {
-        entries = fs.readdirSync(d, { withFileTypes: true });
-      } catch {
-        return;
-      }
-      for (const e of entries) {
-        const p = path.join(d, e.name);
-        // ref/ holds metadata-only reference assemblies with the same name.
-        if (e.isDirectory() && e.name.toLowerCase() !== "ref") walk(p, depth + 1);
-        else if (e.isFile() && e.name.toLowerCase() === `${info.assemblyName.toLowerCase()}.dll`) {
-          const mtime = fs.statSync(p).mtimeMs;
-          if (!best || mtime > best.mtime) best = { p, mtime };
-        }
-      }
-    };
-    walk(binDir, 0);
-    return best?.p;
+    return findBuiltDll(this.shadow!.dir, info, this.repoRoot);
   }
 
   async prepare(): Promise<Shadow> {
@@ -478,15 +457,13 @@ export class Runner {
    */
   async buildMap(opts: {
     refresh?: boolean;
-    /** Concurrent per-class coverage runs (ignored on the Coverlet fallback). */
-    parallel?: number;
     /**
-     * Discovery results (repo-relative csproj -> class FQNs), from
-     * discoverAll(). Only projects with unmapped classes get a warm build.
+     * vstest-discovered classes per repo-relative csproj (from discoverAll()).
+     * Used as part of the alive set when pruning: vstest and IL metadata name
+     * nested classes differently, and the union never wrongly kills rows.
      */
     discovered: Record<string, string[]>;
     onProgress?: (done: number, total: number, current: string) => void;
-    /** Coarse phase updates before per-class progress exists (restore/build/discovery). */
     onPhase?: (message: string) => void;
     shouldCancel?: () => boolean;
   }): Promise<{ mapped: number; failed: string[] }> {

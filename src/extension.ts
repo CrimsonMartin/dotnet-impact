@@ -2,7 +2,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
-import { locateClasses, locateMethod, SourceLocation } from "./core/locate";
+import { locateClasses, locateMethod, SourceLocation, stripNesting } from "./core/locate";
 import { testProjects } from "./core/projects";
 import { AffectedSet, Runner, TestOutcome } from "./core/runner";
 import { cacheDirFor, setDotnetPath, toRepoRelative } from "./core/util";
@@ -127,7 +127,7 @@ async function eagerDiscover(): Promise<void> {
     updateStatus("discovering tests…", true);
     await runner.prepare();
     const discovered = await runner.discoverAll({
-      parallel: autoParallel(),
+      parallel: discoveryParallel(),
       onPhase: (m) => updateStatus(m, true),
     });
     rebuildTree(discovered);
@@ -138,7 +138,7 @@ async function eagerDiscover(): Promise<void> {
     const unmapped = [...classOwners.keys()].filter((c) => !runner!.map.has(c));
     if (cfg.get<boolean>("autoBuildMap", true) && unmapped.length > 0) {
       output.appendLine(`auto-building impact map for ${unmapped.length} unmapped test classes`);
-      // Reuse this discovery: buildMap skips its serial rebuild+re-list lead-in.
+      // Pass this discovery along so pruning sees vstest's class naming too.
       void buildMapWithProgress(vscode.ProgressLocation.Window, discovered);
     }
   } catch (e) {
@@ -181,14 +181,6 @@ function rebuildTree(discovered: Record<string, string[]>): void {
       projItem.children.add(item);
     }
   }
-}
-
-/** xUnit nested classes render as Ns.Outer+Inner; our locator keys on Ns.Inner. */
-function stripNesting(cls: string): string {
-  const plus = cls.lastIndexOf("+");
-  if (plus < 0) return cls;
-  const ns = cls.slice(0, cls.lastIndexOf(".", cls.indexOf("+")));
-  return `${ns}.${cls.slice(plus + 1)}`;
 }
 
 // ---------- running ----------
@@ -452,9 +444,12 @@ async function runAffectedNow(): Promise<void> {
 
 let mapBuilding = false;
 
-function autoParallel(): number {
-  // Each coverage run's datacollector saturates roughly one core.
-  return Math.max(1, Math.min(12, os.cpus().length - 2));
+/** Width for parallel test discovery; each --list-tests run costs roughly a core. */
+function discoveryParallel(): number {
+  const configured = vscode.workspace
+    .getConfiguration("dotnetImpact")
+    .get<number>("maxParallelCoverageRuns", 0);
+  return configured > 0 ? configured : Math.max(1, Math.min(12, os.cpus().length - 2));
 }
 
 async function buildMapWithProgress(
@@ -475,19 +470,13 @@ async function buildMapWithProgress(
         token.onCancellationRequested(() => (mapBuildCancelled = true));
         await runner!.prepare();
         discovered ??= await runner!.discoverAll({
-          parallel: autoParallel(),
+          parallel: discoveryParallel(),
           onPhase: (message) => {
             progress.report({ message });
             updateStatus(message, true);
           },
         });
-        const configured = vscode.workspace
-          .getConfiguration("dotnetImpact")
-          .get<number>("maxParallelCoverageRuns", 0);
-        const parallel = configured > 0 ? configured : autoParallel();
-        output.appendLine(`map build: parallel=${parallel}`);
         const res = await runner!.buildMap({
-          parallel,
           discovered,
           shouldCancel: () => mapBuildCancelled,
           onPhase: (message) => {

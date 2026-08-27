@@ -42,7 +42,6 @@ async function main(): Promise<number> {
       });
       const res = await runner.buildMap({
         refresh: has("--refresh"),
-        parallel,
         discovered,
         onPhase: (message) => process.stderr.write(`${message}\n`),
         onProgress: (done, total, current) =>

@@ -4,3 +4,5 @@ out/
 .impact/
 helper/bin/
 helper/obj/
+helper-static/bin/
+helper-static/obj/

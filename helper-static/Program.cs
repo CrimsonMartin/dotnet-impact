@@ -154,9 +154,8 @@ void LoadAssembly(AssemblyInput input)
         var td = md.GetTypeDefinition(tdh);
         var fqn = FullName(md, tdh);
         if (fqn == null) continue; // <Module> etc.
-        var node = new TypeNode { Fqn = TopLevelFqn(md, tdh) ?? fqn, Csproj = input.Csproj };
         // Nested and compiler-generated types fold into their top-level declaring type.
-        var key = asmName + "|" + fqn;
+        var node = new TypeNode { Fqn = TopLevelFqn(md, tdh) ?? fqn, Csproj = input.Csproj };
         if (world.TryGetValue(asmName + "|" + node.Fqn, out var existing)) node = existing;
         else
         {
@@ -164,7 +163,6 @@ void LoadAssembly(AssemblyInput input)
             if (!byName.TryGetValue(node.Fqn, out var list)) byName[node.Fqn] = list = new();
             list.Add(node);
         }
-        _ = key;
 
         var collector = new RefCollector(md, node.RefNames);
         // Base type + interfaces.
@@ -201,7 +199,7 @@ void LoadAssembly(AssemblyInput input)
                 {
                     var body = pe.GetMethodBody(m.RelativeVirtualAddress);
                     ScanIl(md, body.GetILBytes() ?? Array.Empty<byte>(), collector);
-                    foreach (var local in DecodeLocals(md, body, collector)) _ = local;
+                    DecodeLocals(md, body, collector);
                 }
                 catch
                 {
@@ -237,20 +235,17 @@ void LoadAssembly(AssemblyInput input)
     }
 }
 
-static IEnumerable<int> DecodeLocals(MetadataReader md, MethodBodyBlock body, RefCollector collector)
+static void DecodeLocals(MetadataReader md, MethodBodyBlock body, RefCollector collector)
 {
-    if (!body.LocalSignature.IsNil)
+    if (body.LocalSignature.IsNil) return;
+    try
     {
-        try
-        {
-            md.GetStandaloneSignature(body.LocalSignature).DecodeLocalSignature(collector, null);
-        }
-        catch
-        {
-            /* ignore */
-        }
+        md.GetStandaloneSignature(body.LocalSignature).DecodeLocalSignature(collector, null);
     }
-    yield break;
+    catch
+    {
+        /* ignore */
+    }
 }
 
 static string? FullName(MetadataReader md, TypeDefinitionHandle h)
@@ -268,7 +263,7 @@ static string? FullName(MetadataReader md, TypeDefinitionHandle h)
     return ns.Length > 0 ? ns + "." + name : name;
 }
 
-/** Top-level declaring type's FQN (nested + generated types fold upward). */
+// Top-level declaring type's FQN (nested + generated types fold upward).
 static string? TopLevelFqn(MetadataReader md, TypeDefinitionHandle h)
 {
     var td = md.GetTypeDefinition(h);
@@ -395,10 +390,8 @@ static class IlTables
     }
 }
 
-/**
- * Collects referenced type full names (metadata form, '/'-nesting folded to top
- * level) from signatures, attribute ctors, and IL tokens.
- */
+// Collects referenced type full names (nesting folded to the top-level type)
+// from signatures, attribute ctors, and IL tokens.
 sealed class RefCollector : ISignatureTypeProvider<int, object?>
 {
     private readonly MetadataReader _md;

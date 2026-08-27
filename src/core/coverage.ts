@@ -22,20 +22,6 @@ const COLLECTOR_COVERLET = "XPlat Code Coverage";
 /** Collector that worked for this session; resolved on first successful run. */
 let resolvedCollector: string | null = null;
 
-/** Test-only: reset the per-session collector choice. */
-export function resetCollectorChoice(): void {
-  resolvedCollector = null;
-}
-
-/**
- * Coverlet instruments assemblies on disk, so concurrent runs against one
- * project race; callers should serialize when this is true. The MS collector
- * (profiler-based) parallelizes safely.
- */
-export function usingCoverletFallback(): boolean {
-  return resolvedCollector === COLLECTOR_COVERLET;
-}
-
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -99,9 +85,8 @@ export async function collectClassCoverage(
   const run = (collector: string) => {
     fs.rmSync(resultsDir, { recursive: true, force: true });
     fs.mkdirSync(resultsDir, { recursive: true });
-    // --no-build: callers guarantee a fresh build (map build warm-builds each
-    // project; live refresh follows an affected run). Skipping the per-class
-    // MSBuild spin-up is the single biggest CPU/time saver here.
+    // --no-build: the only caller is live refresh, which runs right after an
+    // affected run built the project. Skipping the MSBuild spin-up matters.
     return exec(
       "dotnet",
       [

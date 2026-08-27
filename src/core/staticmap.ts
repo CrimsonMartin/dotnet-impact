@@ -78,8 +78,8 @@ export class StaticMapper {
 
   /**
    * Compute the static map over `shadowDir`'s built assemblies. Returns null
-   * when the helper is unavailable or produces nothing usable — callers fall
-   * back to the coverage path.
+   * when the helper is unavailable or produces nothing usable — the caller
+   * reports the failure and leaves the existing map untouched.
    */
   async compute(shadowDir: string, graph: ProjectGraph): Promise<StaticMapResult | null> {
     const helper = await this.ensureHelper();

@@ -2,9 +2,10 @@
 
 NCrunch-style **affected-test selection** for .NET in VS Code — free and open source.
 
-Builds a coverage-based impact map (which test classes execute which source files) in a
-background **git worktree shadow**, then on every save runs *only the tests affected by
-your change*, reporting results through VS Code's native Test Explorer. The same core
+Builds a static IL-based impact map (which test classes relate to which source files)
+in seconds inside a background **git worktree shadow**, refines it with measured
+coverage as tests run, and on every save runs *only the tests affected by your
+change*, reporting results through VS Code's native Test Explorer. The same core
 ships as a CLI for pre-commit hooks and AI coding agents, where a full CI run is too
 expensive per commit.
 
@@ -25,10 +26,11 @@ expensive per commit.
    conservative fallback: run every test project that transitively references the
    changed file's project (computed from the `ProjectReference` graph).
 
-Map building uses the Microsoft.CodeCoverage collector (bundled with
+Live map refresh uses the Microsoft.CodeCoverage collector (bundled with
 `Microsoft.NET.Test.Sdk`) — block-level instrumentation, much faster than Coverlet —
-and falls back to `coverlet.collector` automatically where it's unavailable. Running
-affected tests works regardless.
+and falls back to `coverlet.collector` automatically where it's unavailable. Map
+building itself is static analysis and needs no collector; running affected tests
+works regardless.
 
 ## VS Code extension
 

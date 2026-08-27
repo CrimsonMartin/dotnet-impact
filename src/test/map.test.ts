@@ -4,6 +4,32 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
 import { ImpactMap } from "../core/map";
+import { cacheDirFor } from "../core/util";
+
+test("save/load round-trip preserves rows and source markers", () => {
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "impact-map-rt-"));
+  try {
+    const a = new ImpactMap(repoRoot);
+    a.update("Ns.Cov", "t/T.csproj", ["a.cs"]);
+    a.updateStatic("Ns.Stat", "t/T.csproj", ["b.cs"]);
+    a.save();
+
+    const b = new ImpactMap(repoRoot);
+    assert.equal(b.classCount, 2);
+    assert.equal(b.entry("Ns.Cov")!.source, "coverage");
+    assert.equal(b.entry("Ns.Stat")!.source, "static");
+    // The static-never-clobbers-coverage rule must hold across sessions.
+    assert.equal(b.updateStatic("Ns.Cov", "t/T.csproj", ["x.cs"]), false);
+    // Pre-marker rows (source absent) count as coverage.
+    const raw = JSON.parse(fs.readFileSync(path.join(cacheDirFor(repoRoot), "impact-map.json"), "utf8"));
+    delete raw.entries["Ns.Cov"].source;
+    fs.writeFileSync(path.join(cacheDirFor(repoRoot), "impact-map.json"), JSON.stringify(raw));
+    const c = new ImpactMap(repoRoot);
+    assert.equal(c.updateStatic("Ns.Cov", "t/T.csproj", ["x.cs"]), false);
+  } finally {
+    fs.rmSync(cacheDirFor(repoRoot), { recursive: true, force: true });
+  }
+});
 
 function freshMap(): ImpactMap {
   // Point the map at a repo path that has no cache on disk.

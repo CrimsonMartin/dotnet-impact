@@ -80,3 +80,15 @@ export function locateMethod(file: string, methodName: string): number | undefin
 function escapeRe(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
+
+/**
+ * xUnit renders nested classes as Ns.Outer+Inner while locateClasses keys on
+ * Ns.Inner (it ignores nesting): bridge the two naming schemes.
+ */
+export function stripNesting(cls: string): string {
+  const plus = cls.lastIndexOf("+");
+  if (plus < 0) return cls;
+  const dot = cls.lastIndexOf(".", cls.indexOf("+"));
+  const inner = cls.slice(plus + 1);
+  return dot < 0 ? inner : `${cls.slice(0, dot)}.${inner}`;
+}

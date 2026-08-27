@@ -3,7 +3,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
-import { locateClasses, locateMethod } from "../core/locate";
+import { locateClasses, locateMethod, stripNesting } from "../core/locate";
+
+test("stripNesting: bridges vstest nesting to locator naming", () => {
+  assert.equal(stripNesting("Ns.Outer+Inner"), "Ns.Inner");
+  assert.equal(stripNesting("Ns.Plain"), "Ns.Plain");
+  assert.equal(stripNesting("Deep.Ns.A+B+C"), "Deep.Ns.C");
+  assert.equal(stripNesting("Outer+Inner"), "Inner"); // namespace-less: no mangled slice
+});
 
 const FILE_SCOPED = `using Xunit;
 
