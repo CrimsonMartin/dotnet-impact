@@ -3,15 +3,35 @@
  * Impact CLI — same core as the VS Code extension, callable from
  * pre-commit hooks and AI coding agents.
  *
- *   impact build-map [--refresh]     build/refresh the impact map (background-safe)
- *   impact affected [--base <ref>] [--staged]   print affected test classes
- *   impact run [--base <ref>] [--staged]        run affected tests; exit 1 on failure
- *   impact status                    map coverage stats
+ *   impact build-map [--refresh] [--parallel <n>]      build/refresh the impact map
+ *   impact affected [file ...] [--base <ref>] [--staged]   print affected test classes
+ *   impact run [file ...] [--base <ref>] [--staged]        run affected tests
+ *   impact status
+ *
+ * Selection (CLI-only; the extension keeps its own save-driven path):
+ *   file args     exactly those files — lint-staged / pre-commit pass staged
+ *                 filenames as trailing arguments, agents pass what they edited
+ *   --staged      the index only: the tight pre-commit mode
+ *   --base <ref>  <ref>...HEAD plus the dirty tree
+ *   (default)     auto-detected base...HEAD plus the dirty tree — pre-push,
+ *                 CI, post-commit verification
+ *
+ * Exit codes are the contract (stdout may change): 0 = affected tests passed,
+ * or nothing to do; 1 = test failure or internal error; 2 = usage. And
+ * infrastructure never blocks a commit: no map yet, or the shadow lock held
+ * by another impact process, warns on stderr and exits 0.
  */
 import * as os from "os";
 import * as path from "path";
+import { cliChangedFiles } from "./core/changeset";
+import { parseCliArgs } from "./core/cliArgs";
+import { acquireShadowLock } from "./core/lock";
 import { Runner } from "./core/runner";
 import { git } from "./core/util";
+
+const USAGE =
+  "usage: impact <build-map|affected|run|status> [file ...] " +
+  "[--base <ref>] [--staged] [--refresh] [--parallel <n>]";
 
 async function findRepoRoot(cwd: string): Promise<string> {
   const res = await git(cwd, ["rev-parse", "--show-toplevel"]);
@@ -19,84 +39,129 @@ async function findRepoRoot(cwd: string): Promise<string> {
   return path.resolve(res.stdout.trim());
 }
 
-function arg(flag: string): string | undefined {
-  const i = process.argv.indexOf(flag);
-  return i >= 0 ? process.argv[i + 1] : undefined;
-}
-const has = (flag: string) => process.argv.includes(flag);
-
 async function main(): Promise<number> {
-  const cmd = process.argv[2];
+  const parsed = parseCliArgs(process.argv.slice(2));
+  if (parsed.errors.length > 0) {
+    for (const e of parsed.errors) console.error(e);
+    console.error(USAGE);
+    return 2;
+  }
   const repoRoot = await findRepoRoot(process.cwd());
   const runner = new Runner(repoRoot);
+  const base = parsed.flags.get("--base") as string | undefined;
+  const staged = parsed.flags.has("--staged");
 
-  switch (cmd) {
+  /** File args or git-derived selection, as repo-relative-friendly paths. */
+  const selectFiles = async (): Promise<string[]> =>
+    parsed.files.length > 0
+      ? // Hook frameworks differ: lint-staged passes absolute paths,
+        // pre-commit repo-relative (cwd = repo root). Resolving against cwd
+        // handles both plus paths typed from a subdirectory.
+        parsed.files.map((f) => path.resolve(process.cwd(), f))
+      : cliChangedFiles(repoRoot, { base, staged });
+
+  switch (parsed.command) {
     case "build-map": {
-      await runner.prepare();
-      const configured = Number(arg("--parallel") ?? 0);
-      const parallel =
-        configured > 0 ? configured : Math.max(1, Math.min(12, os.cpus().length - 2));
-      const discovered = await runner.discoverAll({
-        parallel,
-        onPhase: (message) => process.stderr.write(`${message}\n`),
-      });
-      const res = await runner.buildMap({
-        refresh: has("--refresh"),
-        discovered,
-        onPhase: (message) => process.stderr.write(`${message}\n`),
-        onProgress: (done, total, current) =>
-          process.stderr.write(`[${done + 1}/${total}] ${current}\n`),
-      });
-      console.log(`mapped ${res.mapped} test classes; ${res.failed.length} failures`);
-      for (const f of res.failed) console.error(`  failed: ${f}`);
-      return 0;
+      const release = await acquireShadowLock(repoRoot);
+      if (!release) {
+        console.error("another impact process holds the shadow worktree; try again shortly");
+        return 1;
+      }
+      try {
+        await runner.prepare();
+        const configured = Number(parsed.flags.get("--parallel") ?? 0);
+        const parallel =
+          configured > 0 ? configured : Math.max(1, Math.min(12, os.cpus().length - 2));
+        const discovered = await runner.discoverAll({
+          parallel,
+          onPhase: (message) => process.stderr.write(`${message}\n`),
+        });
+        const res = await runner.buildMap({
+          refresh: parsed.flags.has("--refresh"),
+          discovered,
+          onPhase: (message) => process.stderr.write(`${message}\n`),
+          onProgress: (done, total, current) =>
+            process.stderr.write(`[${done + 1}/${total}] ${current}\n`),
+        });
+        console.log(`mapped ${res.mapped} test classes; ${res.failed.length} failures`);
+        for (const f of res.failed) console.error(`  failed: ${f}`);
+        return 0;
+      } finally {
+        release();
+      }
     }
     case "affected": {
-      await runner.prepare();
-      const changed = await runner.changedFiles(arg("--base"), has("--staged"));
-      const affected = runner.computeAffected(changed);
+      if (parsed.files.length > 0 && (base || staged)) {
+        console.error("file arguments and --base/--staged are mutually exclusive");
+        console.error(USAGE);
+        return 2;
+      }
+      if (runner.map.classCount === 0) {
+        console.error("no impact map yet — run `impact build-map` first; skipping");
+        return 0;
+      }
+      // Selection only: no shadow, no lock — cheap enough for any hook.
+      const affected = runner.computeAffected(await selectFiles());
       for (const c of affected.classes) console.log(c);
       for (const p of affected.fallbackProjects) console.log(`project:${p.name}`);
       return 0;
     }
     case "run": {
-      await runner.prepare();
-      const changed = await runner.changedFiles(arg("--base"), has("--staged"));
-      if (changed.length === 0) {
-        console.log("no changes detected; nothing to run");
+      if (parsed.files.length > 0 && (base || staged)) {
+        console.error("file arguments and --base/--staged are mutually exclusive");
+        console.error(USAGE);
+        return 2;
+      }
+      // Never block a commit on infrastructure: a cold start (shadow create +
+      // solution build) belongs in `impact build-map`, not inside `git commit`.
+      if (runner.map.classCount === 0) {
+        console.error("no impact map yet — run `impact build-map` first; skipping");
         return 0;
       }
-      const affected = runner.computeAffected(changed);
-      if (affected.classes.length === 0 && affected.fallbackProjects.length === 0) {
-        console.log("no tests affected by this change");
+      const release = await acquireShadowLock(repoRoot);
+      if (!release) {
+        console.error("another impact process holds the shadow worktree — skipped");
         return 0;
       }
-      console.log(
-        `running ${affected.classes.length} mapped test classes` +
-          (affected.fallbackProjects.length
-            ? ` + ${affected.fallbackProjects.length} full project(s) (unmapped files)`
-            : "")
-      );
-      const result = await runner.runAffected(affected);
-      const failed = result.outcomes.filter((o) => !o.passed && !o.skipped);
-      const skipped = result.outcomes.filter((o) => o.skipped);
-      for (const f of failed) console.error(`FAIL ${f.method}\n  ${f.message ?? ""}`);
-      console.log(
-        `${result.outcomes.length - failed.length - skipped.length}/${result.outcomes.length} passed` +
-          (skipped.length ? `, ${skipped.length} skipped` : "") +
-          (result.ok ? "" : " — FAILED")
-      );
-      if (!result.ok && result.outcomes.length === 0) console.error(result.output);
-      return result.ok ? 0 : 1;
+      try {
+        await runner.prepare();
+        const changed = await selectFiles();
+        if (changed.length === 0) {
+          console.log("no changes detected; nothing to run");
+          return 0;
+        }
+        const affected = runner.computeAffected(changed);
+        if (affected.classes.length === 0 && affected.fallbackProjects.length === 0) {
+          console.log("no tests affected by this change");
+          return 0;
+        }
+        console.log(
+          `running ${affected.classes.length} mapped test classes` +
+            (affected.fallbackProjects.length
+              ? ` + ${affected.fallbackProjects.length} full project(s) (unmapped files)`
+              : "")
+        );
+        const result = await runner.runAffected(affected);
+        const failed = result.outcomes.filter((o) => !o.passed && !o.skipped);
+        const skipped = result.outcomes.filter((o) => o.skipped);
+        for (const f of failed) console.error(`FAIL ${f.method}\n  ${f.message ?? ""}`);
+        console.log(
+          `${result.outcomes.length - failed.length - skipped.length}/${result.outcomes.length} passed` +
+            (skipped.length ? `, ${skipped.length} skipped` : "") +
+            (result.ok ? "" : " — FAILED")
+        );
+        if (!result.ok && result.outcomes.length === 0) console.error(result.output);
+        return result.ok ? 0 : 1;
+      } finally {
+        release();
+      }
     }
     case "status": {
       console.log(`impact map: ${runner.map.classCount} test classes mapped`);
       return 0;
     }
     default:
-      console.error(
-        "usage: impact <build-map|affected|run|status> [--base <ref>] [--staged] [--refresh]"
-      );
+      console.error(USAGE);
       return 2;
   }
 }
