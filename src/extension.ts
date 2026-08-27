@@ -69,11 +69,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   populateTreeFromCache();
   void eagerDiscover(); // background: build shadow, discover classes, refresh tree
 
+  // When C# Dev Kit is present it registers its own test controller over the
+  // same projects; staying a default profile there would make the Testing
+  // view's Run All execute every test twice. Non-default keeps Impact's tree
+  // runnable explicitly while Dev Kit owns Run All.
+  const devKitPresent = !!vscode.extensions.getExtension("ms-dotnettools.csdevkit");
   const profile = controller.createRunProfile(
     "Affected tests",
     vscode.TestRunProfileKind.Run,
     (request, token) => runHandler(request, token),
-    true
+    !devKitPresent
   );
   profile.supportsContinuousRun = true;
 
