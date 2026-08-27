@@ -45,53 +45,75 @@ internal sealed class StartupHook
 
     private static void Serve(string pipeName)
     {
+        // .NET on Unix unlinks the pipe's socket file when a connection is
+        // accepted, so a single instance can never accept twice. Accept, hand
+        // the connection to a worker, and bind a fresh instance immediately so
+        // the socket always exists for the next push.
         for (;;)
         {
             try
             {
-                using var server = new NamedPipeServerStream(
-                    pipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte);
+                var server = new NamedPipeServerStream(
+                    pipeName, PipeDirection.InOut,
+                    NamedPipeServerStream.MaxAllowedServerInstances, PipeTransmissionMode.Byte);
                 server.WaitForConnection();
-                using var reader = new BinaryReader(server, Encoding.UTF8, leaveOpen: true);
-                using var writer = new BinaryWriter(server, Encoding.UTF8, leaveOpen: true);
-                for (;;)
-                {
-                    string name;
-                    byte[] md, il, pdb;
-                    try
-                    {
-                        name = Encoding.UTF8.GetString(reader.ReadBytes(reader.ReadInt32()));
-                        md = reader.ReadBytes(reader.ReadInt32());
-                        il = reader.ReadBytes(reader.ReadInt32());
-                        pdb = reader.ReadBytes(reader.ReadInt32());
-                    }
-                    catch
-                    {
-                        break; // client hung up
-                    }
-                    byte status = 0;
-                    try
-                    {
-                        var asm = AppDomain.CurrentDomain.GetAssemblies()
-                            .FirstOrDefault(a => string.Equals(a.GetName().Name, name, StringComparison.OrdinalIgnoreCase));
-                        if (asm != null)
-                        {
-                            MetadataUpdater.ApplyUpdate(asm, md, il, pdb);
-                            status = 1;
-                        }
-                    }
-                    catch (Exception e)
-                    {
-                        Console.Error.WriteLine($"[impact-hotpatch] apply failed for {name}: {e.Message}");
-                    }
-                    writer.Write(status);
-                    writer.Flush();
-                }
+                var conn = server;
+                new Thread(() => Handle(conn)) { IsBackground = true }.Start();
             }
             catch
             {
-                Thread.Sleep(200); // pipe error: recreate the server
+                Thread.Sleep(200); // bind/accept error: retry
             }
+        }
+    }
+
+    private static void Handle(NamedPipeServerStream conn)
+    {
+        try
+        {
+            using var reader = new BinaryReader(conn, Encoding.UTF8, leaveOpen: true);
+            using var writer = new BinaryWriter(conn, Encoding.UTF8, leaveOpen: true);
+            for (;;)
+            {
+                string name;
+                byte[] md, il, pdb;
+                try
+                {
+                    name = Encoding.UTF8.GetString(reader.ReadBytes(reader.ReadInt32()));
+                    md = reader.ReadBytes(reader.ReadInt32());
+                    il = reader.ReadBytes(reader.ReadInt32());
+                    pdb = reader.ReadBytes(reader.ReadInt32());
+                }
+                catch
+                {
+                    return; // client hung up
+                }
+                byte status = 0;
+                try
+                {
+                    var asm = AppDomain.CurrentDomain.GetAssemblies()
+                        .FirstOrDefault(a => string.Equals(a.GetName().Name, name, StringComparison.OrdinalIgnoreCase));
+                    if (asm != null)
+                    {
+                        MetadataUpdater.ApplyUpdate(asm, md, il, pdb);
+                        status = 1;
+                    }
+                }
+                catch (Exception e)
+                {
+                    Console.Error.WriteLine($"[impact-hotpatch] apply failed for {name}: {e.Message}");
+                }
+                writer.Write(status);
+                writer.Flush();
+            }
+        }
+        catch
+        {
+            /* connection error: worker exits */
+        }
+        finally
+        {
+            conn.Dispose();
         }
     }
 }

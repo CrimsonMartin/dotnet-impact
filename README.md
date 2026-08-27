@@ -93,5 +93,5 @@ npm test            # unit tests (node --test) over the parsing/selection core
 ```
 
 Launch the extension with F5 (Extension Development Host). The shadow worktree and map
-live under `~/.dotnet-impact/<repo>-<hash>/` — delete that folder to reset everything
+live under `~/.impact/<repo>-<hash>/` — delete that folder to reset everything
 (then `git worktree prune` in the repo).
