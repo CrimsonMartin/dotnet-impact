@@ -5,7 +5,7 @@ don't sit inside VS Code: git hooks (pre-commit, pre-push) and AI coding agents 
 want sub-minute, blast-radius-scoped test feedback per edit or per commit. This
 document records what change-selection the CLI supports today (verified against
 `src/cli.ts` and `src/core/runner.ts`), where it falls short for those consumers,
-and what we add.
+and what we change.
 
 ## Current state (verified)
 
@@ -19,84 +19,110 @@ supports three modes:
 | `impact run --staged` | `git diff --name-only --cached` — the index only |
 | `impact run --base <ref>` | `git diff --name-only <ref>` (ref vs working tree) **unioned with** full `git status` |
 
-So the README's pre-commit hook (`impact run --staged`) already selects tests from a
-git diff. What's missing is below.
+The gap: every mode is anchored to the working tree. Nothing answers "what did the
+commits on this branch affect?" — the question asked by a pre-push hook, an agent
+verifying a commit it just made, and CI running affected-only on a PR branch. With
+`--base`, uncommitted noise is always unioned in; with no flags, committed work is
+invisible the moment it's committed.
 
-## Gaps for hooks and agents
+## Design principle: right by default, no new flags
 
-### 1. No committed-only diff — can't express "base..HEAD, ignore the dirty tree"
+Each context has an *ideal* changed-set (staged files for pre-commit, `HEAD~1` for
+post-commit verification, `origin/main...HEAD` for pre-push/CI, the just-edited
+files for an agent's inner loop). But a **superset is always correct** — the map
+collapses files to test classes, dedup drops double-runs, failure-first ordering and
+warm sessions make overlap cheap. So instead of a flag per context (`--diff`
+pass-through was considered and dropped), we make the default set a superset that
+contains every context's right answer, and keep the two existing flags as
+narrow-down overrides.
 
-Every current mode folds in working-tree state: `--base <ref>` diffs the ref against
-the *working tree* and additionally unions in `git status`. There is no way to ask
-"which tests are affected by the commits between `origin/main` and `HEAD`?" while
-ignoring uncommitted noise. That's exactly the question asked by:
+### 1. Default changed-set = committed branch diff ∪ dirty tree
 
-- a **pre-push hook** (validate what's being pushed, not what's half-edited),
-- an **agent verifying a commit it just made** (post-commit check),
-- **CI** running affected-only on a PR branch.
+`impact run` / `impact affected` with no flags selects from:
 
-**Add: a pass-through git-diff option.**
+1. **Committed work on this branch**: auto-detect the base — the branch's
+   `@{upstream}` if set, else `origin/HEAD` (the remote default branch), else none —
+   and take `git diff --name-only -z <merge-base(base, HEAD)>..HEAD` (three-dot
+   semantics: what *this branch* changed, not what base moved on). Rename origins
+   included via `--name-status`, matching what the status path already does.
+2. **Uncommitted work**: the existing `git status --porcelain --untracked-files=all`
+   union, unchanged.
+
+Degradations are all safe: no upstream and no `origin/HEAD` → status only (today's
+behavior, e.g. a fresh local-only repo); branch not ahead of base (merge-base ==
+HEAD, e.g. just after a pull on the default branch) → committed part is empty →
+today's behavior; detached HEAD → status only unless an upstream resolves.
+
+This makes all the commit-granular cases work with **zero flags**:
+
+- **post-commit verify** (agent just committed): the commit is in the branch diff.
+- **pre-push hook / CI**: clean tree → exactly the merge-base range every
+  affected-test system (Nx, Turborepo, dotnet-affected) is built on.
+- **agent inner loop**: dirty tree still included, as today.
+
+Existing flags become the narrow-down overrides, not additions:
+
+- `--base <ref>` — overrides base auto-detection (and keeps its current
+  "vs working tree" meaning for an explicitly chosen ref).
+- `--staged` — the tight, index-only mode for speed-sensitive pre-commit hooks and
+  partial staging; unchanged.
+
+Trade-off, stated honestly: on a long-lived branch the default set is larger than a
+per-context minimum, so a pre-commit hook on such a branch re-covers earlier branch
+commits. Mitigations already exist (`--staged` for the hook, failure-first ordering,
+warm sessions); if it bites in practice, a "last validated commit" watermark is the
+future optimization — not a new flag.
+
+### 2. Positional file arguments — the hook-framework contract, not a flag
 
 ```
-impact affected --diff <args...>
-impact run --diff <args...>
+impact run [file ...]
+impact affected [file ...]
 ```
 
-`--diff` consumes the rest of the argument list and passes it verbatim to
-`git diff --name-only -z <args...>`, with **no** status union. Examples:
+When positional paths are given, git inspection is skipped entirely and they feed
+`computeAffected` directly (the same internal path the VS Code extension uses on
+save). This is not ergonomic sugar: **lint-staged and pre-commit.com invoke hook
+commands with the staged filenames as trailing arguments** — that's their interface.
+Positional args make impact a drop-in entry for both:
 
+```jsonc
+// lint-staged
+{ "*.cs": "impact run" }
 ```
-impact run --diff HEAD~1                 # tests affected by the last commit
-impact run --diff origin/main...HEAD     # merge-base diff for the branch (pre-push)
-impact run --diff --cached               # equivalent to --staged
+
+```yaml
+# .pre-commit-config.yaml
+- repo: local
+  hooks:
+    - id: impact
+      entry: impact run
+      language: system
+      files: \.cs$
 ```
 
-Pass-through (rather than a curated `--committed-only` flag) keeps us out of the
-business of re-modelling git's range semantics — two-dot, three-dot/merge-base,
-`--cached`, `-M` rename detection all come for free, and agents already speak
-`git diff`. `--diff` is mutually exclusive with `--base`/`--staged` (error out if
-combined). Rename detection: pass `--name-status` internally instead of
-`--name-only` so both sides of a rename feed selection, matching what the
-status-based path already does via `parseStatusZ`.
+They also give agents the tight inner loop ("I edited these 3 files, test their
+blast radius") without depending on the tree being otherwise clean.
 
-### 2. `--staged` selects from the index but tests run against the working tree
+### 3. `--staged` selects from the index but tests run against the working tree
 
 The shadow worktree is `HEAD` + a file-copy overlay of the **working tree**
 (`syncOverlay` copies `git status` dirty files), not the index. With partial
 staging, `impact run --staged` picks tests from staged files but executes unstaged
-code — a pre-commit hook can green-light a commit whose actual (staged) content was
-never built or run. This is the classic pre-commit snapshot problem (`git stash -k`
-territory).
+code — a hook can green-light a commit whose actual staged content was never run.
+This is the exact problem pre-commit.com engineered its stash-unstaged behavior
+around.
 
-Decision: **document, don't solve yet.** Agents stage everything before committing,
-so index == worktree in the primary use case; humans doing partial `git add -p` on a
-.NET repo are the rare case, and index-snapshot checkout into the shadow is a
-meaningful chunk of work (overlay from `git checkout-index` instead of file copies).
-Add a note to the README's hook section; revisit as an opt-in `--index-snapshot`
-mode if it bites.
+Decision: **document, don't solve yet.** Agents stage everything, so index ==
+worktree in the primary use case. Revisit as an index-snapshot overlay
+(`git checkout-index` based) only if it bites.
 
-### 3. No machine-readable output
+### 4. JSON output — deferred
 
-Agents parse stdout today. Add `--json` to `affected` and `run`:
-
-- `affected --json` → `{ "changedFiles": [...], "classes": [...], "fallbackProjects": [...] }`
-- `run --json` → the above plus `{ "ok": bool, "outcomes": [{ "method", "passed", "skipped", "message" }] }`
-
-Human-readable output stays the default; progress/phase chatter already goes to
-stderr, so stdout stays clean JSON under the flag.
-
-### 4. Explicit file list
-
-An agent that just edited three files shouldn't need the repo to be dirty in any
-particular way:
-
-```
-impact affected --files src/A.cs src/B.cs
-```
-
-Bypasses git entirely and feeds `computeAffected` directly (it already accepts any
-repo-relative or absolute list — the extension uses this path on save). Low cost,
-high agent ergonomics.
+Considered and parked: it can't be *default* behavior (changing stdout format breaks
+existing consumers), agents parse the current text output fine, and the exit code
+already carries the pass/fail contract. Revisit only on concrete demand; until then
+treat the current stdout format as stable.
 
 ## Out of scope (unchanged)
 
@@ -107,11 +133,13 @@ high agent ergonomics.
 
 ## Implementation order
 
-1. `--diff` pass-through in `changedFiles` + CLI parsing + README (`pre-push` example
-   alongside the existing pre-commit one). *(core of this plan)*
-2. `--json` on `affected` and `run`.
-3. `--files` explicit list.
-4. README note on the staged-vs-worktree caveat (with item 1).
+1. Default changed-set: base auto-detection (`@{upstream}` → `origin/HEAD` → none) +
+   merge-base committed diff unioned into `changedFiles`. *(core of this plan)*
+2. Positional file arguments on `affected` and `run`.
+3. README: hook recipes (lint-staged / pre-commit.com pre-commit, pre-push), the
+   staged-vs-worktree caveat note, and a suggested `CLAUDE.md`/agent-docs snippet
+   ("after editing run `impact run <files>`; after committing run `impact run`") so
+   agents discover the workflow.
 
-Each step is independently shippable; 1 is the one that unblocks pre-push hooks and
-post-commit agent verification.
+Each step is independently shippable; 1 makes hooks, CI, and post-commit agent
+verification work with no flags at all.
