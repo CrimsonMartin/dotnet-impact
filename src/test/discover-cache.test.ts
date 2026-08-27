@@ -44,13 +44,13 @@ test("discoverAll: cache skip, invalidation, force, failure-keeps-stale, dead-pr
       discoverImpl: async () => {
         calls++;
         if (fail) throw new Error("boom");
-        return ["Ns.ATests"];
+        return ["Ns.ATests.Adds", "Ns.ATests.Subtracts"];
       },
     };
 
     // 1. Cold: discovers once, caches.
     const d1 = await runner.discoverAll(seams);
-    assert.deepEqual(d1, { "tests/T/T.csproj": ["Ns.ATests"] });
+    assert.deepEqual(d1, { "tests/T/T.csproj": ["Ns.ATests.Adds", "Ns.ATests.Subtracts"] });
     assert.equal(calls, 1);
 
     // 2. Warm, unchanged: stamp skip — zero discovery calls, same result.
@@ -73,7 +73,7 @@ test("discoverAll: cache skip, invalidation, force, failure-keeps-stale, dead-pr
     fs.utimesSync(f, new Date(), new Date(Date.now() + 10_000));
     const d5 = await runner.discoverAll(seams);
     assert.equal(calls, 4);
-    assert.deepEqual(d5["tests/T/T.csproj"], ["Ns.ATests"]);
+    assert.deepEqual(d5["tests/T/T.csproj"], ["Ns.ATests.Adds", "Ns.ATests.Subtracts"]);
     fail = false;
 
     // 6. Dead projects drop out of the cache file.
@@ -89,6 +89,7 @@ test("discoverAll: cache skip, invalidation, force, failure-keeps-stale, dead-pr
     const cache = JSON.parse(
       fs.readFileSync(path.join(cacheDirFor(root), "discovery-cache.json"), "utf8")
     );
+    assert.equal(cache.version, 3);
     assert.deepEqual(Object.keys(cache.projects), ["tests/T/T.csproj"]);
   } finally {
     cleanup(root);

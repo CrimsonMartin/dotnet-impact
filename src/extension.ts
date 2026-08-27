@@ -2,7 +2,8 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
-import { locateClasses, locateMethod, SourceLocation, stripNesting } from "./core/locate";
+import { classOf } from "./core/discover";
+import { locateClasses, locateMethod, locateMethods, SourceLocation, stripNesting } from "./core/locate";
 import { testProjects } from "./core/projects";
 import { KnownResult, replayEvents } from "./core/replay";
 import { AffectedSet, Runner, TestOutcome } from "./core/runner";
@@ -143,9 +144,13 @@ function populateTreeFromCache(): void {
     const raw = JSON.parse(
       fs.readFileSync(path.join(cacheDirFor(runner!.repoRoot), "discovery-cache.json"), "utf8")
     );
-    for (const [rel, entry] of Object.entries<{ classes: string[] }>(raw?.projects ?? {})) {
-      cached[rel] = entry.classes;
+    if (raw?.version === 3) {
+      for (const [rel, entry] of Object.entries<{ methods: string[] }>(raw?.projects ?? {})) {
+        cached[rel] = entry.methods;
+      }
     }
+    // Older cache versions held classes only; the map still seeds class items
+    // below, and eager discovery refills methods moments later.
   } catch {
     /* first session */
   }
@@ -163,7 +168,8 @@ async function eagerDiscover(): Promise<void> {
       onPhase: (m) => updateStatus(m, true),
     });
     rebuildTree(discovered);
-    updateStatus(`${classOwners.size} test classes`);
+    const methodCount = Object.values(discovered).reduce((n, m) => n + m.length, 0);
+    updateStatus(`${methodCount} tests in ${classOwners.size} classes`);
 
     // Auto-build the map for any classes it doesn't cover yet.
     const cfg = vscode.workspace.getConfiguration("dotnetImpact");
@@ -179,7 +185,11 @@ async function eagerDiscover(): Promise<void> {
   }
 }
 
-/** (Re)build project + class items, attaching source locations from the real repo. */
+/**
+ * (Re)build project + class + method items, attaching source locations from
+ * the real repo. Discovery lists full method FQNs, so every class's dropdown
+ * is populated up front — no run needed to see the methods.
+ */
 function rebuildTree(discovered: Record<string, string[]>): void {
   if (!runner || !controller) return;
   const graph = runner.projectGraph();
@@ -192,9 +202,18 @@ function rebuildTree(discovered: Record<string, string[]>): void {
     const projItem = controller.createTestItem(p.csproj, p.name, vscode.Uri.file(p.csproj));
     controller.items.add(projItem);
 
+    // Group discovered method FQNs under their classes.
+    const methodsByClass = new Map<string, string[]>();
+    for (const m of discovered[rel] ?? []) {
+      const cls = classOf(m);
+      if (!cls) continue;
+      if (!methodsByClass.has(cls)) methodsByClass.set(cls, []);
+      methodsByClass.get(cls)!.push(m);
+    }
+
     const locations = locateClasses(p.dir);
     const classes = new Set<string>([
-      ...(discovered[rel] ?? []),
+      ...methodsByClass.keys(),
       ...runner.map.classes().filter((c) => runner!.map.entry(c)?.csproj === rel),
     ]);
     for (const cls of [...classes].sort()) {
@@ -209,8 +228,23 @@ function rebuildTree(discovered: Record<string, string[]>): void {
         classLocations.set(cls, loc);
         item.range = new vscode.Range(loc.line, 0, loc.line, 0);
       }
-      item.canResolveChildren = false; // methods appear after first run
+      item.canResolveChildren = false; // children are added eagerly below
       projItem.children.add(item);
+
+      // Pre-populate method children (one file read locates them all).
+      const methods = (methodsByClass.get(cls) ?? []).sort();
+      const names = methods.map((m) => m.slice(cls.length + 1) || m);
+      const lines = loc ? locateMethods(loc.file, names) : new Map<string, number>();
+      for (let i = 0; i < methods.length; i++) {
+        const child = controller.createTestItem(
+          methods[i],
+          names[i],
+          loc ? vscode.Uri.file(loc.file) : undefined
+        );
+        const line = lines.get(names[i]);
+        if (line !== undefined) child.range = new vscode.Range(line, 0, line, 0);
+        item.children.add(child);
+      }
     }
   }
 }

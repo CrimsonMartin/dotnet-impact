@@ -10,7 +10,8 @@ function stripArgs(name: string): string {
   return name.replace(/\(.*\)$/s, "");
 }
 
-function classOf(displayName: string): string | undefined {
+/** Containing class of a method FQN, or undefined if the name isn't FQN-shaped. */
+export function classOf(displayName: string): string | undefined {
   const noArgs = stripArgs(displayName);
   const lastDot = noArgs.lastIndexOf(".");
   if (lastDot <= 0) return undefined;
@@ -19,7 +20,8 @@ function classOf(displayName: string): string | undefined {
 }
 
 /**
- * Extract test class FQNs from `dotnet test --list-tests` output.
+ * Extract test method FQNs (theory args stripped, deduped) from
+ * `dotnet test --list-tests` output.
  *
  * VSTest prints a "The following Tests are available:" marker followed by one
  * indented display name per line. Microsoft.Testing.Platform (xunit v3, MTP
@@ -29,17 +31,16 @@ function classOf(displayName: string): string | undefined {
  */
 export function parseListedTests(stdout: string): string[] {
   const lines = stdout.split(/\r?\n/);
-  const classes = new Set<string>();
+  const methods = new Set<string>();
   const markerAt = lines.findIndex((l) => /following tests are available/i.test(l));
 
   if (markerAt >= 0) {
     for (const raw of lines.slice(markerAt + 1)) {
-      const line = raw.trim();
+      const line = stripArgs(raw.trim());
       if (!line) continue;
-      const cls = classOf(line);
-      if (cls) classes.add(cls);
+      if (FQN_RE.test(line) && classOf(line)) methods.add(line);
     }
-    return [...classes].sort();
+    return [...methods].sort();
   }
 
   // MTP-style output: no marker. Accept only unambiguous test lines.
@@ -50,17 +51,32 @@ export function parseListedTests(stdout: string): string[] {
     // Require Namespace.Class.Method (>= 2 dots) so chatter like
     // "Determining projects to restore" or "Tests.dll" never qualifies.
     if (line.split(".").length < 3) continue;
-    const cls = classOf(line);
-    if (cls) classes.add(cls);
+    if (classOf(line)) methods.add(line);
   }
-  return [...classes].sort();
+  return [...methods].sort();
+}
+
+/** Collapse a per-project methods record to the distinct classes it contains. */
+export function classesRecord(
+  discovered: Record<string, string[]>
+): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  for (const [rel, methods] of Object.entries(discovered)) {
+    const classes = new Set<string>();
+    for (const m of methods) {
+      const cls = classOf(m);
+      if (cls) classes.add(cls);
+    }
+    out[rel] = [...classes].sort();
+  }
+  return out;
 }
 
 /**
- * List test classes (fully qualified) in a test project via
- * `dotnet test --list-tests`.
+ * List test methods (fully qualified, theory args stripped) in a test project
+ * via `dotnet test --list-tests`.
  */
-export async function discoverTestClasses(
+export async function discoverTests(
   csproj: string,
   cwd: string,
   noBuild = false
@@ -70,9 +86,9 @@ export async function discoverTestClasses(
     ["test", csproj, "--list-tests", ...(noBuild ? ["--no-build"] : []), "--nologo", "--verbosity", "quiet"],
     cwd
   );
-  const classes = parseListedTests(res.stdout);
-  if (res.code !== 0 && classes.length === 0) {
+  const methods = parseListedTests(res.stdout);
+  if (res.code !== 0 && methods.length === 0) {
     throw new Error(`test discovery failed for ${csproj}: ${res.stderr || res.stdout}`);
   }
-  return classes;
+  return methods;
 }

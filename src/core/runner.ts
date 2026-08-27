@@ -10,7 +10,7 @@ import {
   parseCoberturaLineHits,
   preferredCollector,
 } from "./coverage";
-import { discoverTestClasses } from "./discover";
+import { classesRecord, discoverTests } from "./discover";
 import {
   affectedTestProjects,
   buildProjectGraph,
@@ -113,13 +113,14 @@ export class Runner {
   }
 
   /**
-   * Discover test classes across all test projects, fast:
+   * Discover test methods across all test projects, fast:
    * - projects whose sources are unchanged since the cached discovery are
    *   skipped entirely (stamp = newest source mtime + file count);
    * - dirty projects get one build (the solution when present — dependency-
    *   correct and internally parallel — else serial per-project), then
    *   `--list-tests --no-build` runs in parallel.
-   * Returns repo-relative csproj -> class FQNs for every test project.
+   * Returns repo-relative csproj -> method FQNs (theory args stripped) for
+   * every test project; derive classes with classesRecord() when needed.
    */
   async discoverAll(
     opts: {
@@ -135,13 +136,14 @@ export class Runner {
     if (!this.shadow) await this.prepare();
     const graph = this.projectGraph();
     const cachePath = path.join(cacheDirFor(this.repoRoot), "discovery-cache.json");
-    let cache: { version: 2; projects: Record<string, { stamp: string; classes: string[] }> } = {
-      version: 2,
+    let cache: { version: 3; projects: Record<string, { stamp: string; methods: string[] }> } = {
+      version: 3,
       projects: {},
     };
     try {
       const loaded = JSON.parse(fs.readFileSync(cachePath, "utf8"));
-      if (loaded?.version === 2) cache = loaded;
+      // v2 cached classes only; a version bump re-discovers once to get methods.
+      if (loaded?.version === 3) cache = loaded;
     } catch {
       /* fresh */
     }
@@ -154,7 +156,7 @@ export class Runner {
       const stamp = sourceStamp(p.dir); // real repo is the source of truth
       const cached = cache.projects[rel];
       if (!opts.force && cached && cached.stamp === stamp) {
-        result[rel] = cached.classes;
+        result[rel] = cached.methods;
       } else {
         dirty.push({ p, rel, stamp });
       }
@@ -194,7 +196,7 @@ export class Runner {
     }
 
     // Parallel discovery against the built outputs.
-    const discover = opts.discoverImpl ?? discoverTestClasses;
+    const discover = opts.discoverImpl ?? discoverTests;
     let next = 0;
     let done = 0;
     await Promise.all(
@@ -205,13 +207,13 @@ export class Runner {
           const d = dirty[i];
           opts.onPhase?.(`discovering ${d.p.name} (${++done}/${dirty.length})`);
           try {
-            const classes = await discover(this.shadowPath(d.p.csproj), this.shadow!.dir, true);
-            result[d.rel] = classes;
-            cache.projects[d.rel] = { stamp: d.stamp, classes };
+            const methods = await discover(this.shadowPath(d.p.csproj), this.shadow!.dir, true);
+            result[d.rel] = methods;
+            cache.projects[d.rel] = { stamp: d.stamp, methods };
           } catch {
             // Keep the stale cache row if we have one; better than losing the tree.
             const cached = cache.projects[d.rel];
-            if (cached) result[d.rel] = cached.classes;
+            if (cached) result[d.rel] = cached.methods;
           }
         }
       })
@@ -819,9 +821,10 @@ export class Runner {
   async buildMap(opts: {
     refresh?: boolean;
     /**
-     * vstest-discovered classes per repo-relative csproj (from discoverAll()).
-     * Used as part of the alive set when pruning: vstest and IL metadata name
-     * nested classes differently, and the union never wrongly kills rows.
+     * vstest-discovered method FQNs per repo-relative csproj (discoverAll()
+     * output, verbatim). Their classes join the alive set when pruning: vstest
+     * and IL metadata name nested classes differently, and the union never
+     * wrongly kills rows.
      */
     discovered: Record<string, string[]>;
     onProgress?: (done: number, total: number, current: string) => void;
@@ -889,7 +892,8 @@ export class Runner {
     /** Alive classes per project for pruning: static ∪ vstest discovery (their
      * naming differs on nested classes; the union never wrongly kills rows). */
     const alive = new Map<string, Set<string>>();
-    for (const [rel, classes] of Object.entries(opts.discovered)) alive.set(rel, new Set(classes));
+    for (const [rel, classes] of Object.entries(classesRecord(opts.discovered)))
+      alive.set(rel, new Set(classes));
     let done = 0;
     for (const [cls, row] of entries) {
       if (!alive.has(row.csproj)) alive.set(row.csproj, new Set());

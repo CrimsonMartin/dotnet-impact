@@ -63,18 +63,32 @@ function scanFile(file: string, out: Map<string, SourceLocation>): void {
 
 /** Find the declaration line of a method within a source file (0-based), if present. */
 export function locateMethod(file: string, methodName: string): number | undefined {
+  return locateMethods(file, [methodName]).get(methodName);
+}
+
+/**
+ * Declaration lines (0-based) for several methods of one source file, with a
+ * single file read — rebuilding the tree locates every method of a class.
+ */
+export function locateMethods(file: string, methodNames: string[]): Map<string, number> {
+  const out = new Map<string, number>();
   let content: string;
   try {
     content = fs.readFileSync(file, "utf8");
   } catch {
-    return undefined;
+    return out;
   }
-  const re = new RegExp(`^\\s*(?:public|internal|protected|private).*\\b${escapeRe(methodName)}\\s*[(<]`);
+  const pending = methodNames.map((name) => ({
+    name,
+    re: new RegExp(`^\\s*(?:public|internal|protected|private).*\\b${escapeRe(name)}\\s*[(<]`),
+  }));
   const lines = content.split(/\r?\n/);
-  for (let i = 0; i < lines.length; i++) {
-    if (re.test(lines[i])) return i;
+  for (let i = 0; i < lines.length && out.size < pending.length; i++) {
+    for (const p of pending) {
+      if (!out.has(p.name) && p.re.test(lines[i])) out.set(p.name, i);
+    }
   }
-  return undefined;
+  return out;
 }
 
 function escapeRe(s: string): string {
