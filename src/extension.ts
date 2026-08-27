@@ -26,6 +26,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   if (!ws) return;
   const repoRoot = ws.uri.fsPath;
   runner = new Runner(repoRoot);
+  runner.logSink = (m) => output.appendLine(m);
 
   const applyDotnetPath = () =>
     setDotnetPath(vscode.workspace.getConfiguration("dotnetImpact").get<string>("dotnetPath", ""));

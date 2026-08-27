@@ -14,10 +14,12 @@ expensive per commit.
    store (near-instant, no duplicate history). Uncommitted edits are mirrored on top as
    a file-copy overlay, so background builds/test runs never touch your working tree and
    its warm `bin`/`obj` never collide with your editor's builds.
-2. **Impact map** — each test class is run once with Coverlet
-   (`--collect "XPlat Code Coverage"`), and the Cobertura report is inverted into
-   `source file → test classes that execute it`. Class-level granularity keeps the map
-   build tractable; rows refresh whenever their tests re-run.
+2. **Impact map** — built statically in seconds: the built assemblies' IL metadata
+   and portable PDBs yield each test class's transitive type-reference closure as
+   source files (`source file → test classes that could reach it`). Rows are tagged
+   `static`, and the live-refresh pipeline replaces them with measured per-class
+   coverage as tests actually run — converging on observed truth, including
+   DI/reflection edges static analysis can't see. Class-level granularity throughout.
 3. **Affected set** — on save (or per commit), changed files are looked up in the map.
    Mapped files → run just those test classes (`dotnet test --filter`). Unmapped files →
    conservative fallback: run every test project that transitively references the

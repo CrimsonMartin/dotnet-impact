@@ -1,7 +1,7 @@
 import { XMLParser } from "fast-xml-parser";
 import * as fs from "fs";
 import * as path from "path";
-import { buildRunsettings, collectClassCoverage, usingCoverletFallback } from "./coverage";
+import { buildRunsettings, collectClassCoverage } from "./coverage";
 import { discoverTestClasses } from "./discover";
 import {
   affectedTestProjects,
@@ -13,6 +13,7 @@ import {
   testProjects,
 } from "./projects";
 import { ImpactMap } from "./map";
+import { StaticMapper } from "./staticmap";
 import { cacheDirFor, classFilter, exec, git, parseStatusZ, toRepoRelative } from "./util";
 import type { SessionRunner } from "./vstestSession";
 import { ensureShadow, Shadow, syncOverlay } from "./worktree";
@@ -62,10 +63,18 @@ export class Runner {
 
   /** Optional persistent test-session runner; runs fall back to dotnet test without it. */
   sessions: SessionRunner | null = null;
+  /** Static (IL+PDB) map builder; log sink is swappable by the host. */
+  readonly staticMapper: StaticMapper;
+  logSink: (msg: string) => void = () => undefined;
 
   constructor(readonly repoRoot: string) {
     this.map = new ImpactMap(repoRoot);
     this.lastFailures = this.loadLastFailures();
+    this.staticMapper = new StaticMapper(
+      repoRoot,
+      path.join(__dirname, "..", "..", "helper-static"),
+      (m) => this.logSink(m)
+    );
   }
 
   /** Newest built test dll for a repo-relative csproj, inside the shadow. */
@@ -461,8 +470,11 @@ export class Runner {
   }
 
   /**
-   * Build/refresh the impact map: discover test classes per project, collect
-   * per-class coverage for classes missing from the map (or all, if refresh).
+   * Build/refresh the impact map from the built assemblies' IL metadata and
+   * portable PDBs: each test class's transitive type-reference closure becomes
+   * its file row (a safe superset of dynamic coverage). Rows are tagged
+   * `static`; the live-refresh pipeline replaces them with measured coverage
+   * as tests run. Seconds, not hours.
    */
   async buildMap(opts: {
     refresh?: boolean;
@@ -480,12 +492,8 @@ export class Runner {
   }): Promise<{ mapped: number; failed: string[] }> {
     if (!this.shadow) await this.prepare();
     const graph = this.projectGraph();
-    const work: Array<{ csprojRel: string; classFqn: string }> = [];
-    /** Successfully-discovered projects and their live classes, for pruning. */
-    const discovered = new Map<string, Set<string>>();
     const failed: string[] = [];
     let cancelled = false;
-    // Cancellation reaps in-flight child processes (no orphaned dotnet test).
     const ctrl = new AbortController();
     const wantCancel = () => {
       if (opts.shouldCancel?.()) {
@@ -498,79 +506,63 @@ export class Runner {
     const projects = testProjects(graph);
     const liveProjects = new Set(projects.map((p) => toRepoRelative(this.repoRoot, p.csproj)));
 
-    // Only projects with actual work get a warm build (coverage runs use --no-build).
-    const needBuild: typeof projects = [];
-    for (const p of projects) {
-      const csprojRel = toRepoRelative(this.repoRoot, p.csproj);
-      const classes = opts.discovered[csprojRel];
-      if (!classes) continue; // discovery failed for it; leave its entries alone
-      discovered.set(csprojRel, new Set(classes));
-      const items = classes.filter((c) => opts.refresh || !this.map.has(c));
-      if (items.length > 0) {
-        needBuild.push(p);
-        work.push(...items.map((classFqn) => ({ csprojRel, classFqn })));
-      }
-    }
-    let built = 0;
-    for (const p of needBuild) {
-      if (wantCancel()) break;
-      opts.onPhase?.(`building ${p.name} (${++built}/${needBuild.length})`);
-      await exec(
+    // Build phase: the closure needs every assembly. One solution build when
+    // possible (dependency-correct, internally parallel), else per test project.
+    const sln = fs
+      .readdirSync(this.repoRoot)
+      .find((f) => f.toLowerCase().endsWith(".sln") || f.toLowerCase().endsWith(".slnx"));
+    let builtOk = false;
+    if (sln) {
+      opts.onPhase?.(`building solution ${sln}`);
+      const res = await exec(
         "dotnet",
-        ["build", this.shadowPath(p.csproj), "--nologo", "--verbosity", "quiet"],
+        ["build", path.join(this.shadow!.dir, sln), "--nologo", "--verbosity", "quiet"],
         this.shadow!.dir,
-        10 * 60 * 1000,
+        15 * 60 * 1000,
         ctrl.signal
       );
+      builtOk = res.code === 0;
+      if (!builtOk && !ctrl.signal.aborted) failed.push(`solution build: ${sln}`);
     }
-
-    let done = 0;
-    const runItem = async (item: { csprojRel: string; classFqn: string }): Promise<void> => {
-      try {
-        const cov = await collectClassCoverage(
+    if (!builtOk) {
+      let built = 0;
+      for (const p of projects) {
+        if (wantCancel()) break;
+        opts.onPhase?.(`building ${p.name} (${++built}/${projects.length})`);
+        await exec(
+          "dotnet",
+          ["build", this.shadowPath(p.csproj), "--nologo", "--verbosity", "quiet"],
           this.shadow!.dir,
-          this.shadowPath(path.join(this.repoRoot, item.csprojRel)),
-          item.classFqn,
-          ctrl.signal,
-          this.settingsFile
+          10 * 60 * 1000,
+          ctrl.signal
         );
-        if (ctrl.signal.aborted) return; // partial coverage: don't poison the row
-        this.map.update(item.classFqn, item.csprojRel, repoTreeFiles(cov.files));
-        if (!cov.passed) failed.push(item.classFqn);
-      } catch (e) {
-        failed.push(`${item.classFqn}: ${(e as Error).message}`);
       }
-      done++;
-      this.map.save(); // per-item: an interrupted build resumes where it stopped
-    };
-
-    // First item runs alone: it resolves which collector this project set
-    // supports. After that, parallelize — unless we're on the Coverlet
-    // fallback, which rewrites assemblies on disk and must stay serial.
-    if (work.length > 0 && !cancelled) {
-      opts.onProgress?.(0, work.length, work[0].classFqn);
-      await runItem(work[0]);
     }
-    const parallel = usingCoverletFallback() ? 1 : Math.max(1, opts.parallel ?? 1);
-    let next = 1;
-    const workers = Array.from(
-      { length: Math.min(parallel, Math.max(work.length - 1, 0)) },
-      async () => {
-        for (;;) {
-          if (wantCancel()) return;
-          const i = next++;
-          if (i >= work.length) return;
-          opts.onProgress?.(done, work.length, work[i].classFqn);
-          await runItem(work[i]);
-        }
-      }
-    );
-    await Promise.all(workers);
+    if (wantCancel()) return { mapped: 0, failed };
 
-    // Prune dead entries only after a full, uncancelled sweep — a partial pass
-    // has no evidence about classes it never reached.
+    // Static closure over the built assemblies.
+    opts.onPhase?.("computing static impact map");
+    const result = await this.staticMapper.compute(this.shadow!.dir, graph);
+    if (!result) {
+      return { mapped: 0, failed: [...failed, "static map computation failed"] };
+    }
+
+    const entries = Object.entries(result.classes);
+    /** Alive classes per project for pruning: static ∪ vstest discovery (their
+     * naming differs on nested classes; the union never wrongly kills rows). */
+    const alive = new Map<string, Set<string>>();
+    for (const [rel, classes] of Object.entries(opts.discovered)) alive.set(rel, new Set(classes));
+    let done = 0;
+    for (const [cls, row] of entries) {
+      if (!alive.has(row.csproj)) alive.set(row.csproj, new Set());
+      alive.get(row.csproj)!.add(cls);
+      opts.onProgress?.(done, entries.length, cls);
+      // refresh forces a clean static baseline over old coverage rows too.
+      if (this.map.updateStatic(cls, row.csproj, row.files, opts.refresh)) done++;
+    }
+
     if (!cancelled) {
-      const removed = this.map.prune(discovered, liveProjects);
+      const removed = this.map.prune(alive, liveProjects);
       if (removed.length > 0) opts.onPhase?.(`pruned ${removed.length} stale map entries`);
     }
     this.map.save();

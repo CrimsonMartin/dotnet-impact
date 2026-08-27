@@ -136,11 +136,15 @@ export function parseStatusZ(stdout: string): StatusEntry[] {
 /**
  * `dotnet test --filter` expression selecting whole test classes. The trailing
  * dot prevents substring over-match (class `Foo` must not select `FooBar`'s
- * tests): every test FQN is `<class>.<method>`, so `~<class>.` matches exactly
- * the class's own tests. Filter operator characters in names are escaped.
+ * tests); the `+` variant also matches tests in nested classes, since static
+ * map rows fold `Ns.Outer+Inner` into `Ns.Outer`. Filter operator characters
+ * in names are escaped.
  */
 export function classFilter(classes: string[]): string {
   return classes
-    .map((c) => `FullyQualifiedName~${c.replace(/([()&|=!~])/g, "\\$1")}.`)
+    .map((c) => {
+      const esc = c.replace(/([()&|=!~])/g, "\\$1");
+      return `FullyQualifiedName~${esc}.|FullyQualifiedName~${esc}+`;
+    })
     .join("|");
 }

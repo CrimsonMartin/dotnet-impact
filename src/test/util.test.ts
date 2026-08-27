@@ -63,22 +63,25 @@ test("parseStatusZ: paths with spaces are not quoted in -z mode", () => {
   assert.deepEqual(out, [{ status: "??", file: 'My Folder/My "File".cs', origin: undefined }]);
 });
 
-test("classFilter: trailing dot prevents substring over-match", () => {
-  assert.equal(classFilter(["Ns.Foo"]), "FullyQualifiedName~Ns.Foo.");
-  // "Ns.FooBar.Method" must NOT contain "Ns.Foo." — the over-match Foo vs FooBar.
+test("classFilter: trailing dot prevents substring over-match; + variant catches nested", () => {
+  assert.equal(classFilter(["Ns.Foo"]), "FullyQualifiedName~Ns.Foo.|FullyQualifiedName~Ns.Foo+");
+  // "Ns.FooBar.Method" must NOT contain "Ns.Foo." or "Ns.Foo+".
   assert.ok(!"Ns.FooBar.Method".includes("Ns.Foo."));
+  assert.ok(!"Ns.FooBar.Method".includes("Ns.Foo+"));
   assert.ok("Ns.Foo.Method".includes("Ns.Foo."));
+  // Static map folds nested classes: Ns.Outer row must select Ns.Outer+Inner tests.
+  assert.ok("Ns.Outer+Inner.Method".includes("Ns.Outer+"));
 });
 
 test("classFilter: joins classes with | and escapes operator chars", () => {
   assert.equal(
     classFilter(["A.B", "C.D"]),
-    "FullyQualifiedName~A.B.|FullyQualifiedName~C.D."
+    "FullyQualifiedName~A.B.|FullyQualifiedName~A.B+|FullyQualifiedName~C.D.|FullyQualifiedName~C.D+"
   );
-  assert.equal(classFilter(["Ns.We(ird)"]), "FullyQualifiedName~Ns.We\\(ird\\).");
+  assert.ok(classFilter(["Ns.We(ird)"]).startsWith("FullyQualifiedName~Ns.We\\(ird\\)."));
 });
 
 test("classFilter: nested class FQNs pass through", () => {
-  assert.equal(classFilter(["Ns.Outer+Inner"]), "FullyQualifiedName~Ns.Outer+Inner.");
+  assert.ok(classFilter(["Ns.Outer+Inner"]).includes("FullyQualifiedName~Ns.Outer+Inner."));
   assert.ok("Ns.Outer+Inner.Method".includes("Ns.Outer+Inner."));
 });

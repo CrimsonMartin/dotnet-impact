@@ -11,3 +11,5 @@ node_modules/**
 helper/bin/**
 helper/obj/**
 .github/**
+helper-static/bin/**
+helper-static/obj/**

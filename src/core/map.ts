@@ -5,6 +5,8 @@ import { cacheDirFor } from "./util";
 export interface MapEntry {
   csproj: string; // repo-relative path of the owning test project
   files: string[]; // repo-relative source files this class's tests execute
+  /** How this row was produced; absent means "coverage" (pre-marker rows). */
+  source?: "static" | "coverage";
   updatedAt: string;
 }
 
@@ -46,8 +48,30 @@ export class ImpactMap {
   }
 
   update(classFqn: string, csproj: string, files: string[]): void {
-    this.data.entries[classFqn] = { csproj, files, updatedAt: new Date().toISOString() };
+    this.data.entries[classFqn] = {
+      csproj,
+      files,
+      source: "coverage",
+      updatedAt: new Date().toISOString(),
+    };
     this.inverted = null;
+  }
+
+  /**
+   * Write a statically-derived row. Static never clobbers measured coverage:
+   * the write is skipped when a coverage row already exists (unless `force`).
+   */
+  updateStatic(classFqn: string, csproj: string, files: string[], force = false): boolean {
+    const existing = this.data.entries[classFqn];
+    if (!force && existing && (existing.source ?? "coverage") === "coverage") return false;
+    this.data.entries[classFqn] = {
+      csproj,
+      files,
+      source: "static",
+      updatedAt: new Date().toISOString(),
+    };
+    this.inverted = null;
+    return true;
   }
 
   remove(classFqn: string): void {

@@ -26,6 +26,17 @@ test("affectedClasses: lookup is case-insensitive and slash-normalized", () => {
   assert.deepEqual(map.affectedClasses([`src${path.sep}A.cs`]), ["Ns.ATests"]);
 });
 
+test("updateStatic: fills gaps and refreshes static rows, never clobbers coverage", () => {
+  const map = freshMap();
+  assert.equal(map.updateStatic("Ns.A", "t/T.csproj", ["a.cs"]), true); // new row
+  assert.equal(map.updateStatic("Ns.A", "t/T.csproj", ["a.cs", "b.cs"]), true); // static→static ok
+  map.update("Ns.B", "t/T.csproj", ["b.cs"]); // coverage row
+  assert.equal(map.updateStatic("Ns.B", "t/T.csproj", ["x.cs"]), false); // static loses
+  assert.deepEqual(map.entry("Ns.B")!.files, ["b.cs"]);
+  assert.equal(map.updateStatic("Ns.B", "t/T.csproj", ["x.cs"], true), true); // refresh forces
+  assert.equal(map.entry("Ns.B")!.source, "static");
+});
+
 test("prune: removes dead classes and dead projects, keeps undiscovered ones", () => {
   const map = freshMap();
   map.update("Ns.Alive", "tests/A/A.csproj", ["src/a.cs"]);
