@@ -88,7 +88,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return;
       pending.add(doc.fileName);
       if (debounce) clearTimeout(debounce);
-      const ms = vscode.workspace.getConfiguration("dotnetImpact").get<number>("debounceMs", 1500);
+      const ms = vscode.workspace.getConfiguration("dotnetImpact").get<number>("debounceMs", 300);
       debounce = setTimeout(() => {
         const files = [...pending];
         pending.clear();

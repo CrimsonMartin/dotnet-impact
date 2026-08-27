@@ -2,7 +2,7 @@
   "name": "dotnet-impact",
   "displayName": "dotnet-impact — affected-test runner for .NET",
   "description": "NCrunch-style impacted-test selection for .NET: builds a static IL-based impact map in seconds in a background git worktree, refines it with live coverage as tests run, and runs only the tests affected by your change. Includes a CLI for pre-commit hooks and AI coding agents.",
-  "version": "0.0.21",
+  "version": "0.0.22",
   "publisher": "crimsonmartin",
   "license": "MIT",
   "repository": {
@@ -91,6 +91,11 @@
           "type": "number",
           "default": 0,
           "description": "Concurrent 'dotnet test --list-tests' runs during test discovery. 0 = auto (cores minus 2, max 12). Map building itself is static analysis and needs no throttle."
+        },
+        "dotnetImpact\\": {
+          "debounceMs": {
+            "default": 300
+          }
         }
       }
     }
