@@ -555,15 +555,29 @@ export class Runner {
   readonly pendingRefresh = new Map<string, string>();
 
   /**
-   * Queue every class that just produced results for a coverage refresh, so map
-   * rows track reality as tests re-run. Classes only the run knew about (fallback
-   * discoveries) get owners from `owners` and grow the map organically.
+   * Queue classes that just produced results for a coverage refresh — but only
+   * where refreshing buys anything: rows that are static, missing, or stale
+   * measured coverage. Fresh coverage rows are skipped, so a full-suite run
+   * doesn't trigger hours of pointless background re-measurement. Classes only
+   * the run knew about (fallback discoveries) get owners from `owners` and
+   * grow the map organically.
    */
+  static readonly COVERAGE_FRESH_MS = 7 * 24 * 3600 * 1000;
+
   queueRefreshFromOutcomes(outcomes: TestOutcome[], owners?: Record<string, string>): number {
     for (const o of outcomes) {
       if (o.skipped) continue;
-      const csproj = this.map.entry(o.classFqn)?.csproj ?? owners?.[o.classFqn];
-      if (csproj) this.pendingRefresh.set(o.classFqn, csproj);
+      const entry = this.map.entry(o.classFqn);
+      const csproj = entry?.csproj ?? owners?.[o.classFqn];
+      if (!csproj) continue;
+      if (
+        entry &&
+        (entry.source ?? "coverage") === "coverage" &&
+        Date.now() - Date.parse(entry.updatedAt) < Runner.COVERAGE_FRESH_MS
+      ) {
+        continue; // measured recently: nothing to learn
+      }
+      this.pendingRefresh.set(o.classFqn, csproj);
     }
     return this.pendingRefresh.size;
   }

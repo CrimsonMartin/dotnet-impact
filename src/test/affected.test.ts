@@ -112,6 +112,27 @@ test("build outputs (bin/obj) never drive selection", () => {
   assert.equal(a.fallbackProjects.length, 0);
 });
 
+test("queueRefreshFromOutcomes: only static, missing, or stale rows queue", () => {
+  const root = scaffoldRepo();
+  const runner = new Runner(root);
+  const rel = "tests/Lib.Tests/Lib.Tests.csproj";
+  runner.map.update("Ns.Fresh", rel, ["a.cs"]); // fresh coverage
+  runner.map.updateStatic("Ns.Static", rel, ["b.cs"]); // static
+  runner.map.update("Ns.Stale", rel, ["c.cs"]);
+  // Age the Stale row past the freshness horizon.
+  (runner.map.entry("Ns.Stale") as { updatedAt: string }).updatedAt = new Date(
+    Date.now() - Runner.COVERAGE_FRESH_MS - 1000
+  ).toISOString();
+
+  const mk = (cls: string) => ({ classFqn: cls, method: cls + ".M", passed: true, skipped: false });
+  runner.queueRefreshFromOutcomes(
+    [mk("Ns.Fresh"), mk("Ns.Static"), mk("Ns.Stale"), mk("Ns.New"),
+     { classFqn: "Ns.Skipped", method: "m", passed: false, skipped: true }],
+    { "Ns.New": rel, "Ns.Skipped": rel }
+  );
+  assert.deepEqual([...runner.pendingRefresh.keys()].sort(), ["Ns.New", "Ns.Stale", "Ns.Static"]);
+});
+
 test("fallback project's mapped classes are not double-run", () => {
   const root = scaffoldRepo();
   fs.writeFileSync(path.join(root, "src", "Lib", "New.cs"), "");
