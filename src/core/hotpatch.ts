@@ -132,6 +132,9 @@ export class HotPatcher {
         csproj: this.shadowPathOf(job.csprojAbs),
         file: shadowFile,
       });
+      if (!r.ok && (r.reason ?? "").startsWith("no-op")) {
+        continue; // semantically unchanged file: nothing to patch, not a failure
+      }
       if (!r.ok) {
         this.log(`hotpatch: ${path.basename(job.fileAbs)}: ${r.reason} — using build path`);
         return false;
@@ -144,18 +147,46 @@ export class HotPatcher {
       });
     }
 
-    // Push every delta to every live testhost; all must accept.
+    // Push every delta to every live testhost. A dead pipe (stale pid file,
+    // pid reuse) just drops that host; a live host REFUSING a delta is an
+    // inconsistency and forces the build path + reset.
+    let patchedHosts = 0;
     for (const host of hosts) {
+      let connected = true;
       for (const d of deltas) {
-        const okPush = await this.push(host, d).catch(() => false);
+        let okPush: boolean;
+        try {
+          okPush = await this.push(host, d).catch(async () => {
+            // One retry covers the hook's brief re-accept window.
+            await new Promise((r) => setTimeout(r, 120));
+            return this.push(host, d);
+          });
+        } catch (e) {
+          connected = false; // dead host: prune registration, skip it
+          this.log(`hotpatch: host ${path.basename(host.pidFile)} unreachable (${(e as Error).message}); pruned`);
+          try {
+            fs.rmSync(host.pidFile, { force: true });
+          } catch {
+            /* ignore */
+          }
+          break;
+        }
         if (!okPush) {
-          this.log(`hotpatch: push failed (pid file ${path.basename(host.pidFile)}); using build path`);
+          this.log(`hotpatch: testhost rejected delta; using build path`);
           this.reset(); // patched state may now be inconsistent across hosts
           return false;
         }
       }
+      if (connected) patchedHosts++;
     }
-    this.log(`hotpatch: applied ${deltas.length} delta(s) to ${hosts.length} testhost(s)`);
+    if (deltas.length > 0 && patchedHosts === 0) {
+      // Nothing accepted the patch: fresh testhosts would load stale disk
+      // assemblies. Only the build path is safe.
+      this.log("hotpatch: no live testhost accepted patches; using build path");
+      this.reset();
+      return false;
+    }
+    this.log(`hotpatch: applied ${deltas.length} delta(s) to ${patchedHosts} testhost(s)`);
     return true;
   }
 
