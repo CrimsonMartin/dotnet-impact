@@ -25,53 +25,70 @@ verifying a commit it just made, and CI running affected-only on a PR branch. Wi
 `--base`, uncommitted noise is always unioned in; with no flags, committed work is
 invisible the moment it's committed.
 
-## Design principle: right by default, no new flags
+**Constraint: the VS Code extension's behavior stays exactly as-is.**
+`Runner.changedFiles()` is shared — the extension's *Run affected tests now* command
+calls it with no arguments (`extension.ts` → `runAffectedNow`). Every selection
+change below is therefore scoped to the CLI path only: a CLI-only entry point (new
+method or options object that only `cli.ts` passes), never a change to the shared
+default.
+
+## Design principle: right by default, no new flags — within the CLI's cost model
 
 Each context has an *ideal* changed-set (staged files for pre-commit, `HEAD~1` for
 post-commit verification, `origin/main...HEAD` for pre-push/CI, the just-edited
-files for an agent's inner loop). But a **superset is always correct** — the map
-collapses files to test classes, dedup drops double-runs, failure-first ordering and
-warm sessions make overlap cheap. So instead of a flag per context (`--diff`
-pass-through was considered and dropped), we make the default set a superset that
-contains every context's right answer, and keep the two existing flags as
-narrow-down overrides.
+files for an agent's inner loop). A **superset is always correct** — the map
+collapses files to test classes and dedup drops double-runs — so one smart default
+can contain every context's right answer, and the two existing flags become
+narrow-down overrides. (A `--diff` pass-through flag was considered and dropped as
+subsumed.)
 
-### 1. Default changed-set = committed branch diff ∪ dirty tree
+But correct is not free here: warm sessions, hot-patch, and pre-warmed testhosts
+live in the extension — `cli.ts` never wires `runner.sessions`, so every CLI
+invocation pays build + plain `dotnet test` per affected project. The smart default
+therefore targets the contexts where the superset matches the question anyway:
+**pre-push, CI, and post-commit agent verification**. Speed-sensitive **pre-commit
+hook recipes recommend `--staged`** (or the positional-args form below), not the
+default.
+
+### 1. Default changed-set = committed branch diff ∪ dirty tree (CLI only)
 
 `impact run` / `impact affected` with no flags selects from:
 
-1. **Committed work on this branch**: auto-detect the base — the branch's
-   `@{upstream}` if set, else `origin/HEAD` (the remote default branch), else none —
-   and take `git diff --name-only -z <merge-base(base, HEAD)>..HEAD` (three-dot
-   semantics: what *this branch* changed, not what base moved on). Rename origins
-   included via `--name-status`, matching what the status path already does.
+1. **Committed work on this branch**: auto-detect the base, then take
+   `git diff --name-status -z <base>...HEAD` — git's three-dot form, which by
+   definition diffs `merge-base(base, HEAD)` against `HEAD`, i.e. what *this branch*
+   changed, not what base moved on. One spelling: the implementation must not also
+   compute a merge-base and stack a second range on top. `--name-status` (not
+   `--name-only`) so both sides of a rename feed selection, matching the status
+   path's `parseStatusZ` handling.
 2. **Uncommitted work**: the existing `git status --porcelain --untracked-files=all`
    union, unchanged.
 
-Degradations are all safe: no upstream and no `origin/HEAD` → status only (today's
-behavior, e.g. a fresh local-only repo); branch not ahead of base (merge-base ==
-HEAD, e.g. just after a pull on the default branch) → committed part is empty →
-today's behavior; detached HEAD → status only unless an upstream resolves.
+Base auto-detection, in order: the branch's `@{upstream}` if set; else `origin/HEAD`
+if resolvable; else **probe** `origin/main` then `origin/master` for existence; else
+none. The probe matters: `origin/HEAD` only exists after a clone or an explicit
+`git remote set-head`, so locally-inited repos — a primary target — would otherwise
+silently degrade.
 
-This makes all the commit-granular cases work with **zero flags**:
+Degradations are all safe: no resolvable base → status only (today's behavior);
+branch not ahead of base (merge-base == HEAD, e.g. just after a pull on the default
+branch) → committed part empty → today's behavior; detached HEAD → status only
+unless an upstream resolves.
 
-- **post-commit verify** (agent just committed): the commit is in the branch diff.
-- **pre-push hook / CI**: clean tree → exactly the merge-base range every
-  affected-test system (Nx, Turborepo, dotnet-affected) is built on.
-- **agent inner loop**: dirty tree still included, as today.
+Flag semantics:
 
-Existing flags become the narrow-down overrides, not additions:
-
-- `--base <ref>` — overrides base auto-detection (and keeps its current
-  "vs working tree" meaning for an explicitly chosen ref).
-- `--staged` — the tight, index-only mode for speed-sensitive pre-commit hooks and
-  partial staging; unchanged.
+- `--base <ref>` — overrides auto-detection and is **realigned to the same
+  semantics**: `<ref>...HEAD` ∪ dirty tree. Today's meaning ("ref vs working tree",
+  which also pulls in drift committed *on* the base since the fork point) is
+  dropped now, pre-1.0, so the explicit and auto-detected paths can't diverge.
+  CLI-only; the extension never passes a base.
+- `--staged` — unchanged: the tight, index-only mode, and the recommended mode for
+  pre-commit hooks.
 
 Trade-off, stated honestly: on a long-lived branch the default set is larger than a
-per-context minimum, so a pre-commit hook on such a branch re-covers earlier branch
-commits. Mitigations already exist (`--staged` for the hook, failure-first ordering,
-warm sessions); if it bites in practice, a "last validated commit" watermark is the
-future optimization — not a new flag.
+per-context minimum. Mitigations exist (`--staged`/positional args for hooks,
+failure-first ordering); if it bites in practice, a "last validated commit"
+watermark is the future optimization — not a new flag.
 
 ### 2. Positional file arguments — the hook-framework contract, not a flag
 
@@ -104,7 +121,32 @@ Positional args make impact a drop-in entry for both:
 They also give agents the tight inner loop ("I edited these 3 files, test their
 blast radius") without depending on the tree being otherwise clean.
 
-### 3. `--staged` selects from the index but tests run against the working tree
+Path forms differ by caller — lint-staged passes absolute paths, pre-commit.com
+repo-relative — and `computeAffected` already normalizes both. Parsing note: the
+current `arg()`/`has()` helpers scan argv blindly (`arg()` returns whatever follows
+the flag), so positional support requires a real parse that separates value-taking
+flags from trailing paths.
+
+### 3. Hook safety: cold start and concurrent invocations
+
+Two failure modes appear the moment the CLI runs inside `git commit`, and the plan
+takes one principle for both: **exit 1 means affected tests failed — nothing else
+blocks a commit.**
+
+- **Cold start.** The first-ever run creates the shadow worktree and builds the
+  solution — minutes, inside a hook. Stance: when no map/shadow exists, `run` and
+  `affected` print a warning to stderr ("no impact map — run `impact build-map`
+  first") and **exit 0** rather than hijack the commit. `build-map` remains the
+  explicit, foreground way to pay the cold cost (overnight / background, per the
+  README).
+- **Concurrency.** lint-staged parallelizes hook commands, and a CLI invocation can
+  race the extension's background map refresh; nothing serializes shadow access
+  across processes today. Add a lock file in the repo's cache dir
+  (`~/.dotnet-impact/<repo>-<hash>/`): wait briefly for the holder, then bail with a
+  clear "another impact instance holds the shadow — skipped" message and exit 0 in
+  the same never-block spirit.
+
+### 4. `--staged` selects from the index but tests run against the working tree
 
 The shadow worktree is `HEAD` + a file-copy overlay of the **working tree**
 (`syncOverlay` copies `git status` dirty files), not the index. With partial
@@ -117,29 +159,42 @@ Decision: **document, don't solve yet.** Agents stage everything, so index ==
 worktree in the primary use case. Revisit as an index-snapshot overlay
 (`git checkout-index` based) only if it bites.
 
-### 4. JSON output — deferred
+### 5. Exit codes are the contract; stdout is not
 
-Considered and parked: it can't be *default* behavior (changing stdout format breaks
-existing consumers), agents parse the current text output fine, and the exit code
-already carries the pass/fail contract. Revisit only on concrete demand; until then
-treat the current stdout format as stable.
+The machine-readable contract is the exit code — hooks and agents branch on it.
+Stdout stays human-oriented and free to change between versions (no stability
+promise), and `--json` stays deferred until there's concrete demand.
+
+| Command | 0 | 1 | 2 |
+|---|---|---|---|
+| `run` | affected tests passed — or nothing affected, or no map yet (see §3) | test failure, or internal error | usage |
+| `affected` | selection printed (possibly empty) | internal error | usage |
+| `build-map` | map built (per-class mapping failures are reported, not fatal) | internal error | usage |
+| `status` | stats printed | internal error | usage |
 
 ## Out of scope (unchanged)
 
 - Save-watching in the CLI — that's the extension's job.
+- Any change to the VS Code extension's selection behavior (see the constraint above).
 - Solving reflection/DI blind spots — documented in the README, fallback covers it.
 - The `run` execution pipeline (shadow build, warm sessions, hot-patch) — selection
   is the only thing changing here.
 
 ## Implementation order
 
-1. Default changed-set: base auto-detection (`@{upstream}` → `origin/HEAD` → none) +
-   merge-base committed diff unioned into `changedFiles`. *(core of this plan)*
-2. Positional file arguments on `affected` and `run`.
-3. README: hook recipes (lint-staged / pre-commit.com pre-commit, pre-push), the
-   staged-vs-worktree caveat note, and a suggested `CLAUDE.md`/agent-docs snippet
+1. CLI-only default changed-set: base auto-detection (`@{upstream}` → `origin/HEAD`
+   → probe `origin/main`/`origin/master` → none) + three-dot committed diff unioned
+   into a CLI-scoped selection path; `--base` realigned to `ref...HEAD ∪ dirty`.
+   The extension's `changedFiles()` call is untouched. *(core of this plan)*
+2. Positional file arguments on `affected` and `run`, with the argv parse split
+   (value-taking flags vs trailing paths).
+3. Hook safety: no-map/no-shadow early exit 0 + cross-process shadow lock file.
+4. README: hook recipes — pre-commit via lint-staged / pre-commit.com (positional
+   args or `--staged`), pre-push using the no-flag default — the staged-vs-worktree
+   caveat note, the exit-code table, and a suggested `CLAUDE.md`/agent-docs snippet
    ("after editing run `impact run <files>`; after committing run `impact run`") so
    agents discover the workflow.
 
-Each step is independently shippable; 1 makes hooks, CI, and post-commit agent
-verification work with no flags at all.
+Each step is independently shippable; 1 makes pre-push, CI, and post-commit agent
+verification work with no flags at all, and 3 is required before recommending the
+CLI inside `git commit`.
