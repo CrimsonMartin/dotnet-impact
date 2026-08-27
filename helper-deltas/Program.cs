@@ -169,7 +169,9 @@ sealed class ProjectState
         // Classify: identical member skeletons, only method/ctor bodies changed.
         var oldMembers = MemberIndex(oldTree);
         var newMembers = MemberIndex(newTree);
-        if (oldMembers.Count != newMembers.Count) return (null, null, null, "structural: member count changed");
+        if (oldMembers.Count != newMembers.Count)
+            return (null, null, null,
+                $"structural: member count changed ({oldMembers.Count} -> {newMembers.Count}, tree={oldTree.FilePath})");
 
         var oldModel = _compilation.GetSemanticModel(oldTree);
         var newModel = newComp.GetSemanticModel(newTree);
