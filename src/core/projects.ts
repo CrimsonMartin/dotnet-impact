@@ -126,6 +126,30 @@ export function testProjects(graph: ProjectGraph): ProjectInfo[] {
 const STAMP_FILE_RE = /\.(cs|csproj|props|targets|razor|cshtml|resx|config|json)$/i;
 
 /**
+ * Freshness stamp for a project INCLUDING everything it transitively
+ * references — unchanged stamp means a rebuild would be a no-op.
+ */
+export function transitiveSourceStamp(
+  graph: ProjectGraph,
+  csprojAbs: string,
+  memo: Map<string, string> = new Map()
+): string {
+  const key = path.resolve(csprojAbs).toLowerCase();
+  const cached = memo.get(key);
+  if (cached !== undefined) return cached;
+  memo.set(key, ""); // cycle guard
+  const info = graph.projects.get(key);
+  if (!info) return "";
+  const parts = [sourceStamp(info.dir)];
+  for (const ref of [...info.references].sort()) {
+    parts.push(transitiveSourceStamp(graph, ref, memo));
+  }
+  const stamp = parts.join("+");
+  memo.set(key, stamp);
+  return stamp;
+}
+
+/**
  * Freshness stamp for a project directory: newest source mtime + file count
  * (count catches deletions). Discovery can be skipped while the stamp holds.
  */

@@ -10,6 +10,7 @@ import {
   projectForFile,
   sourceStamp,
   testProjects,
+  transitiveSourceStamp,
 } from "./projects";
 import { ImpactMap } from "./map";
 import { findBuiltDll, StaticMapper } from "./staticmap";
@@ -325,19 +326,41 @@ export class Runner {
     }
 
     // Build phase: every involved project once, serially — later builds reuse
-    // the shared dependencies the first ones compiled.
+    // the shared dependencies the first ones compiled. Projects whose
+    // transitive sources are unchanged since their last successful shadow
+    // build skip entirely (a no-op dotnet build still costs seconds).
+    const builtStampsPath = path.join(cacheDirFor(this.repoRoot), "built-stamps.json");
+    let builtStamps: Record<string, string> = {};
+    try {
+      builtStamps = JSON.parse(fs.readFileSync(builtStampsPath, "utf8"));
+    } catch {
+      /* fresh */
+    }
+    const stampMemo = new Map<string, string>();
     for (const rel of allRels) {
       if (signal?.aborted) break;
-      const res = await exec(
+      const csprojAbs = path.join(this.repoRoot, rel);
+      const stamp = transitiveSourceStamp(this.projectGraph(), csprojAbs, stampMemo);
+      if (stamp && builtStamps[rel] === stamp) continue; // nothing changed since last build
+      const buildArgs = ["build", this.shadowPath(csprojAbs), "--nologo", "--verbosity", "quiet"];
+      let res = await exec(
         "dotnet",
-        ["build", this.shadowPath(path.join(this.repoRoot, rel)), "--nologo", "--verbosity", "quiet"],
+        [...buildArgs, "--no-restore"],
         this.shadow!.dir,
         10 * 60 * 1000,
         signal
       );
       if (res.code !== 0 && !signal?.aborted) {
+        // New/changed packages need a restore; retry once with it.
+        res = await exec("dotnet", buildArgs, this.shadow!.dir, 10 * 60 * 1000, signal);
+      }
+      if (res.code !== 0 && !signal?.aborted) {
         ok = false;
         output += res.stdout + res.stderr;
+      } else if (!signal?.aborted && stamp) {
+        builtStamps[rel] = stamp;
+        fs.mkdirSync(path.dirname(builtStampsPath), { recursive: true });
+        fs.writeFileSync(builtStampsPath, JSON.stringify(builtStamps));
       }
     }
 

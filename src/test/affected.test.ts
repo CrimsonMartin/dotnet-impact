@@ -3,7 +3,20 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
-import { sourceStamp } from "../core/projects";
+import { buildProjectGraph, sourceStamp, transitiveSourceStamp } from "../core/projects";
+
+test("transitiveSourceStamp: dependency edits change the referencing project's stamp", () => {
+  const root = scaffoldRepo();
+  const graph = buildProjectGraph(root);
+  const testCsproj = path.join(root, "tests", "Lib.Tests", "Lib.Tests.csproj");
+  const s1 = transitiveSourceStamp(graph, testCsproj);
+  assert.ok(s1.length > 0);
+  // Touch a file in the REFERENCED project only.
+  const dep = path.join(root, "src", "Lib", "Calc.cs");
+  fs.utimesSync(dep, new Date(), new Date(Date.now() + 5000));
+  const s2 = transitiveSourceStamp(buildProjectGraph(root), testCsproj);
+  assert.notEqual(s2, s1);
+});
 import { Runner } from "../core/runner";
 
 test("sourceStamp: changes on edit and on deletion, skips bin/obj", () => {
