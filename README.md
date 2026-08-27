@@ -7,7 +7,7 @@ build, no test-host startup, no running the whole suite. The closest thing to
 this is Visual Studio's Live Unit Testing, which requires an Enterprise license
 and doesn't exist for VS Code at all.
 
-<!-- demo.gif: save → red → fix → green, with the timing line visible -->
+![Break a method, save, watch the affected test go red in under 100ms — fix it, save, green again.](docs/demo.gif)
 
 ## Why it's fast
 
