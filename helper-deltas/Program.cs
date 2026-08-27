@@ -153,7 +153,10 @@ sealed class ProjectState
             _compilation = comp,
             _baseline = EmitBaseline.CreateInitialBaseline(
                 comp,
-                ModuleMetadata.CreateFromFile(dll),
+                // From image, never CreateFromFile: the file variant memory-maps
+                // the dll and holds the handle open, which on Windows blocks the
+                // next rebuild of that project (MSB3021 "file is locked").
+                ModuleMetadata.CreateFromImage(ImmutableArray.Create(File.ReadAllBytes(dll))),
                 handle => default,
                 handle => default,
                 true),

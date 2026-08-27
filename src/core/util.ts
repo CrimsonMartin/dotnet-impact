@@ -56,6 +56,11 @@ export function exec(
     if (env.DOTNET_CLI_USE_MSBUILD_SERVER === undefined) {
       env = { ...env, DOTNET_CLI_USE_MSBUILD_SERVER: "1" };
     }
+    // The .NET 10 terminal logger writes ANSI cursor/progress codes even when
+    // piped on Windows; captured output must be plain text.
+    if (env.MSBUILDTERMINALLOGGER === undefined) {
+      env = { ...env, MSBUILDTERMINALLOGGER: "off" };
+    }
     if (path.isAbsolute(cmd)) {
       // DOTNET_ROOT so the host resolves runtimes, and PATH so build targets
       // that shell out to `dotnet`/tools (NSwag, protoc, etc.) find it too.

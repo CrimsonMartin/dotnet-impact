@@ -256,6 +256,7 @@ export class SessionRunner {
         this.dispose();
       };
       signal?.addEventListener("abort", onAbort, { once: true });
+      this.sessionDlls.add(dll);
       this.send({ id, cmd: "run", dll, filter });
       const res = await done;
       signal?.removeEventListener("abort", onAbort);
@@ -291,9 +292,13 @@ export class SessionRunner {
     return task;
   }
 
+  /** Every dll a session was ever started for; the release-all sweep target. */
+  private readonly sessionDlls = new Set<string>();
+
   /** Stop the session holding `dll` so a rebuild can overwrite it (Windows locks). */
   async release(dll: string): Promise<void> {
     if (!this.proc || !this.ready) return;
+    this.sessionDlls.delete(dll);
     const id = this.nextId++;
     const done = new Promise<{ ok: boolean }>((resolve) => {
       this.pending.set(id, { tests: [], resolve });
@@ -301,6 +306,15 @@ export class SessionRunner {
     this.send({ id, cmd: "release", dll });
     await Promise.race([done, new Promise((r) => setTimeout(r, 5000))]);
     this.pending.delete(id); // a timed-out release must not leak its entry
+  }
+
+  /**
+   * Stop every warm session before a build: on Windows any testhost locks not
+   * just its own test dll but every dependency assembly it loaded, so a
+   * rebuild of a shared project fails unless all of them let go.
+   */
+  async releaseAll(): Promise<void> {
+    for (const dll of [...this.sessionDlls]) await this.release(dll);
   }
 
   /** `immediate` skips the graceful window — use when the host is exiting. */

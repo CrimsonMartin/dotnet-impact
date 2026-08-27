@@ -519,14 +519,11 @@ export class Runner {
     // involved test projects, which is always correct.
     let buildMs = 0;
     if (!fastPatched) {
-      // Windows keeps loaded assemblies locked: stop warm sessions before
-      // builds can overwrite their dlls. (Elsewhere the helper's mtime check
-      // handles it.)
+      // Windows keeps loaded assemblies locked — and every warm testhost
+      // locks its dependency dlls too, not just its own test dll, so ALL
+      // sessions must let go before a shared project can rebuild.
       if (process.platform === "win32" && this.sessions?.available) {
-        for (const rel of allRels) {
-          const dll = this.findTestDll(rel);
-          if (dll) await this.sessions.release(dll);
-        }
+        await this.sessions.releaseAll();
       }
       const tBuild = Date.now();
       const built = await this.buildProjects(allRels, signal);
@@ -679,10 +676,7 @@ export class Runner {
     const allRels = new Set([...byProject.keys(), ...fallbackRel]);
 
     if (process.platform === "win32" && this.sessions?.available) {
-      for (const rel of allRels) {
-        const dll = this.findTestDll(rel);
-        if (dll) await this.sessions.release(dll);
-      }
+      await this.sessions.releaseAll();
     }
 
     const built = await this.buildProjects(allRels, signal);
