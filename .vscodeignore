@@ -15,3 +15,5 @@ helper-static/bin/**
 helper-static/obj/**
 helper-hotpatch/bin/**
 helper-hotpatch/obj/**
+helper-deltas/bin/**
+helper-deltas/obj/**
