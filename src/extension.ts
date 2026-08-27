@@ -260,7 +260,14 @@ async function doRun(
     } else if (request.include && request.include.length > 0) {
       affected = affectedFromSelection(request.include);
     } else {
-      affected = runner!.computeAffected(await runner!.changedFiles());
+      // Top-level "Run Tests" with nothing selected: the whole suite, like any
+      // other test extension. Affected selection lives on save-triggered runs
+      // and the "Run affected tests now" command.
+      affected = {
+        classes: [],
+        fallbackProjects: testProjects(runner!.projectGraph()),
+        changedFiles: [],
+      };
     }
     affected.classOwners = Object.fromEntries(classOwners);
 
@@ -439,7 +446,7 @@ function ensureMethodItem(
 
 async function runAffectedNow(): Promise<void> {
   if (!runner) return;
-  await executeRun(new vscode.TestRunRequest(), undefined);
+  await executeRun(new vscode.TestRunRequest(), await runner.changedFiles());
 }
 
 let mapBuilding = false;
