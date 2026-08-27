@@ -82,7 +82,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const pending = new Set<string>();
   context.subscriptions.push(
     vscode.workspace.onDidSaveTextDocument((doc) => {
-      if (!doc.fileName.endsWith(".cs")) return;
+      if (!/\.(cs|razor|cshtml)$/i.test(doc.fileName)) return;
       if (continuousSessions > 0) return; // continuous run already watches saves
       if (!vscode.workspace.getConfiguration("dotnetImpact").get<boolean>("autoRunOnSave", true))
         return;
@@ -195,7 +195,7 @@ async function runHandler(
     // Native continuous run: watch saves until the user toggles the eye off.
     continuousSessions++;
     const listener = vscode.workspace.onDidSaveTextDocument(async (doc) => {
-      if (!doc.fileName.endsWith(".cs")) return;
+      if (!/\.(cs|razor|cshtml)$/i.test(doc.fileName)) return;
       await executeRun(request, [doc.fileName]);
     });
     token.onCancellationRequested(() => {
