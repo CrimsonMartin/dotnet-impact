@@ -611,7 +611,14 @@ export class Runner {
           this.pendingRefresh.set(cls, csprojRel); // partial result: retry later
           break;
         }
-        this.map.update(cls, csprojRel, repoTreeFiles(cov.files));
+        const files = repoTreeFiles(cov.files);
+        if (files.length === 0) {
+          // No report (failed run, racing rebuild, missing collector): never
+          // overwrite a good row with emptiness.
+          this.logSink(`map refresh: no coverage produced for ${cls}; keeping existing row`);
+          continue;
+        }
+        this.map.update(cls, csprojRel, files);
         this.map.save();
         done++;
       } catch {
