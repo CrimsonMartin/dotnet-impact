@@ -353,13 +353,7 @@ async function doRun(
       return;
     }
 
-    for (const cls of affected.classes) {
-      const item = findClassItem(cls);
-      if (item) {
-        run.enqueued(item);
-        run.started(item);
-      }
-    }
+    markRunning(run, affected);
     const subset = affected.classes.length > 0;
     const reported = new Set<string>();
     // Stream results into Test Explorer as each test invocation finishes
@@ -430,13 +424,7 @@ async function doCoverageRun(request: vscode.TestRunRequest, signal: AbortSignal
       return;
     }
 
-    for (const cls of affected.classes) {
-      const item = findClassItem(cls);
-      if (item) {
-        run.enqueued(item);
-        run.started(item);
-      }
-    }
+    markRunning(run, affected);
     const subset = affected.classes.length > 0;
     const reported = new Set<string>();
     const result = await runner!.runCoverage(affected, signal, (partial) =>
@@ -512,6 +500,30 @@ function affectedFromSelection(include: readonly vscode.TestItem[]): AffectedSet
 }
 
 // ---------- result reporting ----------
+
+/**
+ * Mark everything this run will actually execute as queued+running, down to
+ * the method leaves. Only items that are really running spin — the untouched
+ * rest of the suite keeps its icons (see core/replay.ts for the v0.1.2
+ * lesson). Items that end without a result are reset by run.end().
+ */
+function markRunning(run: vscode.TestRun, affected: AffectedSet): void {
+  const fallbackRels = new Set(
+    affected.fallbackProjects.map((p) => toRepoRelative(runner!.repoRoot, p.csproj))
+  );
+  const classes = new Set(affected.classes);
+  for (const [cls, rel] of classOwners) if (fallbackRels.has(rel)) classes.add(cls);
+  for (const cls of classes) {
+    const item = findClassItem(cls);
+    if (!item) continue;
+    run.enqueued(item);
+    run.started(item);
+    item.children.forEach((m) => {
+      run.enqueued(m);
+      run.started(m);
+    });
+  }
+}
 
 function findClassItem(cls: string): vscode.TestItem | undefined {
   let found: vscode.TestItem | undefined;
