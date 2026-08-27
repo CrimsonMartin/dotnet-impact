@@ -23,8 +23,11 @@ using Microsoft.VisualStudio.TestPlatform.ObjectModel.Client;
 using Microsoft.VisualStudio.TestPlatform.ObjectModel.Client.Interfaces;
 using Microsoft.VisualStudio.TestPlatform.ObjectModel.Logging;
 
-var vstestPath = args.Length > 0 ? args[0] : throw new ArgumentException("usage: ImpactRunner <vstest.console.dll>");
-const string RunSettings = "<RunSettings><RunConfiguration></RunConfiguration></RunSettings>";
+var vstestPath = args.Length > 0 ? args[0] : throw new ArgumentException("usage: ImpactRunner <vstest.console.dll> [runsettings-file]");
+// Optional runsettings file (hot-patch env injection for testhosts lives there).
+var RunSettings = args.Length > 1 && File.Exists(args[1])
+    ? File.ReadAllText(args[1])
+    : "<RunSettings><RunConfiguration></RunConfiguration></RunSettings>";
 
 var wrapper = new VsTestConsoleWrapper(vstestPath);
 wrapper.StartSession();

@@ -63,7 +63,9 @@ export class SessionRunner {
     private readonly repoRoot: string,
     /** Absolute path to the helper source dir shipped with the extension. */
     private readonly helperSrcDir: string,
-    private readonly log: (msg: string) => void = () => undefined
+    private readonly log: (msg: string) => void = () => undefined,
+    /** Optional runsettings file applied to every session/run (hot-patch env). */
+    private readonly runsettingsFile?: string
   ) {}
 
   get available(): boolean {
@@ -147,7 +149,9 @@ export class SessionRunner {
         env.DOTNET_ROOT = path.dirname(dotnet);
         env.PATH = `${path.dirname(dotnet)}${path.delimiter}${env.PATH ?? ""}`;
       }
-      this.proc = spawn(dotnet, [dll, vstest], { cwd: this.repoRoot, env, stdio: ["pipe", "pipe", "pipe"] });
+      const helperArgs = [dll, vstest];
+      if (this.runsettingsFile) helperArgs.push(this.runsettingsFile);
+      this.proc = spawn(dotnet, helperArgs, { cwd: this.repoRoot, env, stdio: ["pipe", "pipe", "pipe"] });
       this.proc.on("error", (e) => {
         this.log(`helper spawn error: ${String(e)}`);
         this.ready = false;

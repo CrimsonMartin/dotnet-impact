@@ -6,3 +6,5 @@ helper/bin/
 helper/obj/
 helper-static/bin/
 helper-static/obj/
+helper-hotpatch/bin/
+helper-hotpatch/obj/
