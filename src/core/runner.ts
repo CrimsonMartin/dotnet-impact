@@ -484,9 +484,11 @@ export class Runner {
     const allRels = new Set([...byProject.keys(), ...fallbackRel]);
     const tStart = Date.now();
 
-    // Fast path first: method-body-only edits become EnC deltas patched into
-    // the live warm testhosts — no build, no restart, milliseconds. Any miss
-    // (structural edit, cold host, missing binlog) falls through, logging why.
+    // Fast path first: edits Roslyn's EnC engine accepts (method bodies,
+    // added methods/fields/types, lambdas) become deltas patched into the
+    // live warm testhosts — no build, no restart, milliseconds. Any miss
+    // (rude edit, API-surface change, cold host, missing binlog) falls
+    // through, logging why.
     // This must run BEFORE the Windows session release below: releasing kills
     // the warm hosts the fast path patches into.
     let fastPatched = false;
@@ -521,9 +523,12 @@ export class Runner {
     if (!fastPatched) {
       // Windows keeps loaded assemblies locked — and every warm testhost
       // locks its dependency dlls too, not just its own test dll, so ALL
-      // sessions must let go before a shared project can rebuild.
-      if (process.platform === "win32" && this.sessions?.available) {
-        await this.sessions.releaseAll();
+      // sessions must let go before a shared project can rebuild. The EnC
+      // engine also reads baseline modules from disk; dropping its sessions
+      // releases those handles too.
+      if (process.platform === "win32") {
+        if (this.sessions?.available) await this.sessions.releaseAll();
+        this.hotpatch?.reset();
       }
       const tBuild = Date.now();
       const built = await this.buildProjects(allRels, signal);
@@ -675,8 +680,9 @@ export class Runner {
     const fallbackRel = affected.fallbackProjects.map((p) => toRepoRelative(this.repoRoot, p.csproj));
     const allRels = new Set([...byProject.keys(), ...fallbackRel]);
 
-    if (process.platform === "win32" && this.sessions?.available) {
-      await this.sessions.releaseAll();
+    if (process.platform === "win32") {
+      if (this.sessions?.available) await this.sessions.releaseAll();
+      this.hotpatch?.reset(); // EnC baseline handles; see runAffected
     }
 
     const built = await this.buildProjects(allRels, signal);

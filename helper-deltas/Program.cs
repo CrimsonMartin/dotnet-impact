@@ -1,36 +1,42 @@
 // Impact delta service.
 //
-// Resident process holding Roslyn compilations reconstructed from MSBuild
-// binlogs (Basic.CompilerLog). For a saved .cs file it classifies the edit:
-// method-body-only changes become EnC metadata deltas (EmitDifference) the
-// extension pushes into live testhosts; anything structural is refused so the
-// caller falls back to a real build.
+// Resident process holding Roslyn workspaces reconstructed from complogs
+// (Basic.CompilerLog). Edits are evaluated by Roslyn's own Edit-and-Continue
+// engine (the one behind dotnet-watch hot reload) via the vendored
+// ImpactHotReloadService facade: everything the runtime supports — method
+// bodies, added methods/fields/types, lambdas — becomes deltas the extension
+// pushes into live testhosts; rude edits are refused with their ENC
+// diagnostic so the caller falls back to a real build.
 //
 // Protocol: JSON lines on stdin/stdout.
-//   -> {"id":1,"cmd":"load","binlog":"/abs/x.binlog","csproj":"/abs/Lib.csproj","dll":"/abs/Lib.dll"}
+//   -> {"id":1,"cmd":"load","binlog":"/abs/x.complog","csproj":"/abs/Lib.csproj","dll":"/abs/Lib.dll"}
 //   <- {"id":1,"type":"done","ok":true,"assembly":"Lib"}
 //   -> {"id":2,"cmd":"delta","csproj":"/abs/Lib.csproj","file":"/abs/Calc.cs"}
 //   <- {"id":2,"type":"done","ok":true,"assembly":"Lib","md":"<b64>","il":"<b64>","pdb":"<b64>"}
-//      or {"id":2,"type":"done","ok":false,"reason":"structural: ..."}
+//      or {"id":2,"type":"done","ok":false,"reason":"rude edit ENC0023: ..."}
 //   -> {"id":3,"cmd":"reset"}   drop all state (after a real rebuild)
 //
-// Baselines chain across generations; a "load" for an already-loaded project
-// re-initializes it (fresh dll after a rebuild).
+// Baselines chain across generations inside the EnC session; a "load" for an
+// already-loaded project re-initializes it (fresh dll after a rebuild).
 
 using System.Collections.Immutable;
-using System.Reflection.Metadata;
 using System.Text;
 using System.Text.Json;
 using Basic.CompilerLog.Util;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
-using Microsoft.CodeAnalysis.CSharp.Syntax;
-using Microsoft.CodeAnalysis.Emit;
+using Microsoft.CodeAnalysis.ExternalAccess.HotReload.Api;
 using Microsoft.CodeAnalysis.Text;
 
-var projects = new Dictionary<string, ProjectState>(StringComparer.OrdinalIgnoreCase);
+var projects = new Dictionary<string, EncProject>(StringComparer.OrdinalIgnoreCase);
 var stdout = Console.Out;
 void Emit(object payload) => stdout.WriteLine(JsonSerializer.Serialize(payload));
+
+void ResetAll()
+{
+    foreach (var p in projects.Values) p.Dispose();
+    projects.Clear();
+}
 
 Emit(new { type = "ready" });
 string? line;
@@ -45,9 +51,10 @@ while ((line = Console.ReadLine()) != null)
         switch (root.GetProperty("cmd").GetString())
         {
             case "shutdown":
+                ResetAll();
                 return 0;
             case "reset":
-                projects.Clear();
+                ResetAll();
                 Emit(new { id, type = "done", ok = true });
                 break;
             case "snapshot":
@@ -69,17 +76,15 @@ while ((line = Console.ReadLine()) != null)
                 Emit(new { id, type = "done", ok = true, calls, warnings });
                 break;
             }
-            case "classify":
+            case "guard":
             {
-                // Pure classification of an edit (old source -> new source):
-                // the unit-test surface for the delta calculator.
+                // Pure API-surface check (old source -> new source): the
+                // unit-test surface for the cross-project safety valve.
                 var oldText = root.GetProperty("old").GetString()!;
                 var newText = root.GetProperty("new").GetString()!;
-                var (changed, reason) = DeltaClassifier.Classify(
-                    CSharpSyntaxTree.ParseText(oldText),
-                    CSharpSyntaxTree.ParseText(newText));
-                if (reason != null) Emit(new { id, type = "done", ok = false, reason });
-                else Emit(new { id, type = "done", ok = true, changed });
+                var removed = ApiGuard.RemovedVisibleDeclaration(oldText, newText);
+                if (removed != null) Emit(new { id, type = "done", ok = false, reason = $"api change: {removed}" });
+                else Emit(new { id, type = "done", ok = true });
                 break;
             }
             case "load":
@@ -87,14 +92,15 @@ while ((line = Console.ReadLine()) != null)
                 var binlog = root.GetProperty("binlog").GetString()!;
                 var csproj = root.GetProperty("csproj").GetString()!;
                 var dll = root.GetProperty("dll").GetString()!;
-                var (state, detail) = ProjectState.Load(binlog, csproj, dll);
+                var (state, reason) = EncProject.LoadAsync(binlog, csproj, dll).GetAwaiter().GetResult();
                 if (state == null)
                 {
-                    Emit(new { id, type = "done", ok = false, reason = "project not found in binlog" });
+                    Emit(new { id, type = "done", ok = false, reason });
                     break;
                 }
+                if (projects.TryGetValue(csproj, out var old)) old.Dispose();
                 projects[csproj] = state;
-                Emit(new { id, type = "done", ok = true, assembly = state.AssemblyName, detail });
+                Emit(new { id, type = "done", ok = true, assembly = state.AssemblyName });
                 break;
             }
             case "delta":
@@ -106,10 +112,10 @@ while ((line = Console.ReadLine()) != null)
                     Emit(new { id, type = "done", ok = false, reason = "not loaded" });
                     break;
                 }
-                var result = state.TryDelta(file);
-                if (result.Reason != null)
+                var (delta, reason) = state.DeltaAsync(file).GetAwaiter().GetResult();
+                if (delta == null)
                 {
-                    Emit(new { id, type = "done", ok = false, reason = result.Reason });
+                    Emit(new { id, type = "done", ok = false, reason });
                 }
                 else
                 {
@@ -119,9 +125,9 @@ while ((line = Console.ReadLine()) != null)
                         type = "done",
                         ok = true,
                         assembly = state.AssemblyName,
-                        md = Convert.ToBase64String(result.Md!),
-                        il = Convert.ToBase64String(result.Il!),
-                        pdb = Convert.ToBase64String(result.Pdb!),
+                        md = Convert.ToBase64String(delta.Value.Md),
+                        il = Convert.ToBase64String(delta.Value.Il),
+                        pdb = Convert.ToBase64String(delta.Value.Pdb),
                     });
                 }
                 break;
@@ -136,157 +142,310 @@ while ((line = Console.ReadLine()) != null)
         Emit(new { id, type = "done", ok = false, reason = e.Message });
     }
 }
+ResetAll();
 return 0;
 
-sealed class ProjectState
+/// <summary>
+/// One project's EnC session: workspace + solution reconstructed from its
+/// complog, driven through Roslyn's Edit-and-Continue engine.
+/// </summary>
+sealed class EncProject : IDisposable
 {
+    /// <summary>
+    /// CoreCLR (.NET 8+) hot-reload capabilities. Until the startup hook
+    /// reports MetadataUpdater.GetCapabilities() per host, this is the safe
+    /// modern-runtime set — anything a host can't do would be refused at
+    /// ApplyUpdate and the push failure already forces the build path.
+    /// </summary>
+    private static readonly ImmutableArray<string> Capabilities = ImmutableArray.Create(
+        "Baseline",
+        "AddMethodToExistingType",
+        "AddStaticFieldToExistingType",
+        "AddInstanceFieldToExistingType",
+        "NewTypeDefinition",
+        "ChangeCustomAttributes",
+        "UpdateParameters",
+        "GenericUpdateMethod",
+        "GenericAddMethodToExistingType",
+        "GenericAddFieldToExistingType");
+
     public required string AssemblyName;
-    private CSharpCompilation _compilation = null!;
-    private EmitBaseline _baseline = null!;
+    private AdhocWorkspace _workspace = null!;
+    private ImpactHotReloadService _service = null!;
+    private Solution _current = null!;
+    private Dictionary<string, DocumentId> _documents = null!;
+    /// <summary>Backs the solution's lazy text loaders; must outlive the session.</summary>
+    private SolutionReader _reader = null!;
 
-    public static (ProjectState?, string) Load(string binlog, string csproj, string dll)
+    public static async Task<(EncProject?, string)> LoadAsync(string complogPath, string csproj, string dll)
     {
-        // OnDisk analyzers: source generators must actually run, or generator-
-        // implemented partial members (e.g. [GeneratedRegex]) break the emit.
-        using var reader = CompilerCallReaderUtil.Create(binlog, BasicAnalyzerKind.OnDisk);
-        var data = reader
-            .ReadAllCompilationData()
-            .FirstOrDefault(d =>
-                string.Equals(d.CompilerCall.ProjectFilePath, csproj, StringComparison.OrdinalIgnoreCase)
-                || Path.GetFileName(d.CompilerCall.ProjectFilePath ?? "") == Path.GetFileName(csproj));
-        if (data == null) return (null, "");
-        var before = data.Compilation.SyntaxTrees.Count();
-        var comp = (CSharpCompilation)data.GetCompilationAfterGenerators(out var genDiags);
-        var detail =
-            $"treesBefore={before} treesAfter={comp.SyntaxTrees.Count()}"
-            + (genDiags.IsDefaultOrEmpty ? "" : $" genDiags=[{string.Join("; ", genDiags.Take(2))}]");
-        var state = new ProjectState
+        var reader = SolutionReader.Create(complogPath, BasicAnalyzerKind.OnDisk);
+        var workspace = ImpactEncWorkspace.Create();
+        var solution = workspace.AddSolution(reader.ReadSolutionInfo());
+
+        var project = solution.Projects.FirstOrDefault(p =>
+            string.Equals(p.FilePath, csproj, StringComparison.OrdinalIgnoreCase)
+            || Path.GetFileName(p.FilePath ?? "") == Path.GetFileName(csproj));
+        if (project == null)
         {
-            AssemblyName = comp.AssemblyName ?? Path.GetFileNameWithoutExtension(dll),
-            _compilation = comp,
-            _baseline = EmitBaseline.CreateInitialBaseline(
-                comp,
-                // From image, never CreateFromFile: the file variant memory-maps
-                // the dll and holds the handle open, which on Windows blocks the
-                // next rebuild of that project (MSB3021 "file is locked").
-                ModuleMetadata.CreateFromImage(ImmutableArray.Create(File.ReadAllBytes(dll))),
-                handle => default,
-                handle => default,
-                true),
-        };
-        return (state, detail);
-    }
-
-    public (byte[]? Md, byte[]? Il, byte[]? Pdb, string? Reason) TryDelta(string file)
-    {
-        var oldTree = _compilation.SyntaxTrees.FirstOrDefault(t =>
-            string.Equals(t.FilePath, file, StringComparison.OrdinalIgnoreCase)
-            || t.FilePath.EndsWith(Path.DirectorySeparatorChar + Path.GetFileName(file), StringComparison.OrdinalIgnoreCase));
-        if (oldTree == null) return (null, null, null, "file not in compilation");
-
-        var newTree = CSharpSyntaxTree.ParseText(
-            SourceText.From(File.ReadAllText(file), Encoding.UTF8),
-            (CSharpParseOptions)oldTree.Options,
-            path: oldTree.FilePath);
-        var newComp = _compilation.ReplaceSyntaxTree(oldTree, newTree);
-
-        // Classify: identical member skeletons, only method/ctor bodies changed.
-        var (changedKeys, reason) = DeltaClassifier.Classify(oldTree, newTree);
-        if (reason != null)
-            return (null, null, null, $"{reason} (tree={oldTree.FilePath})");
-        var oldMembers = DeltaClassifier.MemberIndex(oldTree);
-        var newMembers = DeltaClassifier.MemberIndex(newTree);
-
-        var oldModel = _compilation.GetSemanticModel(oldTree);
-        var newModel = newComp.GetSemanticModel(newTree);
-        var edits = new List<SemanticEdit>();
-        foreach (var key in changedKeys)
-        {
-            var oldSym = oldModel.GetDeclaredSymbol(oldMembers[key]);
-            var newSym = newModel.GetDeclaredSymbol(newMembers[key]);
-            if (oldSym == null || newSym == null) return (null, null, null, $"structural: unresolved {key}");
-            edits.Add(new SemanticEdit(SemanticEditKind.Update, oldSym, newSym));
-        }
-        if (edits.Count == 0)
-        {
-            var dbgOld = oldMembers.Values.FirstOrDefault()?.ToFullString().Replace("\n", "\\n") ?? "<none>";
-            return (null, null, null,
-                $"no-op (tree={oldTree.FilePath}, members={oldMembers.Count}, firstOld=[{dbgOld[..Math.Min(90, dbgOld.Length)]}])");
+            workspace.Dispose();
+            reader.Dispose();
+            return (null, "project not found in binlog");
         }
 
-        using var md = new MemoryStream();
-        using var il = new MemoryStream();
-        using var pdb = new MemoryStream();
-        var diff = newComp.EmitDifference(_baseline, edits.ToImmutableArray(), s => false, md, il, pdb);
-        var errors = diff.Diagnostics.Where(d => d.Severity == DiagnosticSeverity.Error).ToList();
-        if (errors.Count > 0) return (null, null, null, "emit: " + errors[0]);
-        if (diff.Baseline == null) return (null, null, null, "emit: no baseline produced");
+        // The EnC engine reads the baseline module from the project's output
+        // path; the complog doesn't carry one, so point it at the built dll.
+        solution = solution
+            .WithProjectOutputFilePath(project.Id, dll)
+            .WithProjectCompilationOutputInfo(project.Id, project.CompilationOutputInfo.WithAssemblyPath(dll));
 
-        _compilation = newComp;
-        _baseline = diff.Baseline;
-        return (md.ToArray(), il.ToArray(), pdb.ToArray(), null);
+        // The engine trusts a baseline document only when its text checksum
+        // matches the PDB's. SolutionReader materializes texts from strings
+        // with no encoding, so GetChecksum() is empty and every document reads
+        // as out-of-sync (ENC1008 "stale project"). Rebuild each text from the
+        // complog tree's string WITH its encoding + checksum algorithm.
+        using (var callReader = CompilerCallReaderUtil.Create(complogPath, BasicAnalyzerKind.OnDisk))
+        {
+            var data = callReader
+                .ReadAllCompilationData()
+                .FirstOrDefault(d =>
+                    string.Equals(d.CompilerCall.ProjectFilePath, csproj, StringComparison.OrdinalIgnoreCase)
+                    || Path.GetFileName(d.CompilerCall.ProjectFilePath ?? "") == Path.GetFileName(csproj));
+            if (data != null)
+            {
+                var byPath = new Dictionary<string, SourceText>(StringComparer.OrdinalIgnoreCase);
+                foreach (var tree in data.Compilation.SyntaxTrees)
+                {
+                    if (string.IsNullOrEmpty(tree.FilePath)) continue;
+                    var text = tree.GetText();
+                    byPath[tree.FilePath] = SourceText.From(
+                        text.ToString(),
+                        text.Encoding ?? tree.Encoding ?? new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+                        text.ChecksumAlgorithm);
+                }
+                foreach (var docu in solution.GetProject(project.Id)!.Documents)
+                    if (docu.FilePath != null && byPath.TryGetValue(docu.FilePath, out var text))
+                        solution = solution.WithDocumentText(docu.Id, text);
+                if (Environment.GetEnvironmentVariable("IMPACT_ENC_DEBUG") == "1")
+                {
+                    var pdbPath = Path.ChangeExtension(dll, ".pdb");
+                    if (File.Exists(pdbPath))
+                    {
+                        using var pdbStream = File.OpenRead(pdbPath);
+                        using var provider = System.Reflection.Metadata.MetadataReaderProvider.FromPortablePdbStream(pdbStream);
+                        var pdbReader = provider.GetMetadataReader();
+                        foreach (var dh in pdbReader.Documents)
+                        {
+                            var d = pdbReader.GetDocument(dh);
+                            var name = pdbReader.GetString(d.Name);
+                            var hash = Convert.ToHexString(pdbReader.GetBlobBytes(d.Hash))[..12];
+                            var mine = byPath.TryGetValue(name, out var t)
+                                ? Convert.ToHexString(t.GetChecksum().ToArray()).PadRight(12)[..12]
+                                : "<no tree>";
+                            Console.Error.WriteLine($"[enc] {Path.GetFileName(name)}: pdb={hash} text={mine}");
+                        }
+                    }
+                }
+            }
+        }
+
+        var service = new ImpactHotReloadService(workspace.Services, Capabilities);
+        await service.StartSessionAsync(solution, CancellationToken.None).ConfigureAwait(false);
+
+        var documents = new Dictionary<string, DocumentId>(StringComparer.OrdinalIgnoreCase);
+        foreach (var d in solution.GetProject(project.Id)!.Documents)
+            if (d.FilePath != null)
+                documents[d.FilePath] = d.Id;
+
+        return (new EncProject
+        {
+            // The hook routes deltas by simple assembly name; SolutionReader
+            // carries the /out file name ("Lib.dll") here.
+            AssemblyName = project.AssemblyName.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)
+                ? Path.GetFileNameWithoutExtension(project.AssemblyName)
+                : project.AssemblyName,
+            _workspace = workspace,
+            _service = service,
+            _current = solution,
+            _documents = documents,
+            _reader = reader,
+        }, "");
     }
 
+    public async Task<((byte[] Md, byte[] Il, byte[] Pdb)?, string)> DeltaAsync(string file)
+    {
+        var docId = FindDocument(file);
+        if (docId == null) return (null, "file not in compilation");
+
+        var text = SourceText.From(File.ReadAllText(file), Encoding.UTF8);
+
+        // Cross-project safety valve. The EnC session spans one project, so
+        // the engine happily models a changed public signature as "add new,
+        // keep old alive in metadata" — dependent test assemblies would keep
+        // calling the old member and stay green even though the solution no
+        // longer compiles. Any disappeared non-private declaration therefore
+        // forces the build path, where the dependent compile failure surfaces.
+        var oldText = (await _current.GetDocument(docId)!.GetTextAsync().ConfigureAwait(false)).ToString();
+        var removed = ApiGuard.RemovedVisibleDeclaration(oldText, text.ToString());
+        if (removed != null)
+            return (null, $"api change: {removed} removed or signature changed — dependents must rebuild");
+
+        var updated = _current.WithDocumentText(docId, text);
+
+        var updates = await _service.GetUpdatesAsync(
+            updated,
+            ImmutableDictionary<ProjectId, ImpactHotReloadService.RunningProjectInfo>.Empty,
+            CancellationToken.None).ConfigureAwait(false);
+
+        if (updates.Status == ImpactHotReloadService.Status.NoChangesToApply)
+        {
+            _current = updated;
+            var diag = updates.PersistentDiagnostics.FirstOrDefault()
+                ?? updates.TransientDiagnostics.SelectMany(t => t.diagnostics).FirstOrDefault();
+            return (null,
+                $"no-op (engine: no effective changes"
+                + $"{(diag != null ? $"; {diag.Id}: {diag.GetMessage()}" : "")}"
+                + $"; persistent={updates.PersistentDiagnostics.Length} transient={updates.TransientDiagnostics.Length} rebuild={updates.ProjectsToRebuild.Length})");
+        }
+
+        var rude = updates.TransientDiagnostics.SelectMany(t => t.diagnostics).FirstOrDefault();
+        if (updates.Status == ImpactHotReloadService.Status.Blocked
+            || !updates.ProjectsToRebuild.IsEmpty
+            || !updates.ProjectsToRestart.IsEmpty
+            || updates.ProjectUpdates.IsEmpty)
+        {
+            Discard();
+            if (rude != null)
+                return (null, $"rude edit {rude.Id}: {rude.GetMessage()}");
+            var error = updates.PersistentDiagnostics.FirstOrDefault(d => d.Severity == DiagnosticSeverity.Error);
+            return (null, error != null ? $"compile error: {error}" : "engine refused the update");
+        }
+
+        if (updates.ProjectUpdates.Length != 1)
+        {
+            // The hook protocol pushes one assembly per delta; multi-module
+            // updates from a single-project session would mean generators
+            // fanned out — refuse and let the build path handle it.
+            Discard();
+            return (null, $"multi-module update ({updates.ProjectUpdates.Length}) not supported");
+        }
+
+        var u = updates.ProjectUpdates[0];
+        _service.CommitUpdate();
+        _current = updated;
+        return ((u.MetadataDelta.ToArray(), u.ILDelta.ToArray(), u.PdbDelta.ToArray()), "");
+    }
+
+    private DocumentId? FindDocument(string file)
+    {
+        if (_documents.TryGetValue(file, out var exact)) return exact;
+        var suffix = Path.DirectorySeparatorChar + Path.GetFileName(file);
+        foreach (var (path, docId) in _documents)
+            if (path.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+                return docId;
+        return null;
+    }
+
+    private void Discard()
+    {
+        try
+        {
+            _service.DiscardUpdate();
+        }
+        catch
+        {
+            // Nothing pending (e.g. Blocked before an emit): fine.
+        }
+    }
+
+    public void Dispose()
+    {
+        try
+        {
+            _service.EndSession();
+        }
+        catch
+        {
+            /* session never started or already ended */
+        }
+        _workspace.Dispose();
+        _reader.Dispose();
+    }
 }
 
-/**
- * The pure classification half of the delta calculator: given the old and new
- * syntax trees of one file, decide whether the change is hot-patchable
- * (method/ctor bodies only) and which members need semantic edits. No
- * compilation or baseline involved — unit-tested through the "classify"
- * protocol command.
- */
-internal static class DeltaClassifier
+/// <summary>
+/// Cross-project safety valve for the per-project EnC sessions: detects
+/// declarations visible outside the file's own assembly-private scope that
+/// DISAPPEAR between two versions of a file. Additions and body edits pass;
+/// a removed/renamed/re-signatured non-private declaration must rebuild so
+/// dependent assemblies (tests, IVT friends) recompile against the new API.
+/// Trivia never participates (keys are token/signature based).
+/// </summary>
+static class ApiGuard
 {
-    public static (List<string> Changed, string? Reason) Classify(SyntaxTree oldTree, SyntaxTree newTree)
+    /// <summary>First removed visible declaration's key, or null if none.</summary>
+    public static string? RemovedVisibleDeclaration(string oldSource, string newSource)
     {
-        var oldMembers = MemberIndex(oldTree);
-        var newMembers = MemberIndex(newTree);
-        if (oldMembers.Count != newMembers.Count)
-            return (new List<string>(),
-                $"structural: member count changed ({oldMembers.Count} -> {newMembers.Count})");
-
-        var changed = new List<string>();
-        foreach (var (key, oldNode) in oldMembers)
-        {
-            if (!newMembers.TryGetValue(key, out var newNode))
-                return (new List<string>(), $"structural: {key}");
-            // Roslyn's trivia-insensitive equivalence, NOT text comparison:
-            // ToFullString() includes surrounding trivia, so a blank line
-            // added above a property read as a structural change.
-            if (oldNode.IsEquivalentTo(newNode, topLevel: false)) continue;
-            if (oldNode is not BaseMethodDeclarationSyntax)
-                return (new List<string>(), $"structural: non-method change at {key}");
-            changed.Add(key);
-        }
-        return (changed, null);
+        var oldKeys = DeclarationKeys(CSharpSyntaxTree.ParseText(oldSource));
+        var newKeys = DeclarationKeys(CSharpSyntaxTree.ParseText(newSource));
+        foreach (var key in oldKeys)
+            if (!newKeys.Contains(key))
+                return key;
+        return null;
     }
 
-    /** Member skeleton index: signature key -> declaration node. */
-    public static Dictionary<string, MemberDeclarationSyntax> MemberIndex(SyntaxTree tree)
+    private static HashSet<string> DeclarationKeys(SyntaxTree tree)
     {
-        var index = new Dictionary<string, MemberDeclarationSyntax>();
-        foreach (var node in tree.GetRoot().DescendantNodes().OfType<MemberDeclarationSyntax>())
+        var keys = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var node in tree.GetRoot().DescendantNodes().OfType<Microsoft.CodeAnalysis.CSharp.Syntax.MemberDeclarationSyntax>())
         {
-            if (node is NamespaceDeclarationSyntax or FileScopedNamespaceDeclarationSyntax or TypeDeclarationSyntax)
-                continue; // containers tracked through their members
-            var typeChain = string.Join("+", node.Ancestors().OfType<TypeDeclarationSyntax>()
+            if (node is Microsoft.CodeAnalysis.CSharp.Syntax.NamespaceDeclarationSyntax
+                or Microsoft.CodeAnalysis.CSharp.Syntax.FileScopedNamespaceDeclarationSyntax)
+                continue;
+            if (IsPrivate(node)) continue;
+
+            var typeChain = string.Join("+", node.Ancestors()
+                .OfType<Microsoft.CodeAnalysis.CSharp.Syntax.TypeDeclarationSyntax>()
                 .Reverse().Select(t => t.Identifier.Text + "`" + t.Arity));
             var key = node switch
             {
-                MethodDeclarationSyntax m =>
+                Microsoft.CodeAnalysis.CSharp.Syntax.TypeDeclarationSyntax t =>
+                    $"{typeChain}{(typeChain.Length > 0 ? "+" : "")}T:{t.Identifier.Text}`{t.Arity}",
+                Microsoft.CodeAnalysis.CSharp.Syntax.MethodDeclarationSyntax m =>
                     $"{typeChain}.M:{m.Identifier.Text}`{m.Arity}({string.Join(",", m.ParameterList.Parameters.Select(p => p.Type?.ToString()))})",
-                ConstructorDeclarationSyntax c =>
+                Microsoft.CodeAnalysis.CSharp.Syntax.ConstructorDeclarationSyntax c =>
                     $"{typeChain}.C:({string.Join(",", c.ParameterList.Parameters.Select(p => p.Type?.ToString()))})",
-                _ => $"{typeChain}.O:{node.Kind()}:{Snippet(node)}",
+                Microsoft.CodeAnalysis.CSharp.Syntax.PropertyDeclarationSyntax p =>
+                    $"{typeChain}.P:{p.Identifier.Text}:{p.Type}",
+                Microsoft.CodeAnalysis.CSharp.Syntax.FieldDeclarationSyntax f =>
+                    $"{typeChain}.F:{string.Join(",", f.Declaration.Variables.Select(v => v.Identifier.Text))}:{f.Declaration.Type}",
+                // Events, indexers, operators, enums…: token-based identity.
+                _ => $"{typeChain}.O:{node.Kind()}:{string.Join(" ", node.DescendantTokens().Select(t => t.Text))}",
             };
-            index[key] = node;
+            keys.Add(key);
         }
-        return index;
+        return keys;
     }
 
-    /** Identity for non-method members (fields, props): token text only —
-     * trivia must not participate, or spacing inside the member changes it. */
-    private static string Snippet(MemberDeclarationSyntax node) =>
-        string.Join(" ", node.DescendantTokens().Select(t => t.Text));
+    /// <summary>
+    /// Private members can't break other assemblies, and same-project files
+    /// are recompiled inside the session — only they may vanish freely.
+    /// Default member visibility in types is private; explicit modifiers win.
+    /// </summary>
+    private static bool IsPrivate(Microsoft.CodeAnalysis.CSharp.Syntax.MemberDeclarationSyntax node)
+    {
+        var mods = node.Modifiers;
+        var isPrivate = mods.Any(m => m.IsKind(Microsoft.CodeAnalysis.CSharp.SyntaxKind.PrivateKeyword));
+        var isVisible = mods.Any(m =>
+            m.IsKind(Microsoft.CodeAnalysis.CSharp.SyntaxKind.PublicKeyword)
+            || m.IsKind(Microsoft.CodeAnalysis.CSharp.SyntaxKind.InternalKeyword)
+            || m.IsKind(Microsoft.CodeAnalysis.CSharp.SyntaxKind.ProtectedKeyword));
+        if (isPrivate && !mods.Any(m => m.IsKind(Microsoft.CodeAnalysis.CSharp.SyntaxKind.ProtectedKeyword)))
+            return true; // private (private protected keeps protected → visible)
+        if (isVisible) return false;
+        // No modifier: top-level types default internal (visible via IVT);
+        // members default private.
+        return node is not Microsoft.CodeAnalysis.CSharp.Syntax.BaseTypeDeclarationSyntax
+            || node.Parent is Microsoft.CodeAnalysis.CSharp.Syntax.TypeDeclarationSyntax;
+    }
 }

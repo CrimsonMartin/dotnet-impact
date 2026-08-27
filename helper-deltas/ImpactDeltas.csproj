@@ -13,6 +13,11 @@
     <PackageReference Include="Basic.CompilerLog.Util" Version="0.9.56" />
     <!-- SDK source generators target modern Roslyn; 4.8 can't load them (BCLA0002). -->
     <PackageReference Include="Microsoft.CodeAnalysis" Version="5.9.0" />
+    <!-- Roslyn's EnC engine + its C# analyzer, composed into the workspace. -->
+    <PackageReference Include="Microsoft.CodeAnalysis.Features" Version="5.9.0" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Features" Version="5.9.0" />
+    <!-- The IVT facade over the engine; see helper-enc/ImpactHotReloadService.cs. -->
+    <ProjectReference Include="../helper-enc/ImpactEnc.csproj" />
   </ItemGroup>
 
 </Project>

@@ -7,7 +7,8 @@ import { ProjectGraph, projectForFile } from "./projects";
 import { cacheDirFor, exec, resolveDotnet, toRepoRelative } from "./util";
 
 /**
- * Hot-patch fast path: for method-body-only edits, produce EnC deltas via the
+ * Hot-patch fast path: for edits Roslyn's EnC engine accepts (method bodies,
+ * added methods/fields/types, lambdas), produce deltas via the
  * resident ImpactDeltas service and push them into every live testhost through
  * the ImpactHotPatch startup-hook pipes — no build, no testhost restart.
  * Everything degrades silently: any miss returns false and the caller takes
@@ -306,15 +307,26 @@ export class HotPatcher {
 
   // ---- delta service process management ----
 
-  private async buildHelper(srcDir: string, name: string): Promise<string | undefined> {
+  private async buildHelper(
+    srcDir: string,
+    name: string,
+    extraSrcDirs: string[] = []
+  ): Promise<string | undefined> {
     const bin = path.join(cacheDirFor(this.repoRoot), `${name.toLowerCase()}-bin`);
     const dll = path.join(bin, `${name}.dll`);
     const stamp = path.join(bin, ".source-stamp");
-    const src = fs
-      .readdirSync(srcDir)
-      .filter((f) => f.endsWith(".cs") || f.endsWith(".csproj"))
-      .sort()
-      .map((f) => fs.readFileSync(path.join(srcDir, f), "utf8"))
+    const src = [srcDir, ...extraSrcDirs]
+      .flatMap((dir) => {
+        try {
+          return fs
+            .readdirSync(dir)
+            .filter((f) => f.endsWith(".cs") || f.endsWith(".csproj") || f.endsWith(".snk"))
+            .sort()
+            .map((f) => fs.readFileSync(path.join(dir, f)).toString("base64"));
+        } catch {
+          return [];
+        }
+      })
       .join("\n");
     const want = hash(src);
     try {
@@ -350,7 +362,11 @@ export class HotPatcher {
   private async start(): Promise<boolean> {
     try {
       this.buffer = "";
-      const dll = await this.buildHelper(this.deltasSrcDir, "ImpactDeltas");
+      // helper-enc is a ProjectReference of the delta service: its sources
+      // must participate in the rebuild stamp.
+      const dll = await this.buildHelper(this.deltasSrcDir, "ImpactDeltas", [
+        path.join(this.deltasSrcDir, "..", "helper-enc"),
+      ]);
       if (!dll) {
         this.broken = true;
         return false;

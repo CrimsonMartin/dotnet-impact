@@ -1,0 +1,165 @@
+import * as assert from "node:assert/strict";
+import { spawn, execFileSync } from "node:child_process";
+import * as crypto from "node:crypto";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import * as readline from "node:readline";
+import { test } from "node:test";
+import { resolveDotnet } from "../core/util";
+
+/**
+ * Unit tests for the delta service's API guard, driven through the helper's
+ * "guard" command (pure: two source texts in, verdict out).
+ *
+ * With Roslyn's EnC engine deciding patchability, the guard's only job is
+ * cross-project safety: the per-project session can't see dependents, so a
+ * non-private declaration that DISAPPEARS (removal/rename/re-signature) must
+ * force the build path — the engine alone would model it as "add new, keep
+ * old alive in metadata" and dependent test assemblies would stay green
+ * against an API that no longer compiles.
+ *
+ * Everything else — whitespace (the historical false-structural bug), body
+ * edits, added members — passes through to the engine.
+ */
+
+const HELPER_SRC = path.join(__dirname, "../../helper-deltas");
+const ENC_SRC = path.join(__dirname, "../../helper-enc");
+
+function dotnetOrNull(): string | null {
+  try {
+    const dotnet = resolveDotnet();
+    execFileSync(dotnet, ["--version"], { stdio: "pipe", timeout: 30_000 });
+    return dotnet;
+  } catch {
+    return null;
+  }
+}
+
+/** Build the helper into a stamped tmp cache (rebuilds only on source change). */
+function builtHelper(dotnet: string): string {
+  const bin = path.join(os.tmpdir(), "impact-guard-test-bin");
+  const dll = path.join(bin, "ImpactDeltas.dll");
+  const stampFile = path.join(bin, ".source-stamp");
+  const src = [HELPER_SRC, ENC_SRC]
+    .flatMap((dir) =>
+      fs
+        .readdirSync(dir)
+        .filter((f) => f.endsWith(".cs") || f.endsWith(".csproj") || f.endsWith(".snk"))
+        .sort()
+        .map((f) => fs.readFileSync(path.join(dir, f)).toString("base64"))
+    )
+    .join("\n");
+  const want = crypto.createHash("sha1").update(src).digest("hex");
+  try {
+    if (fs.existsSync(dll) && fs.readFileSync(stampFile, "utf8") === want) return dll;
+  } catch {
+    /* rebuild */
+  }
+  execFileSync(
+    dotnet,
+    ["build", path.join(HELPER_SRC, "ImpactDeltas.csproj"), "-c", "Release", "-o", bin, "--nologo", "-v", "quiet"],
+    { stdio: "pipe", timeout: 300_000, env: { ...process.env, MSBUILDTERMINALLOGGER: "off" } }
+  );
+  fs.writeFileSync(stampFile, want);
+  return dll;
+}
+
+interface GuardReply {
+  ok: boolean;
+  reason?: string;
+}
+
+/** One helper process for all cases; guard(old, new) over the jsonl protocol. */
+async function withGuard(
+  run: (guard: (oldSrc: string, newSrc: string) => Promise<GuardReply>) => Promise<void>
+): Promise<void> {
+  const dotnet = dotnetOrNull();
+  if (!dotnet) return; // no SDK on this machine: nothing to test against
+  const dll = builtHelper(dotnet);
+  const proc = spawn(dotnet, [dll], { stdio: ["pipe", "pipe", "pipe"] });
+  const rl = readline.createInterface({ input: proc.stdout });
+  const pending = new Map<number, (r: GuardReply) => void>();
+  rl.on("line", (line) => {
+    try {
+      const msg = JSON.parse(line);
+      if (msg.type === "done") pending.get(msg.id)?.(msg);
+    } catch {
+      /* chatter */
+    }
+  });
+  let nextId = 1;
+  const guard = (oldSrc: string, newSrc: string): Promise<GuardReply> => {
+    const id = nextId++;
+    const reply = new Promise<GuardReply>((resolve) => pending.set(id, resolve));
+    proc.stdin.write(JSON.stringify({ id, cmd: "guard", old: oldSrc, new: newSrc }) + "\n");
+    return reply;
+  };
+  try {
+    await run(guard);
+  } finally {
+    try {
+      proc.stdin.write(JSON.stringify({ cmd: "shutdown" }) + "\n");
+    } catch {
+      /* already gone */
+    }
+    setTimeout(() => proc.kill(), 2000).unref();
+  }
+}
+
+const SOURCE = `namespace Ns;
+
+public class Edi810
+{
+    public string? OriginalFullName { get; set; }
+
+    public Invoices? Invoices { get; set; }
+
+    private int _cache;
+
+    private int Cached() => _cache;
+
+    public int Total(int a, int b)
+    {
+        return a + b;
+    }
+}
+public class Invoices { }
+`;
+
+test("guard passes whitespace and additive/body edits through to the engine", { timeout: 300_000 }, async () => {
+  await withGuard(async (guard) => {
+    // Whitespace around and inside members (the historical false-structural bug).
+    for (const [label, edited] of [
+      ["blank line before property", SOURCE.replace("\n    public Invoices?", "\n\n    public Invoices?")],
+      ["blank line removed", SOURCE.replace("{ get; set; }\n\n    public Invoices?", "{ get; set; }\n    public Invoices?")],
+      ["accessor spacing", SOURCE.replace("OriginalFullName { get; set; }", "OriginalFullName { get;  set; }")],
+      ["re-indented body", SOURCE.replace("        return a + b;", "            return a + b;")],
+      // Behavior edits the engine handles.
+      ["method body change", SOURCE.replace("return a + b;", "return a * b;")],
+      ["added public method", SOURCE.replace("public class Invoices { }", "public class Invoices { public int N() => 1; }")],
+      ["added property", SOURCE.replace("public Invoices? Invoices { get; set; }", "public Invoices? Invoices { get; set; }\n\n    public int Extra { get; set; }")],
+      // Private surface may change freely: can't break other assemblies.
+      ["private member removed", SOURCE.replace("    private int Cached() => _cache;\n", "")],
+    ] as const) {
+      const r = await guard(SOURCE, edited);
+      assert.equal(r.ok, true, `${label}: ${r.reason}`);
+    }
+  });
+});
+
+test("guard refuses disappearing non-private declarations", { timeout: 300_000 }, async () => {
+  await withGuard(async (guard) => {
+    for (const [label, edited] of [
+      ["method signature change", SOURCE.replace("public int Total(int a, int b)", "public long Total(long a, long b)")],
+      ["property type change", SOURCE.replace("public string? OriginalFullName", "public int OriginalFullName")],
+      ["public method removed", SOURCE.replace("    public int Total(int a, int b)\n    {\n        return a + b;\n    }\n", "")],
+      ["public type renamed", SOURCE.replace("public class Invoices { }", "public class Invoicing { }")],
+      ["property removed", SOURCE.replace("    public Invoices? Invoices { get; set; }\n", "")],
+    ] as const) {
+      const r = await guard(SOURCE, edited);
+      assert.equal(r.ok, false, `${label} should be refused`);
+      assert.match(r.reason ?? "", /^api change: /, label);
+    }
+  });
+});
