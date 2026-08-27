@@ -51,7 +51,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         ok ? hot.runsettingsFile : undefined
       );
       if (ok) runner!.hotpatch = hot;
+      output.appendLine(
+        ok
+          ? "hot-patch: ready (runsettings prepared, delta service on demand)"
+          : "hot-patch: UNAVAILABLE — hook helper failed to build; every run takes the build path"
+      );
     });
+  } else {
+    // Deferred: output is created below, before any await resumes.
+    setTimeout(() => output.appendLine("persistent sessions disabled by setting — build path every run"), 0);
   }
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {

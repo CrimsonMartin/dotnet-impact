@@ -490,7 +490,11 @@ export class Runner {
     // This must run BEFORE the Windows session release below: releasing kills
     // the warm hosts the fast path patches into.
     let fastPatched = false;
-    if (this.sessions?.available && this.hotpatch && affected.changedFiles.length > 0) {
+    let fastSkip = ""; // why the fast path was not even attempted
+    if (affected.changedFiles.length === 0) fastSkip = "no-changed-files";
+    else if (!this.sessions?.available) fastSkip = "sessions-unavailable";
+    else if (!this.hotpatch) fastSkip = "hotpatch-unavailable";
+    else {
       this.hotpatch.shadowDir = this.shadow!.dir;
       let binlogs: Record<string, string> = {};
       try {
@@ -586,8 +590,9 @@ export class Runner {
     }
 
     const now = Date.now();
+    const fastLabel = fastPatched ? "hit" : fastSkip ? `off(${fastSkip})` : "miss";
     this.logSink(
-      `timing: fastpath=${fastPatched ? "hit" : "miss"} build=${buildMs}ms tests=${now - tTest}ms total=${now - tStart}ms`
+      `timing: fastpath=${fastLabel} build=${buildMs}ms tests=${now - tTest}ms total=${now - tStart}ms`
     );
 
     // Remember failures for next run's quick pass (skip on cancel: partial data).
