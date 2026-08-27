@@ -61,20 +61,55 @@ Native Test Explorer integration via the `TestController` API — no custom UI:
 
 ```
 impact build-map [--refresh]      # build or refresh the map (run overnight / in background)
-impact affected [--base <ref>] [--staged]   # print affected test classes
-impact run [--base <ref>] [--staged]        # run affected tests; exit 1 on failure
+impact affected [file ...] [--base <ref>] [--staged]   # print affected test classes
+impact run [file ...] [--base <ref>] [--staged]        # run affected tests; exit 1 on failure
 impact status
 ```
 
-Pre-commit hook (`.git/hooks/pre-commit`):
+Selection, from tightest to broadest (CLI only — the extension keeps its
+save-driven path):
+
+- `impact run src/A.cs src/B.cs` — exactly those files. lint-staged and
+  [pre-commit](https://pre-commit.com) pass staged filenames as trailing
+  arguments, so impact is a drop-in hook entry; agents pass the files they just
+  edited.
+- `impact run --staged` — the index only: the fast pre-commit mode.
+- `impact run` — everything this branch changed: commits since the merge-base
+  with the auto-detected base (the branch's upstream, else `origin/HEAD`, else
+  `origin/main`/`origin/master`) plus the dirty tree. Right for pre-push hooks,
+  CI, and verifying a commit just made.
+- `impact run --base <ref>` — same shape with an explicit base: `<ref>...HEAD`
+  plus the dirty tree.
+
+Exit codes are the contract (stdout is human-oriented and may change): `run`
+exits 0 when affected tests pass or nothing is affected, 1 on test failure or
+error, 2 on usage errors. Infrastructure never blocks a commit: with no map
+built yet, or the shadow worktree locked by another impact process, `run` and
+`affected` warn on stderr and exit 0 — build the map explicitly (overnight or
+in the background) with `impact build-map`.
+
+Pre-commit via lint-staged (`{ "*.cs": "impact run" }`), or a plain hook:
 
 ```sh
 #!/bin/sh
-node /path/to/dotnet-impact/out/cli.js run --staged || exit 1
+# .git/hooks/pre-commit
+impact run --staged || exit 1
 ```
 
-For an AI coding agent, `impact run` after each edit gives sub-minute feedback
-scoped to the blast radius of the change, instead of a full CI cycle.
+```sh
+#!/bin/sh
+# .git/hooks/pre-push
+impact run || exit 1
+```
+
+`--staged` caveat: selection comes from the index, but tests execute
+working-tree content — with partial staging (`git add -p`) the run can exercise
+unstaged edits. Agents that stage everything are unaffected.
+
+For an AI coding agent, `impact run <files>` after each edit gives sub-minute
+feedback scoped to the blast radius of the change, and `impact run` after each
+commit verifies the branch. Put those two lines in your repo's `CLAUDE.md` (or
+equivalent agent docs) so agents discover the workflow.
 
 ## Known blind spots (by design, documented not solved)
 
