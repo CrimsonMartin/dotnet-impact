@@ -4,6 +4,7 @@ import * as path from "path";
 import * as vscode from "vscode";
 import { locateClasses, locateMethod, SourceLocation, stripNesting } from "./core/locate";
 import { testProjects } from "./core/projects";
+import { KnownResult, replayEvents } from "./core/replay";
 import { AffectedSet, Runner, TestOutcome } from "./core/runner";
 import { cacheDirFor, setDotnetPath, toRepoRelative } from "./core/util";
 import { HotPatcher } from "./core/hotpatch";
@@ -247,10 +248,7 @@ const coverageDetails = new WeakMap<vscode.TestRun, Map<string, vscode.Statement
  * the suite at its previous state — the Testing view's counter then reads
  * "3/all" while running and settles back at "all/all" instead of "3/3".
  */
-const knownResults = new Map<
-  string,
-  { classFqn: string; passed: boolean; skipped: boolean; duration: number; message?: string }
->();
+const knownResults = new Map<string, KnownResult>();
 
 /** The in-flight run, so a newer save can supersede it. */
 let activeRun: { ctrl: AbortController; files: string[] | undefined } | undefined;
@@ -328,9 +326,7 @@ async function doRun(
         run.started(item);
       }
     }
-    // Subset run: hold the rest of the suite in the counter's denominator.
     const subset = affected.classes.length > 0;
-    if (subset) enqueueKnownSuite(run, new Set(affected.classes));
     const reported = new Set<string>();
     // Stream results into Test Explorer as each test invocation finishes
     // (failure-first pass lands red results in the first seconds).
@@ -408,7 +404,6 @@ async function doCoverageRun(request: vscode.TestRunRequest, signal: AbortSignal
       }
     }
     const subset = affected.classes.length > 0;
-    if (subset) enqueueKnownSuite(run, new Set(affected.classes));
     const reported = new Set<string>();
     const result = await runner!.runCoverage(affected, signal, (partial) =>
       reportOutcomes(run, partial, reported)
@@ -545,28 +540,15 @@ function reportOutcomes(run: vscode.TestRun, outcomes: TestOutcome[], reported?:
   }
 }
 
-/**
- * Suite-wide counter for subset runs. Enqueue puts every previously-run method
- * into the run's denominator up front ("3/all" while running); replay then
- * re-reports each untouched method at its last known state so the counter
- * settles at "all/all". Methods in `skip` got real results this run.
- */
-function enqueueKnownSuite(run: vscode.TestRun, runningClasses: Set<string>): void {
-  for (const [methodFqn, r] of knownResults) {
-    if (runningClasses.has(r.classFqn)) continue;
-    const item = findClassItem(r.classFqn)?.children.get(methodFqn);
-    if (item) run.enqueued(item);
-  }
-}
-
+/** Settle the counter at "all/all" after a subset run; see core/replay.ts. */
 function replayKnownSuite(run: vscode.TestRun, skip: Set<string>): void {
-  for (const [methodFqn, r] of knownResults) {
-    if (skip.has(methodFqn)) continue;
-    const item = findClassItem(r.classFqn)?.children.get(methodFqn);
+  for (const ev of replayEvents(knownResults, skip)) {
+    const cls = knownResults.get(ev.methodFqn)!.classFqn;
+    const item = findClassItem(cls)?.children.get(ev.methodFqn);
     if (!item) continue;
-    if (r.skipped) run.skipped(item);
-    else if (r.passed) run.passed(item, r.duration);
-    else run.failed(item, new vscode.TestMessage(r.message ?? "failed"), r.duration);
+    if (ev.state === "skipped") run.skipped(item);
+    else if (ev.state === "passed") run.passed(item, ev.duration);
+    else run.failed(item, new vscode.TestMessage(ev.message ?? "failed"), ev.duration);
   }
 }
 
