@@ -26,6 +26,14 @@ test("acquireShadowLock: exclusive while held, reusable after release, steals de
     const stolen = await acquireShadowLock(root, 100);
     assert.notEqual(stolen, null);
     stolen!();
+
+    // An old lock whose holder is alive is NEVER stolen: liveness beats age
+    // (a cold build-map can legitimately run past any cutoff).
+    fs.writeFileSync(lockFile, String(process.pid));
+    const old = new Date(Date.now() - 60 * 60 * 1000);
+    fs.utimesSync(lockFile, old, old);
+    assert.equal(await acquireShadowLock(root, 400), null);
+    fs.rmSync(lockFile, { force: true });
   } finally {
     fs.rmSync(cacheDirFor(root), { recursive: true, force: true });
     fs.rmSync(root, { recursive: true, force: true });

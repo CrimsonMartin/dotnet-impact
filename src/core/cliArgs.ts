@@ -9,6 +9,28 @@ export interface ParsedArgs {
 const VALUE_FLAGS = new Set(["--base", "--parallel"]);
 const BOOL_FLAGS = new Set(["--staged", "--refresh"]);
 
+const COMMAND_FLAGS: Record<string, string[]> = {
+  "build-map": ["--refresh", "--parallel"],
+  affected: ["--base", "--staged"],
+  run: ["--base", "--staged"],
+  status: [],
+};
+const FILE_COMMANDS = new Set(["affected", "run"]);
+
+/** Per-command validation: a flag the command ignores is an error, not a no-op. */
+export function validateCommandArgs(p: ParsedArgs): string[] {
+  const errors: string[] = [];
+  const allowed = p.command !== undefined ? COMMAND_FLAGS[p.command] : undefined;
+  if (!allowed) return errors; // unknown command: usage handles it
+  for (const f of p.flags.keys()) {
+    if (!allowed.includes(f)) errors.push(`${f} is not valid for ${p.command}`);
+  }
+  if (p.files.length > 0 && !FILE_COMMANDS.has(p.command!)) {
+    errors.push(`${p.command} does not take file arguments`);
+  }
+  return errors;
+}
+
 /**
  * Split argv into command, flags, and positional file paths. Value-taking
  * flags consume exactly the next token; anything else that isn't a flag is a

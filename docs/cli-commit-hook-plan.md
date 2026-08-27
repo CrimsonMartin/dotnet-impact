@@ -145,7 +145,11 @@ blocks a commit.**
   (`~/.impact/<repo>-<hash>/`; implementation uses `cacheDirFor()`, never a
   literal path): wait briefly for the holder, then bail with a
   clear "another impact instance holds the shadow — skipped" message and exit 0 in
-  the same never-block spirit.
+  the same never-block spirit. Residual risk, named: the lock is CLI-side only —
+  the extension is pinned (see the constraint above) and does not take it, so a
+  CLI invocation can still race the extension's background refresh. CLI-vs-CLI
+  (the lint-staged case) is fully covered; extension adoption of the same lock
+  file is a follow-up outside this plan.
 
 ### 4. `--staged` selects from the index but tests run against the working tree
 
