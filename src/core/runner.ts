@@ -1,6 +1,15 @@
 import * as fs from "fs";
 import * as path from "path";
-import { buildRunsettings, collectClassCoverage } from "./coverage";
+import {
+  buildRunsettings,
+  collectClassCoverage,
+  COLLECTOR_COVERLET,
+  COLLECTOR_MS,
+  findCoberturaFiles,
+  noteWorkingCollector,
+  parseCoberturaLineHits,
+  preferredCollector,
+} from "./coverage";
 import { discoverTestClasses } from "./discover";
 import {
   affectedTestProjects,
@@ -490,21 +499,10 @@ export class Runner {
     //      dirs by file copy — milliseconds instead of test-project rebuilds.
     // Any build failure falls back to the plain full `dotnet build` of the
     // involved test projects, which is always correct.
-    if (!fastPatched && !(await this.minimalBuild(allRels, signal))) {
-      for (const rel of allRels) {
-        if (signal?.aborted) break;
-        const res = await exec(
-          "dotnet",
-          ["build", this.shadowPath(path.join(this.repoRoot, rel)), "--nologo", "--verbosity", "quiet"],
-          this.shadow!.dir,
-          10 * 60 * 1000,
-          signal
-        );
-        if (res.code !== 0 && !signal?.aborted) {
-          ok = false;
-          output += res.stdout + res.stderr;
-        }
-      }
+    if (!fastPatched) {
+      const built = await this.buildProjects(allRels, signal);
+      ok = ok && built.ok;
+      output += built.output;
     }
 
     // Failure-first: split mapped classes into a quick red pass and the rest.
@@ -578,6 +576,200 @@ export class Runner {
       outcomes,
       output,
     };
+  }
+
+  /** Minimal-rebuild first; any failure falls back to plain builds of the test projects. */
+  private async buildProjects(
+    allRels: Set<string>,
+    signal?: AbortSignal
+  ): Promise<{ ok: boolean; output: string }> {
+    let ok = true;
+    let output = "";
+    if (!(await this.minimalBuild(allRels, signal))) {
+      for (const rel of allRels) {
+        if (signal?.aborted) break;
+        const res = await exec(
+          "dotnet",
+          ["build", this.shadowPath(path.join(this.repoRoot, rel)), "--nologo", "--verbosity", "quiet"],
+          this.shadow!.dir,
+          10 * 60 * 1000,
+          signal
+        );
+        if (res.code !== 0 && !signal?.aborted) {
+          ok = false;
+          output += res.stdout + res.stderr;
+        }
+      }
+    }
+    return { ok, output };
+  }
+
+  /**
+   * Explicit "run with coverage": the selected classes/projects run under a
+   * coverage collector (same MS-collector-with-Coverlet-fallback as map
+   * refresh) and per-line hit counts come back for the editor's native
+   * coverage view. Deliberately bypasses hot-patch and warm sessions —
+   * instrumentation needs a real collector-owned testhost — but keeps the
+   * minimal-rebuild path, so an unchanged tree skips straight to the run.
+   */
+  async runCoverage(
+    affected: AffectedSet,
+    signal?: AbortSignal,
+    onPartial?: (outcomes: TestOutcome[]) => void
+  ): Promise<RunResult & { coverage: Map<string, Map<number, number>> }> {
+    if (!this.shadow) await this.prepare();
+    const outcomes: TestOutcome[] = [];
+    let output = "";
+
+    const byProject = new Map<string, string[]>();
+    for (const cls of affected.classes) {
+      const csproj = this.map.entry(cls)?.csproj ?? affected.classOwners?.[cls];
+      if (!csproj) continue;
+      if (!byProject.has(csproj)) byProject.set(csproj, []);
+      byProject.get(csproj)!.push(cls);
+    }
+    const fallbackRel = affected.fallbackProjects.map((p) => toRepoRelative(this.repoRoot, p.csproj));
+    const allRels = new Set([...byProject.keys(), ...fallbackRel]);
+
+    if (process.platform === "win32" && this.sessions?.available) {
+      for (const rel of allRels) {
+        const dll = this.findTestDll(rel);
+        if (dll) await this.sessions.release(dll);
+      }
+    }
+
+    const built = await this.buildProjects(allRels, signal);
+    let ok = built.ok;
+    output += built.output;
+
+    const coverage = new Map<string, Map<number, number>>();
+    const mergeHits = (report: Map<string, Map<number, number>>) => {
+      // Across projects the same line's executions are genuinely additive.
+      for (const [file, lines] of report) {
+        let byLine = coverage.get(file);
+        if (!byLine) coverage.set(file, (byLine = new Map()));
+        for (const [line, hits] of lines) byLine.set(line, (byLine.get(line) ?? 0) + hits);
+      }
+    };
+
+    const invocations = [
+      ...[...byProject.entries()].map(([rel, classes]) => ({
+        rel,
+        filter: classFilter(classes) as string | undefined,
+      })),
+      ...fallbackRel.map((rel) => ({ rel, filter: undefined as string | undefined })),
+    ];
+    let next = 0;
+    await Promise.all(
+      Array.from({ length: Math.min(4, invocations.length) }, async () => {
+        for (;;) {
+          if (signal?.aborted) return;
+          const i = next++;
+          if (i >= invocations.length) return;
+          const inv = invocations[i];
+          const res = await this.dotnetTestCoverage(inv.rel, inv.filter, signal);
+          ok = ok && (res.ok || signal?.aborted === true);
+          output += res.output;
+          outcomes.push(...res.outcomes);
+          mergeHits(res.coverage);
+          if (res.outcomes.length > 0) onPartial?.(res.outcomes);
+        }
+      })
+    );
+
+    if (!signal?.aborted) {
+      for (const o of outcomes) {
+        if (o.skipped) continue;
+        if (o.passed) this.lastFailures.delete(o.classFqn);
+        else this.lastFailures.add(o.classFqn);
+      }
+      this.saveLastFailures();
+    }
+
+    return {
+      ok,
+      cancelled: signal?.aborted === true,
+      ranClasses: affected.classes,
+      fallbackProjects: affected.fallbackProjects.map((p) => p.name),
+      outcomes,
+      output,
+      coverage,
+    };
+  }
+
+  private async dotnetTestCoverage(
+    rel: string,
+    filter: string | undefined,
+    signal?: AbortSignal
+  ): Promise<{
+    ok: boolean;
+    outcomes: TestOutcome[];
+    output: string;
+    coverage: Map<string, Map<number, number>>;
+  }> {
+    const csprojAbs = this.shadowPath(path.join(this.repoRoot, rel));
+    const resultsDir = path.join(path.dirname(csprojAbs), ".impact-cov");
+
+    const run = (collector: string) => {
+      fs.rmSync(resultsDir, { recursive: true, force: true });
+      fs.mkdirSync(resultsDir, { recursive: true });
+      return exec(
+        "dotnet",
+        [
+          "test",
+          csprojAbs,
+          ...(filter ? ["--filter", filter] : []),
+          "--collect",
+          collector,
+          ...(this.settingsFile ? ["--settings", this.settingsFile] : []),
+          "--no-build",
+          "--no-restore",
+          "--nologo",
+          "--verbosity",
+          "quiet",
+          "--logger",
+          "trx",
+          "--results-directory",
+          resultsDir,
+        ],
+        this.shadow!.dir,
+        10 * 60 * 1000,
+        signal
+      );
+    };
+
+    const first = preferredCollector();
+    let res = await run(first);
+    let reports = findCoberturaFiles(resultsDir);
+    if (reports.length === 0 && first === COLLECTOR_MS && !signal?.aborted) {
+      res = await run(COLLECTOR_COVERLET);
+      reports = findCoberturaFiles(resultsDir);
+      if (reports.length > 0) noteWorkingCollector(COLLECTOR_COVERLET);
+    } else if (reports.length > 0) {
+      noteWorkingCollector(first);
+    }
+
+    const coverage = new Map<string, Map<number, number>>();
+    for (const report of reports) {
+      // Same-file overlap across a project's reports (multi-TFM) is the same
+      // code measured twice: max, not sum.
+      for (const [file, lines] of parseCoberturaLineHits(report, this.shadow!.dir)) {
+        let byLine = coverage.get(file);
+        if (!byLine) coverage.set(file, (byLine = new Map()));
+        for (const [line, hits] of lines) byLine.set(line, Math.max(byLine.get(line) ?? 0, hits));
+      }
+    }
+
+    const outcomes: TestOutcome[] = [];
+    try {
+      for (const f of fs.readdirSync(resultsDir).filter((f) => f.endsWith(".trx"))) {
+        outcomes.push(...parseTrx(path.join(resultsDir, f)));
+      }
+    } catch {
+      /* no trx produced (build failure) */
+    }
+    fs.rmSync(resultsDir, { recursive: true, force: true });
+    return { ok: res.code === 0, outcomes, output: res.stdout + res.stderr, coverage };
   }
 
   private async dotnetTest(

@@ -82,6 +82,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
   profile.supportsContinuousRun = true;
 
+  // Explicit "run with coverage" (the button Dev Kit users lose): collector
+  // run feeding VS Code's native coverage view. Never the default profile —
+  // coverage is an ask, not the save loop.
+  const coverageProfile = controller.createRunProfile(
+    "Coverage",
+    vscode.TestRunProfileKind.Coverage,
+    (request, token) => coverageRunHandler(request, token),
+    false
+  );
+  coverageProfile.loadDetailedCoverage = async (run, fileCoverage) =>
+    coverageDetails.get(run)?.get(fileCoverage.uri.toString()) ?? [];
+
   context.subscriptions.push(
     vscode.commands.registerCommand("dotnetImpact.buildMap", () => buildMapWithProgress()),
     vscode.commands.registerCommand("dotnetImpact.runAffected", () => runAffectedNow()),
@@ -227,6 +239,19 @@ async function runHandler(
   await executeRun(request, undefined);
 }
 
+/** Per-run line coverage details, served lazily via loadDetailedCoverage. */
+const coverageDetails = new WeakMap<vscode.TestRun, Map<string, vscode.StatementCoverage[]>>();
+
+/**
+ * Last known result per method item, so a subset run can report the rest of
+ * the suite at its previous state — the Testing view's counter then reads
+ * "3/all" while running and settles back at "all/all" instead of "3/3".
+ */
+const knownResults = new Map<
+  string,
+  { classFqn: string; passed: boolean; skipped: boolean; duration: number; message?: string }
+>();
+
 /** The in-flight run, so a newer save can supersede it. */
 let activeRun: { ctrl: AbortController; files: string[] | undefined } | undefined;
 /** Serializes shadow access: runs execute one at a time, in order. */
@@ -303,14 +328,20 @@ async function doRun(
         run.started(item);
       }
     }
+    // Subset run: hold the rest of the suite in the counter's denominator.
+    const subset = affected.classes.length > 0;
+    if (subset) enqueueKnownSuite(run, new Set(affected.classes));
+    const reported = new Set<string>();
     // Stream results into Test Explorer as each test invocation finishes
     // (failure-first pass lands red results in the first seconds).
     const result = await runner!.runAffected(affected, signal, (partial) =>
-      reportOutcomes(run, partial)
+      reportOutcomes(run, partial, reported)
     );
     if (result.cancelled) {
       updateStatus("superseded");
     } else {
+      // Settle the counter at all/all: everything not run reports its last state.
+      if (subset) replayKnownSuite(run, reported);
       updateStatus(
         result.ok
           ? `✓ ${result.outcomes.length} tests (${affected.classes.length} classes)`
@@ -322,6 +353,87 @@ async function doRun(
         runner!.queueRefreshFromOutcomes(result.outcomes, Object.fromEntries(classOwners));
         void kickRefresh();
       }
+    }
+    output.appendLine(result.output);
+  } catch (e) {
+    updateStatus("error");
+    output.appendLine(String(e));
+  } finally {
+    run.end();
+  }
+}
+
+/** Coverage profile entry: serialized on the same run chain as normal runs. */
+async function coverageRunHandler(
+  request: vscode.TestRunRequest,
+  token: vscode.CancellationToken
+): Promise<void> {
+  if (!runner || !controller) return;
+  refreshAbort?.abort();
+  activeRun?.ctrl.abort();
+  const ctrl = new AbortController();
+  token.onCancellationRequested(() => ctrl.abort());
+  const mine = { ctrl, files: undefined as string[] | undefined };
+  activeRun = mine;
+  const prev = runChain;
+  runChain = (async () => {
+    await prev.catch(() => undefined);
+    if (ctrl.signal.aborted) return;
+    await doCoverageRun(request, ctrl.signal);
+  })();
+  await runChain;
+  if (activeRun === mine) activeRun = undefined;
+}
+
+async function doCoverageRun(request: vscode.TestRunRequest, signal: AbortSignal): Promise<void> {
+  const run = controller!.createTestRun(request);
+  updateStatus("coverage run…", true);
+  try {
+    await runner!.prepare();
+    const affected: AffectedSet =
+      request.include && request.include.length > 0
+        ? affectedFromSelection(request.include)
+        : { classes: [], fallbackProjects: testProjects(runner!.projectGraph()), changedFiles: [] };
+    affected.classOwners = Object.fromEntries(classOwners);
+    if (affected.classes.length === 0 && affected.fallbackProjects.length === 0) {
+      run.appendOutput("no tests selected\r\n");
+      return;
+    }
+
+    for (const cls of affected.classes) {
+      const item = findClassItem(cls);
+      if (item) {
+        run.enqueued(item);
+        run.started(item);
+      }
+    }
+    const subset = affected.classes.length > 0;
+    if (subset) enqueueKnownSuite(run, new Set(affected.classes));
+    const reported = new Set<string>();
+    const result = await runner!.runCoverage(affected, signal, (partial) =>
+      reportOutcomes(run, partial, reported)
+    );
+
+    if (result.cancelled) {
+      updateStatus("superseded");
+    } else {
+      const details = new Map<string, vscode.StatementCoverage[]>();
+      for (const [file, lines] of result.coverage) {
+        if (path.isAbsolute(file)) continue; // generated/SDK sources outside the repo
+        const uri = vscode.Uri.file(path.join(runner!.repoRoot, file));
+        const statements = [...lines.entries()]
+          .sort((a, b) => a[0] - b[0])
+          .map(([line, hits]) => new vscode.StatementCoverage(hits, new vscode.Position(line - 1, 0)));
+        details.set(uri.toString(), statements);
+        run.addCoverage(vscode.FileCoverage.fromDetails(uri, statements));
+      }
+      coverageDetails.set(run, details);
+      if (subset) replayKnownSuite(run, reported);
+      updateStatus(
+        result.ok
+          ? `✓ ${result.outcomes.length} tests, coverage on ${details.size} files`
+          : `✗ ${result.outcomes.filter((o) => !o.passed && !o.skipped).length} failing`
+      );
     }
     output.appendLine(result.output);
   } catch (e) {
@@ -381,7 +493,7 @@ function findClassItem(cls: string): vscode.TestItem | undefined {
   return found;
 }
 
-function reportOutcomes(run: vscode.TestRun, outcomes: TestOutcome[]): void {
+function reportOutcomes(run: vscode.TestRun, outcomes: TestOutcome[], reported?: Set<string>): void {
   // Group theory cases: "Ns.Class.Method(args)" collapses to one method item.
   const byMethod = new Map<string, TestOutcome[]>();
   for (const o of outcomes) {
@@ -399,14 +511,24 @@ function reportOutcomes(run: vscode.TestRun, outcomes: TestOutcome[]): void {
     const methodItem = ensureMethodItem(classItem, cls, methodFqn);
     const failed = results.filter((r) => !r.passed && !r.skipped);
     const duration = results.reduce((s, r) => s + (r.durationMs ?? 0), 0);
-    if (results.every((r) => r.skipped)) {
+    const allSkipped = results.every((r) => r.skipped);
+    let message: string | undefined;
+    if (allSkipped) {
       run.skipped(methodItem);
     } else if (failed.length === 0) {
       run.passed(methodItem, duration);
     } else {
-      const msg = failed.map((f) => `${f.method}: ${f.message ?? "failed"}`).join("\n");
-      run.failed(methodItem, new vscode.TestMessage(msg), duration);
+      message = failed.map((f) => `${f.method}: ${f.message ?? "failed"}`).join("\n");
+      run.failed(methodItem, new vscode.TestMessage(message), duration);
     }
+    reported?.add(methodFqn);
+    knownResults.set(methodFqn, {
+      classFqn: cls,
+      passed: !allSkipped && failed.length === 0,
+      skipped: allSkipped,
+      duration,
+      message,
+    });
 
     const agg = classResults.get(cls) ?? { passed: true, duration: 0 };
     agg.passed = agg.passed && failed.length === 0;
@@ -420,6 +542,31 @@ function reportOutcomes(run: vscode.TestRun, outcomes: TestOutcome[]): void {
     const item = findClassItem(cls);
     if (!item) continue;
     if (agg.passed) run.passed(item, agg.duration);
+  }
+}
+
+/**
+ * Suite-wide counter for subset runs. Enqueue puts every previously-run method
+ * into the run's denominator up front ("3/all" while running); replay then
+ * re-reports each untouched method at its last known state so the counter
+ * settles at "all/all". Methods in `skip` got real results this run.
+ */
+function enqueueKnownSuite(run: vscode.TestRun, runningClasses: Set<string>): void {
+  for (const [methodFqn, r] of knownResults) {
+    if (runningClasses.has(r.classFqn)) continue;
+    const item = findClassItem(r.classFqn)?.children.get(methodFqn);
+    if (item) run.enqueued(item);
+  }
+}
+
+function replayKnownSuite(run: vscode.TestRun, skip: Set<string>): void {
+  for (const [methodFqn, r] of knownResults) {
+    if (skip.has(methodFqn)) continue;
+    const item = findClassItem(r.classFqn)?.children.get(methodFqn);
+    if (!item) continue;
+    if (r.skipped) run.skipped(item);
+    else if (r.passed) run.passed(item, r.duration);
+    else run.failed(item, new vscode.TestMessage(r.message ?? "failed"), r.duration);
   }
 }
 

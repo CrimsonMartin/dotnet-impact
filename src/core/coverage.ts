@@ -17,10 +17,20 @@ export interface ClassCoverageResult {
  * per-sequence-point probes. Fallback: coverlet.collector, for test projects
  * where the MS collector is unavailable.
  */
-const COLLECTOR_MS = "Code Coverage;Format=cobertura";
-const COLLECTOR_COVERLET = "XPlat Code Coverage";
+export const COLLECTOR_MS = "Code Coverage;Format=cobertura";
+export const COLLECTOR_COVERLET = "XPlat Code Coverage";
 /** Collector that worked for this session; resolved on first successful run. */
 let resolvedCollector: string | null = null;
+
+/** Collector to try first: whichever worked before, else the MS collector. */
+export function preferredCollector(): string {
+  return resolvedCollector ?? COLLECTOR_MS;
+}
+
+/** Record which collector produced a report, so later runs skip the probe. */
+export function noteWorkingCollector(collector: string): void {
+  if (resolvedCollector === null) resolvedCollector = collector;
+}
 
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -111,16 +121,17 @@ export async function collectClassCoverage(
     );
   };
 
-  let res = await run(resolvedCollector ?? COLLECTOR_MS);
+  const first = preferredCollector();
+  let res = await run(first);
   let reports = findCoberturaFiles(resultsDir);
   // No report and no explicit choice yet: the MS collector may be missing from
   // this project (old test SDK); try Coverlet once and stick with what works.
-  if (reports.length === 0 && resolvedCollector === null && !signal?.aborted) {
+  if (reports.length === 0 && first === COLLECTOR_MS && !signal?.aborted) {
     res = await run(COLLECTOR_COVERLET);
     reports = findCoberturaFiles(resultsDir);
-    if (reports.length > 0) resolvedCollector = COLLECTOR_COVERLET;
-  } else if (reports.length > 0 && resolvedCollector === null) {
-    resolvedCollector = COLLECTOR_MS;
+    if (reports.length > 0) noteWorkingCollector(COLLECTOR_COVERLET);
+  } else if (reports.length > 0) {
+    noteWorkingCollector(first);
   }
 
   const files = new Set<string>();
@@ -137,7 +148,7 @@ export async function collectClassCoverage(
   };
 }
 
-function findCoberturaFiles(dir: string): string[] {
+export function findCoberturaFiles(dir: string): string[] {
   const out: string[] = [];
   const walk = (d: string) => {
     let entries: fs.Dirent[];
@@ -189,6 +200,49 @@ export function parseCoberturaHitFiles(coberturaPath: string, shadowDir: string)
     }
   }
   return [...files];
+}
+
+/**
+ * Extract per-line hit counts from a Cobertura report, keyed by
+ * shadow-root-relative forward-slash path (absolute for files outside the
+ * shadow, e.g. generated/SDK sources — callers skip those). A file's lines can
+ * be split across several <class> elements (partials, nested types); the same
+ * line reported twice is the same execution counted per class, so overlaps
+ * take the max, not the sum.
+ */
+export function parseCoberturaLineHits(
+  coberturaPath: string,
+  shadowDir: string
+): Map<string, Map<number, number>> {
+  const xml = fs.readFileSync(coberturaPath, "utf8");
+  const parser = new XMLParser({
+    ignoreAttributes: false,
+    attributeNamePrefix: "@_",
+    processEntities: false,
+    isArray: (name) => ["source", "package", "class", "line"].includes(name),
+  });
+  const doc = parser.parse(xml);
+  const coverage = doc?.coverage;
+  const out = new Map<string, Map<number, number>>();
+  if (!coverage) return out;
+
+  const sources: string[] = (coverage.sources?.source ?? []).map((s: unknown) => String(s));
+  for (const pkg of coverage.packages?.package ?? []) {
+    for (const cls of pkg?.classes?.class ?? []) {
+      const filename: string = cls["@_filename"] ?? "";
+      if (!filename) continue;
+      const file = resolveSourceFile(filename, sources, shadowDir);
+      let byLine = out.get(file);
+      if (!byLine) out.set(file, (byLine = new Map()));
+      for (const l of cls?.lines?.line ?? []) {
+        const line = Number(l["@_number"] ?? 0);
+        if (line <= 0) continue;
+        const hits = Number(l["@_hits"] ?? 0);
+        byLine.set(line, Math.max(byLine.get(line) ?? 0, hits));
+      }
+    }
+  }
+  return out;
 }
 
 function resolveSourceFile(filename: string, sources: string[], shadowDir: string): string {

@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
-import { buildRunsettings, parseCoberturaHitFiles } from "../core/coverage";
+import { buildRunsettings, parseCoberturaHitFiles, parseCoberturaLineHits } from "../core/coverage";
 
 test("buildRunsettings: first-party module filters for both collectors", () => {
   const xml = buildRunsettings(["Lib", "Lib.Tests"]);
@@ -48,4 +48,28 @@ test("parseCoberturaHitFiles: files outside the shadow keep absolute paths", () 
   const files = parseCoberturaHitFiles(p, shadow);
   assert.equal(files.length, 1);
   assert.ok(path.isAbsolute(files[0]));
+});
+
+test("parseCoberturaLineHits: per-line hits, overlapping class entries take max", () => {
+  const shadow = fs.mkdtempSync(path.join(os.tmpdir(), "impact-lines-test-"));
+  fs.mkdirSync(path.join(shadow, "src"), { recursive: true });
+  fs.writeFileSync(path.join(shadow, "src", "Calc.cs"), "");
+
+  const xml = `<?xml version="1.0"?>
+<coverage>
+  <sources><source>${shadow}</source></sources>
+  <packages><package><classes>
+    <class filename="src/Calc.cs"><lines><line number="3" hits="5"/><line number="4" hits="0"/></lines></class>
+    <class filename="src/Calc.cs"><lines><line number="3" hits="2"/><line number="9" hits="1"/></lines></class>
+  </classes></package></packages>
+</coverage>`;
+  const p = path.join(shadow, "report.cobertura.xml");
+  fs.writeFileSync(p, xml);
+
+  const hits = parseCoberturaLineHits(p, shadow);
+  const calc = hits.get("src/Calc.cs")!;
+  assert.equal(calc.get(3), 5); // max across overlapping <class> entries, not sum
+  assert.equal(calc.get(4), 0); // uncovered lines kept (zero hits)
+  assert.equal(calc.get(9), 1);
+  assert.equal(hits.size, 1);
 });
