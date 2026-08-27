@@ -69,6 +69,19 @@ while ((line = Console.ReadLine()) != null)
                 Emit(new { id, type = "done", ok = true, calls, warnings });
                 break;
             }
+            case "classify":
+            {
+                // Pure classification of an edit (old source -> new source):
+                // the unit-test surface for the delta calculator.
+                var oldText = root.GetProperty("old").GetString()!;
+                var newText = root.GetProperty("new").GetString()!;
+                var (changed, reason) = DeltaClassifier.Classify(
+                    CSharpSyntaxTree.ParseText(oldText),
+                    CSharpSyntaxTree.ParseText(newText));
+                if (reason != null) Emit(new { id, type = "done", ok = false, reason });
+                else Emit(new { id, type = "done", ok = true, changed });
+                break;
+            }
             case "load":
             {
                 var binlog = root.GetProperty("binlog").GetString()!;
@@ -178,23 +191,19 @@ sealed class ProjectState
         var newComp = _compilation.ReplaceSyntaxTree(oldTree, newTree);
 
         // Classify: identical member skeletons, only method/ctor bodies changed.
-        var oldMembers = MemberIndex(oldTree);
-        var newMembers = MemberIndex(newTree);
-        if (oldMembers.Count != newMembers.Count)
-            return (null, null, null,
-                $"structural: member count changed ({oldMembers.Count} -> {newMembers.Count}, tree={oldTree.FilePath})");
+        var (changedKeys, reason) = DeltaClassifier.Classify(oldTree, newTree);
+        if (reason != null)
+            return (null, null, null, $"{reason} (tree={oldTree.FilePath})");
+        var oldMembers = DeltaClassifier.MemberIndex(oldTree);
+        var newMembers = DeltaClassifier.MemberIndex(newTree);
 
         var oldModel = _compilation.GetSemanticModel(oldTree);
         var newModel = newComp.GetSemanticModel(newTree);
         var edits = new List<SemanticEdit>();
-        foreach (var (key, oldNode) in oldMembers)
+        foreach (var key in changedKeys)
         {
-            if (!newMembers.TryGetValue(key, out var newNode)) return (null, null, null, $"structural: {key}");
-            if (oldNode.ToFullString() == newNode.ToFullString()) continue;
-            if (oldNode is not BaseMethodDeclarationSyntax)
-                return (null, null, null, $"structural: non-method change at {key}");
-            var oldSym = oldModel.GetDeclaredSymbol(oldNode);
-            var newSym = newModel.GetDeclaredSymbol(newNode);
+            var oldSym = oldModel.GetDeclaredSymbol(oldMembers[key]);
+            var newSym = newModel.GetDeclaredSymbol(newMembers[key]);
             if (oldSym == null || newSym == null) return (null, null, null, $"structural: unresolved {key}");
             edits.Add(new SemanticEdit(SemanticEditKind.Update, oldSym, newSym));
         }
@@ -218,8 +227,43 @@ sealed class ProjectState
         return (md.ToArray(), il.ToArray(), pdb.ToArray(), null);
     }
 
+}
+
+/**
+ * The pure classification half of the delta calculator: given the old and new
+ * syntax trees of one file, decide whether the change is hot-patchable
+ * (method/ctor bodies only) and which members need semantic edits. No
+ * compilation or baseline involved — unit-tested through the "classify"
+ * protocol command.
+ */
+internal static class DeltaClassifier
+{
+    public static (List<string> Changed, string? Reason) Classify(SyntaxTree oldTree, SyntaxTree newTree)
+    {
+        var oldMembers = MemberIndex(oldTree);
+        var newMembers = MemberIndex(newTree);
+        if (oldMembers.Count != newMembers.Count)
+            return (new List<string>(),
+                $"structural: member count changed ({oldMembers.Count} -> {newMembers.Count})");
+
+        var changed = new List<string>();
+        foreach (var (key, oldNode) in oldMembers)
+        {
+            if (!newMembers.TryGetValue(key, out var newNode))
+                return (new List<string>(), $"structural: {key}");
+            // Roslyn's trivia-insensitive equivalence, NOT text comparison:
+            // ToFullString() includes surrounding trivia, so a blank line
+            // added above a property read as a structural change.
+            if (oldNode.IsEquivalentTo(newNode, topLevel: false)) continue;
+            if (oldNode is not BaseMethodDeclarationSyntax)
+                return (new List<string>(), $"structural: non-method change at {key}");
+            changed.Add(key);
+        }
+        return (changed, null);
+    }
+
     /** Member skeleton index: signature key -> declaration node. */
-    private static Dictionary<string, MemberDeclarationSyntax> MemberIndex(SyntaxTree tree)
+    public static Dictionary<string, MemberDeclarationSyntax> MemberIndex(SyntaxTree tree)
     {
         var index = new Dictionary<string, MemberDeclarationSyntax>();
         foreach (var node in tree.GetRoot().DescendantNodes().OfType<MemberDeclarationSyntax>())
@@ -241,6 +285,8 @@ sealed class ProjectState
         return index;
     }
 
-    /** Identity for non-method members (fields, props): full text — any change is structural. */
-    private static string Snippet(MemberDeclarationSyntax node) => node.ToFullString().Trim();
+    /** Identity for non-method members (fields, props): token text only —
+     * trivia must not participate, or spacing inside the member changes it. */
+    private static string Snippet(MemberDeclarationSyntax node) =>
+        string.Join(" ", node.DescendantTokens().Select(t => t.Text));
 }
