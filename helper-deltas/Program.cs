@@ -57,8 +57,16 @@ while ((line = Console.ReadLine()) != null)
                 // corrupt the baseline the way raw binlogs (path-only) would.
                 var binlog = root.GetProperty("binlog").GetString()!;
                 var complog = root.GetProperty("complog").GetString()!;
-                var diagnostics = CompilerLogUtil.ConvertBinaryLog(binlog, complog);
-                Emit(new { id, type = "done", ok = true, warnings = diagnostics.Count });
+                // An up-to-date build skips the compiler entirely; its binlog
+                // holds zero calls and converting it would replace a good
+                // baseline with an empty one. Count first, convert only if real.
+                int calls;
+                using (var callReader = CompilerCallReaderUtil.Create(binlog, BasicAnalyzerKind.OnDisk))
+                    calls = callReader.ReadAllCompilerCalls().Count;
+                var warnings = 0;
+                if (calls > 0)
+                    warnings = CompilerLogUtil.ConvertBinaryLog(binlog, complog).Count;
+                Emit(new { id, type = "done", ok = true, calls, warnings });
                 break;
             }
             case "load":

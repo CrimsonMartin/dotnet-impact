@@ -370,6 +370,7 @@ export class Runner {
     } catch {
       /* fresh */
     }
+    const built: Array<{ info: ProjectInfo; relKey: string; binlog: string }> = [];
     for (const info of order) {
       if (signal?.aborted) return false;
       const relKey = toRepoRelative(this.repoRoot, info.csproj);
@@ -396,24 +397,40 @@ export class Runner {
         return false;
       }
       stamps[relKey] = newStamps[relKey];
-      // Baseline material must embed sources (a raw binlog reads files from
-      // disk at load time — by then they hold the NEXT edit). Snapshot now,
-      // while the shadow still matches this build.
-      if (this.hotpatch) {
-        const complog = binlog.replace(/\.binlog$/, ".complog");
-        if (await this.hotpatch.snapshot(binlog, complog)) {
-          binlogs[relKey] = complog;
+      built.push({ info, relKey, binlog });
+    }
+
+    // Baseline material must embed sources (a raw binlog reads files from
+    // disk at load time — by then they hold the NEXT edit). Snapshot now,
+    // while the shadow still matches this build. A zero-call binlog means the
+    // build was an up-to-date no-op (e.g. an mtime-only touch): the compiler
+    // never ran, the dll is unchanged, and the previous baseline stays valid —
+    // replacing it with an empty complog would poison the fast path.
+    if (this.hotpatch) {
+      const fresh: Array<{ info: ProjectInfo; complog: string }> = [];
+      for (const b of built) {
+        const complog = b.binlog.replace(/\.binlog$/, ".complog");
+        const calls = await this.hotpatch.snapshot(b.binlog, complog);
+        if (calls === null) delete binlogs[b.relKey];
+        else if (calls > 0) {
+          binlogs[b.relKey] = complog;
+          fresh.push({ info: b.info, complog });
+        }
+        // calls === 0: keep the previous baseline untouched.
+      }
+      // Real recompiles invalidate loaded baselines and generation chains;
+      // reset BEFORE preloading so the fresh baselines survive it. No-op
+      // builds reset nothing — warm baselines stay warm.
+      if (fresh.length > 0) {
+        this.hotpatch.reset();
+        for (const f of fresh) {
           // Warm the baseline now so the first fast save is milliseconds.
-          const dll = findBuiltDll(this.shadow!.dir, info, this.repoRoot);
-          if (dll) this.hotpatch.preload(info.csproj, complog, this.shadowPath(info.csproj), dll);
-        } else {
-          delete binlogs[relKey];
+          const dll = findBuiltDll(this.shadow!.dir, f.info, this.repoRoot);
+          if (dll) this.hotpatch.preload(f.info.csproj, f.complog, this.shadowPath(f.info.csproj), dll);
         }
       }
     }
     fs.writeFileSync(binlogsPath, JSON.stringify(binlogs));
-    // Real builds invalidate every hot-patch baseline and generation chain.
-    this.hotpatch?.reset();
 
     // Fan changed dependency outputs into each test project's output dir.
     for (const rel of testRels) {
@@ -464,19 +481,14 @@ export class Runner {
     }
     const fallbackRel = affected.fallbackProjects.map((p) => toRepoRelative(this.repoRoot, p.csproj));
 
-    // Windows keeps loaded assemblies locked: stop warm sessions before builds
-    // can overwrite their dlls. (Elsewhere the helper's mtime check handles it.)
     const allRels = new Set([...byProject.keys(), ...fallbackRel]);
-    if (process.platform === "win32" && this.sessions?.available) {
-      for (const rel of allRels) {
-        const dll = this.findTestDll(rel);
-        if (dll) await this.sessions.release(dll);
-      }
-    }
+    const tStart = Date.now();
 
     // Fast path first: method-body-only edits become EnC deltas patched into
     // the live warm testhosts — no build, no restart, milliseconds. Any miss
-    // (structural edit, cold host, missing binlog) falls through silently.
+    // (structural edit, cold host, missing binlog) falls through, logging why.
+    // This must run BEFORE the Windows session release below: releasing kills
+    // the warm hosts the fast path patches into.
     let fastPatched = false;
     if (this.sessions?.available && this.hotpatch && affected.changedFiles.length > 0) {
       this.hotpatch.shadowDir = this.shadow!.dir;
@@ -501,11 +513,24 @@ export class Runner {
     //      dirs by file copy — milliseconds instead of test-project rebuilds.
     // Any build failure falls back to the plain full `dotnet build` of the
     // involved test projects, which is always correct.
+    let buildMs = 0;
     if (!fastPatched) {
+      // Windows keeps loaded assemblies locked: stop warm sessions before
+      // builds can overwrite their dlls. (Elsewhere the helper's mtime check
+      // handles it.)
+      if (process.platform === "win32" && this.sessions?.available) {
+        for (const rel of allRels) {
+          const dll = this.findTestDll(rel);
+          if (dll) await this.sessions.release(dll);
+        }
+      }
+      const tBuild = Date.now();
       const built = await this.buildProjects(allRels, signal);
+      buildMs = Date.now() - tBuild;
       ok = ok && built.ok;
       output += built.output;
     }
+    const tTest = Date.now();
 
     // Failure-first: split mapped classes into a quick red pass and the rest.
     const failedNow = affected.classes.filter((c) => this.lastFailures.has(c));
@@ -560,6 +585,11 @@ export class Runner {
       );
     }
 
+    const now = Date.now();
+    this.logSink(
+      `timing: fastpath=${fastPatched ? "hit" : "miss"} build=${buildMs}ms tests=${now - tTest}ms total=${now - tStart}ms`
+    );
+
     // Remember failures for next run's quick pass (skip on cancel: partial data).
     if (!signal?.aborted) {
       for (const o of outcomes) {
@@ -600,6 +630,16 @@ export class Runner {
         if (res.code !== 0 && !signal?.aborted) {
           ok = false;
           output += res.stdout + res.stderr;
+        }
+      }
+      // Full builds rewrite dlls with no binlog: every hot-patch baseline is
+      // now stale, and a delta emitted against one would corrupt fresh hosts.
+      if (this.hotpatch) {
+        this.hotpatch.reset();
+        try {
+          fs.rmSync(path.join(cacheDirFor(this.repoRoot), "binlogs.json"), { force: true });
+        } catch {
+          /* ignore */
         }
       }
     }

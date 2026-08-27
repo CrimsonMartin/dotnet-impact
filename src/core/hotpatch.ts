@@ -26,6 +26,10 @@ export class HotPatcher {
   private buffer = "";
   private readonly pending = new Map<number, (msg: DeltaReply) => void>();
   private readonly loaded = new Set<string>(); // csproj abs paths loaded this epoch
+  /** Delta generations pushed since the last real build (epoch). */
+  private gen = 0;
+  /** Last generation each live testhost accepted, keyed by pid file. */
+  private readonly hostGen = new Map<string, number>();
   private onReady: () => void = () => undefined;
 
   constructor(
@@ -61,18 +65,25 @@ export class HotPatcher {
   /** Drop all delta state; call after any real build (baselines went stale). */
   reset(): void {
     this.loaded.clear();
+    this.gen = 0;
+    this.hostGen.clear();
     if (this.proc && this.ready) this.send({ id: this.nextId++, cmd: "reset" });
   }
 
   /**
    * Freeze a just-written binlog into a source-embedding complog. Must run
    * before the next edit lands in the shadow, so callers await it.
+   * Returns the number of compiler calls captured (0 = up-to-date no-op
+   * build, complog untouched), or null on failure.
    */
-  async snapshot(binlog: string, complog: string): Promise<boolean> {
-    if (!(await this.ensureStarted())) return false;
+  async snapshot(binlog: string, complog: string): Promise<number | null> {
+    if (!(await this.ensureStarted())) return null;
     const r = await this.request({ cmd: "snapshot", binlog, complog });
-    if (!r.ok) this.log(`hotpatch: snapshot failed: ${r.reason}`);
-    return r.ok;
+    if (!r.ok) {
+      this.log(`hotpatch: snapshot failed: ${r.reason}`);
+      return null;
+    }
+    return r.calls ?? 0;
   }
 
   /**
@@ -93,17 +104,37 @@ export class HotPatcher {
    */
   async tryFastPath(changedRel: string[], graph: ProjectGraph, binlogs: Record<string, string>): Promise<boolean> {
     if (this.broken || changedRel.length === 0) return false;
-    if (!changedRel.every((f) => f.endsWith(".cs"))) return false;
+    if (!changedRel.every((f) => f.endsWith(".cs"))) {
+      this.log("hotpatch: non-.cs change — using build path");
+      return false;
+    }
     const hosts = this.liveHosts();
-    if (hosts.length === 0) return false; // nothing warm to patch: normal path
+    if (hosts.length === 0) {
+      this.log("hotpatch: no warm testhosts — using build path");
+      return false;
+    }
+    // Coherence gate: a host that (re)started mid-epoch loaded the stale disk
+    // dll and never saw the earlier deltas — patching only the newest delta
+    // into it would run wrong code. Rebuild instead (which resets the epoch).
+    if (this.gen > 0 && hosts.some((h) => (this.hostGen.get(h.pidFile) ?? 0) < this.gen)) {
+      this.log("hotpatch: a testhost restarted mid-epoch and missed earlier deltas — using build path");
+      this.reset();
+      return false;
+    }
 
     const jobs: Array<{ csprojAbs: string; fileAbs: string }> = [];
     for (const rel of changedRel) {
       const abs = path.join(this.repoRoot, rel);
       const owner = projectForFile(graph, abs);
-      if (!owner) return false;
+      if (!owner) {
+        this.log(`hotpatch: no owning project for ${rel} — using build path`);
+        return false;
+      }
       const binlog = binlogs[toRepoRelative(this.repoRoot, owner.csproj)];
-      if (!binlog || !fs.existsSync(binlog)) return false; // no baseline material yet
+      if (!binlog || !fs.existsSync(binlog)) {
+        this.log(`hotpatch: no baseline yet for ${owner.name} — using build path`);
+        return false;
+      }
       jobs.push({ csprojAbs: owner.csproj, fileAbs: abs });
     }
     if (!(await this.ensureStarted())) return false;
@@ -185,6 +216,12 @@ export class HotPatcher {
       this.log("hotpatch: no live testhost accepted patches; using build path");
       this.reset();
       return false;
+    }
+    if (deltas.length > 0) {
+      this.gen++;
+      for (const host of hosts) {
+        if (fs.existsSync(host.pidFile)) this.hostGen.set(host.pidFile, this.gen);
+      }
     }
     this.log(`hotpatch: applied ${deltas.length} delta(s) to ${patchedHosts} testhost(s)`);
     return true;
@@ -413,6 +450,7 @@ export class HotPatcher {
 interface DeltaReply {
   ok: boolean;
   reason?: string;
+  calls?: number;
   assembly?: string;
   md?: string;
   il?: string;
