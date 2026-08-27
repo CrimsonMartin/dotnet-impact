@@ -1,6 +1,6 @@
-# dotnet-impact
+# Impact
 
-NCrunch-style **affected-test selection** for .NET in VS Code — free and open source.
+NCrunch-style **affected-test selection** for .NET in VS Code — free and open source. (Extension: **Impact**; CLI: `dotnet-impact`.)
 
 Builds a static IL-based impact map (which test classes relate to which source files)
 in seconds inside a background **git worktree shadow**, refines it with measured

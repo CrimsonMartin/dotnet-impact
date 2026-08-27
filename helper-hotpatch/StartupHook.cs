@@ -20,8 +20,25 @@ internal sealed class StartupHook
 {
     public static void Initialize()
     {
-        var pipeName = Environment.GetEnvironmentVariable("IMPACT_HOTPATCH_PIPE");
-        if (string.IsNullOrEmpty(pipeName)) return;
+        // Each testhost gets its own pipe: <base>-<pid>, announced by touching a
+        // pid-named file in IMPACT_HOTPATCH_DIR so the extension can find every
+        // live testhost and push deltas to all of them.
+        var baseName = Environment.GetEnvironmentVariable("IMPACT_HOTPATCH_PIPE");
+        if (string.IsNullOrEmpty(baseName)) return;
+        var pipeName = baseName + "-" + Environment.ProcessId;
+        var dir = Environment.GetEnvironmentVariable("IMPACT_HOTPATCH_DIR");
+        try
+        {
+            if (!string.IsNullOrEmpty(dir))
+            {
+                Directory.CreateDirectory(dir);
+                File.WriteAllText(Path.Combine(dir, Environment.ProcessId.ToString()), pipeName);
+            }
+        }
+        catch
+        {
+            /* registration is best effort */
+        }
         var thread = new Thread(() => Serve(pipeName)) { IsBackground = true, Name = "impact-hotpatch" };
         thread.Start();
     }

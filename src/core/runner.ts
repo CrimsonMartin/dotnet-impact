@@ -56,6 +56,8 @@ export class Runner {
 
   /** Optional persistent test-session runner; runs fall back to dotnet test without it. */
   sessions: SessionRunner | null = null;
+  /** Optional hot-patch fast path (method-body edits patch live testhosts). */
+  hotpatch: import("./hotpatch").HotPatcher | null = null;
   /** Static (IL+PDB) map builder; log sink is swappable by the host. */
   readonly staticMapper: StaticMapper;
   logSink: (msg: string) => void = () => undefined;
@@ -348,8 +350,20 @@ export class Runner {
     };
     for (const info of changed) visit(info);
 
+    const binlogDir = path.join(cacheDirFor(this.repoRoot), "binlogs");
+    fs.mkdirSync(binlogDir, { recursive: true });
+    const binlogsPath = path.join(cacheDirFor(this.repoRoot), "binlogs.json");
+    let binlogs: Record<string, string> = {};
+    try {
+      binlogs = JSON.parse(fs.readFileSync(binlogsPath, "utf8"));
+    } catch {
+      /* fresh */
+    }
     for (const info of order) {
       if (signal?.aborted) return false;
+      const relKey = toRepoRelative(this.repoRoot, info.csproj);
+      // The binlog is the hot-patch baseline material for this project.
+      const binlog = path.join(binlogDir, info.name + ".binlog");
       const res = await exec(
         "dotnet",
         [
@@ -360,6 +374,7 @@ export class Runner {
           "-restore:false",
           "-nologo",
           "-v:q",
+          `-bl:${binlog}`,
         ],
         this.shadow!.dir,
         10 * 60 * 1000,
@@ -369,9 +384,25 @@ export class Runner {
         this.logSink(`minimal build failed for ${info.name}; falling back to full builds`);
         return false;
       }
-      const relKey = toRepoRelative(this.repoRoot, info.csproj);
       stamps[relKey] = newStamps[relKey];
+      // Baseline material must embed sources (a raw binlog reads files from
+      // disk at load time — by then they hold the NEXT edit). Snapshot now,
+      // while the shadow still matches this build.
+      if (this.hotpatch) {
+        const complog = binlog.replace(/\.binlog$/, ".complog");
+        if (await this.hotpatch.snapshot(binlog, complog)) {
+          binlogs[relKey] = complog;
+          // Warm the baseline now so the first fast save is milliseconds.
+          const dll = findBuiltDll(this.shadow!.dir, info, this.repoRoot);
+          if (dll) this.hotpatch.preload(info.csproj, complog, this.shadowPath(info.csproj), dll);
+        } else {
+          delete binlogs[relKey];
+        }
+      }
     }
+    fs.writeFileSync(binlogsPath, JSON.stringify(binlogs));
+    // Real builds invalidate every hot-patch baseline and generation chain.
+    this.hotpatch?.reset();
 
     // Fan changed dependency outputs into each test project's output dir.
     for (const rel of testRels) {
@@ -432,6 +463,25 @@ export class Runner {
       }
     }
 
+    // Fast path first: method-body-only edits become EnC deltas patched into
+    // the live warm testhosts — no build, no restart, milliseconds. Any miss
+    // (structural edit, cold host, missing binlog) falls through silently.
+    let fastPatched = false;
+    if (this.sessions?.available && this.hotpatch && affected.changedFiles.length > 0) {
+      this.hotpatch.shadowDir = this.shadow!.dir;
+      let binlogs: Record<string, string> = {};
+      try {
+        binlogs = JSON.parse(
+          fs.readFileSync(path.join(cacheDirFor(this.repoRoot), "binlogs.json"), "utf8")
+        );
+      } catch {
+        /* none yet */
+      }
+      fastPatched = await this.hotpatch
+        .tryFastPath(affected.changedFiles, this.projectGraph(), binlogs)
+        .catch(() => false);
+    }
+
     // Build phase, minimal-rebuild strategy:
     //   1. Rebuild ONLY projects whose OWN sources changed since their last
     //      successful shadow build (BuildProjectReferences=false keeps MSBuild
@@ -440,7 +490,7 @@ export class Runner {
     //      dirs by file copy — milliseconds instead of test-project rebuilds.
     // Any build failure falls back to the plain full `dotnet build` of the
     // involved test projects, which is always correct.
-    if (!(await this.minimalBuild(allRels, signal))) {
+    if (!fastPatched && !(await this.minimalBuild(allRels, signal))) {
       for (const rel of allRels) {
         if (signal?.aborted) break;
         const res = await exec(

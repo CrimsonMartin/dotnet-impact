@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <RollForward>LatestMajor</RollForward>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Basic.CompilerLog.Util" Version="0.9.56" />
+    <!-- SDK source generators target modern Roslyn; 4.8 can't load them (BCLA0002). -->
+    <PackageReference Include="Microsoft.CodeAnalysis" Version="5.9.0" />
+  </ItemGroup>
+
+</Project>

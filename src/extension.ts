@@ -6,6 +6,7 @@ import { locateClasses, locateMethod, SourceLocation, stripNesting } from "./cor
 import { testProjects } from "./core/projects";
 import { AffectedSet, Runner, TestOutcome } from "./core/runner";
 import { cacheDirFor, setDotnetPath, toRepoRelative } from "./core/util";
+import { HotPatcher } from "./core/hotpatch";
 import { SessionRunner } from "./core/vstestSession";
 
 let runner: Runner | undefined;
@@ -33,9 +34,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   applyDotnetPath();
 
   if (vscode.workspace.getConfiguration("dotnetImpact").get<boolean>("persistentTestSessions", true)) {
-    runner.sessions = new SessionRunner(repoRoot, context.asAbsolutePath("helper"), (m) =>
-      output.appendLine(m)
+    // Hot-patch fast path: hook env goes into every session via runsettings.
+    const hot = new HotPatcher(
+      repoRoot,
+      context.asAbsolutePath("helper-deltas"),
+      context.asAbsolutePath("helper-hotpatch"),
+      (m) => output.appendLine(m)
     );
+    void hot.prepareRunsettings().then((ok) => {
+      runner!.sessions = new SessionRunner(
+        repoRoot,
+        context.asAbsolutePath("helper"),
+        (m) => output.appendLine(m),
+        ok ? hot.runsettingsFile : undefined
+      );
+      if (ok) runner!.hotpatch = hot;
+    });
   }
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
@@ -43,13 +57,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     })
   );
 
-  output = vscode.window.createOutputChannel("dotnet-impact");
+  output = vscode.window.createOutputChannel("Impact");
   statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
   statusBar.command = "dotnetImpact.showStatus";
   updateStatus("idle");
   statusBar.show();
 
-  controller = vscode.tests.createTestController("dotnetImpact", "dotnet-impact (affected tests)");
+  controller = vscode.tests.createTestController("dotnetImpact", "Impact (affected tests)");
   context.subscriptions.push(controller, statusBar, output);
 
   populateTreeFromCache();
@@ -470,7 +484,7 @@ async function buildMapWithProgress(
     await vscode.window.withProgress(
       {
         location,
-        title: "dotnet-impact: building impact map",
+        title: "Impact: building impact map",
         cancellable: location === vscode.ProgressLocation.Notification,
       },
       async (progress, token) => {
@@ -514,4 +528,5 @@ async function buildMapWithProgress(
 
 export function deactivate(): void {
   runner?.sessions?.dispose(true); // shadow worktree itself persists intentionally
+  runner?.hotpatch?.dispose();
 }
