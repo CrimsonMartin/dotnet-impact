@@ -1,4 +1,4 @@
-// dotnet-impact hot-patch startup hook.
+// Impact hot-patch startup hook.
 //
 // Injected into testhost processes via DOTNET_STARTUP_HOOKS (with
 // DOTNET_MODIFIABLE_ASSEMBLIES=debug). Hosts a named-pipe server the extension

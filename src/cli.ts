@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 /**
- * dotnet-impact CLI — same core as the VS Code extension, callable from
+ * Impact CLI — same core as the VS Code extension, callable from
  * pre-commit hooks and AI coding agents.
  *
- *   dotnet-impact build-map [--refresh]     build/refresh the impact map (background-safe)
- *   dotnet-impact affected [--base <ref>] [--staged]   print affected test classes
- *   dotnet-impact run [--base <ref>] [--staged]        run affected tests; exit 1 on failure
- *   dotnet-impact status                    map coverage stats
+ *   impact build-map [--refresh]     build/refresh the impact map (background-safe)
+ *   impact affected [--base <ref>] [--staged]   print affected test classes
+ *   impact run [--base <ref>] [--staged]        run affected tests; exit 1 on failure
+ *   impact status                    map coverage stats
  */
 import * as os from "os";
 import * as path from "path";
@@ -95,7 +95,7 @@ async function main(): Promise<number> {
     }
     default:
       console.error(
-        "usage: dotnet-impact <build-map|affected|run|status> [--base <ref>] [--staged] [--refresh]"
+        "usage: impact <build-map|affected|run|status> [--base <ref>] [--staged] [--refresh]"
       );
       return 2;
   }

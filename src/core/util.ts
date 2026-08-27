@@ -97,6 +97,8 @@ export async function git(repo: string, args: string[]): Promise<ExecResult> {
 /** Cache directory for a repo, outside the repo so we never pollute or trigger watchers. */
 export function cacheDirFor(repoRoot: string): string {
   const hash = crypto.createHash("sha1").update(path.resolve(repoRoot).toLowerCase()).digest("hex").slice(0, 12);
+  // Cache dir name is a legacy internal identifier: renaming would orphan every
+  // existing shadow worktree and map. Branding lives elsewhere.
   return path.join(os.homedir(), ".dotnet-impact", `${path.basename(repoRoot)}-${hash}`);
 }
 

@@ -1,4 +1,4 @@
-// dotnet-impact delta service.
+// Impact delta service.
 //
 // Resident process holding Roslyn compilations reconstructed from MSBuild
 // binlogs (Basic.CompilerLog). For a saved .cs file it classifies the edit:

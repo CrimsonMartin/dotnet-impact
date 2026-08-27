@@ -1,4 +1,4 @@
-// dotnet-impact persistent test runner.
+// Impact persistent test runner.
 //
 // Keeps vstest.console and per-assembly test sessions (pre-warmed testhosts)
 // alive between runs, so an incremental test run costs milliseconds of

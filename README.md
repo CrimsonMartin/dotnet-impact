@@ -1,6 +1,6 @@
 # Impact
 
-NCrunch-style **affected-test selection** for .NET in VS Code — free and open source. (Extension: **Impact**; CLI: `dotnet-impact`.)
+NCrunch-style **affected-test selection** for .NET in VS Code — free and open source. (Extension and CLI: **Impact**.)
 
 Builds a static IL-based impact map (which test classes relate to which source files)
 in seconds inside a background **git worktree shadow**, refines it with measured
@@ -52,18 +52,18 @@ Native Test Explorer integration via the `TestController` API — no custom UI:
   also prune entries for deleted test classes/projects.
 - **Automatic map build** — on workspace open, any test classes missing from the map
   are mapped in the background (status-bar progress; disable via
-  `dotnetImpact.autoBuildMap`). `dotnet-impact: Build impact map (background)` runs
+  `dotnetImpact.autoBuildMap`). `Impact: Build impact map (background)` runs
   the same thing on demand with a cancellable progress notification.
-- `dotnet-impact: Run affected tests now` — affected set for the current dirty files.
+- `Impact: Run affected tests now` — affected set for the current dirty files.
 - Status bar shows the last run's result.
 
 ## CLI (pre-commit hooks / agents)
 
 ```
-dotnet-impact build-map [--refresh]      # build or refresh the map (run overnight / in background)
-dotnet-impact affected [--base <ref>] [--staged]   # print affected test classes
-dotnet-impact run [--base <ref>] [--staged]        # run affected tests; exit 1 on failure
-dotnet-impact status
+impact build-map [--refresh]      # build or refresh the map (run overnight / in background)
+impact affected [--base <ref>] [--staged]   # print affected test classes
+impact run [--base <ref>] [--staged]        # run affected tests; exit 1 on failure
+impact status
 ```
 
 Pre-commit hook (`.git/hooks/pre-commit`):
@@ -73,7 +73,7 @@ Pre-commit hook (`.git/hooks/pre-commit`):
 node /path/to/dotnet-impact/out/cli.js run --staged || exit 1
 ```
 
-For an AI coding agent, `dotnet-impact run` after each edit gives sub-minute feedback
+For an AI coding agent, `impact run` after each edit gives sub-minute feedback
 scoped to the blast radius of the change, instead of a full CI cycle.
 
 ## Known blind spots (by design, documented not solved)

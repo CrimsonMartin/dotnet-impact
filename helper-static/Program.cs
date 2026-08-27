@@ -1,4 +1,4 @@
-// dotnet-impact static map builder.
+// Impact static map builder.
 //
 // Reads the solution's BUILT assemblies (IL metadata via System.Reflection.Metadata)
 // plus their portable PDBs, builds the compiler-resolved type-reference graph, and
