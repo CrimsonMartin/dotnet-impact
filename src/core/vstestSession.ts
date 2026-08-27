@@ -304,7 +304,9 @@ export class SessionRunner {
       this.pending.set(id, { tests: [], resolve });
     });
     this.send({ id, cmd: "release", dll });
-    await Promise.race([done, new Promise((r) => setTimeout(r, 5000))]);
+    let timer: NodeJS.Timeout | undefined;
+    await Promise.race([done, new Promise((r) => (timer = setTimeout(r, 5000)))]);
+    clearTimeout(timer);
     this.pending.delete(id); // a timed-out release must not leak its entry
   }
 
