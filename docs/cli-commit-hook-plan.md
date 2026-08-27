@@ -142,7 +142,8 @@ blocks a commit.**
 - **Concurrency.** lint-staged parallelizes hook commands, and a CLI invocation can
   race the extension's background map refresh; nothing serializes shadow access
   across processes today. Add a lock file in the repo's cache dir
-  (`~/.dotnet-impact/<repo>-<hash>/`): wait briefly for the holder, then bail with a
+  (`~/.impact/<repo>-<hash>/`; implementation uses `cacheDirFor()`, never a
+  literal path): wait briefly for the holder, then bail with a
   clear "another impact instance holds the shadow — skipped" message and exit 0 in
   the same never-block spirit.
 
