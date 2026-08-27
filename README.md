@@ -1,132 +1,104 @@
 # Impact
 
-NCrunch-style **affected-test selection** for .NET in VS Code — free and open source. (Extension and CLI: **Impact**.)
+**Live unit testing for .NET in VS Code — free and open source.**
 
-Builds a static IL-based impact map (which test classes relate to which source files)
-in seconds inside a background **git worktree shadow**, refines it with measured
-coverage as tests run, and on every save runs *only the tests affected by your
-change*, reporting results through VS Code's native Test Explorer. The same core
-ships as a CLI for pre-commit hooks and AI coding agents, where a full CI run is too
-expensive per commit.
+Save a file, see the affected tests go green (or red) in **~50 milliseconds**. No
+build, no test-host startup, no running the whole suite. The closest thing to
+this is Visual Studio's Live Unit Testing, which requires an Enterprise license
+and doesn't exist for VS Code at all.
 
-## How it works
+<!-- demo.gif: save → red → fix → green, with the timing line visible -->
 
-1. **Shadow worktree** — `git worktree add` gives a full checkout sharing the object
-   store (near-instant, no duplicate history). Uncommitted edits are mirrored on top as
-   a file-copy overlay, so background builds/test runs never touch your working tree and
-   its warm `bin`/`obj` never collide with your editor's builds.
-2. **Impact map** — built statically in seconds: the built assemblies' IL metadata
-   and portable PDBs yield each test class's transitive type-reference closure as
-   source files (`source file → test classes that could reach it`). Rows are tagged
-   `static`, and the live-refresh pipeline replaces them with measured per-class
-   coverage as tests actually run — converging on observed truth, including
-   DI/reflection edges static analysis can't see. Class-level granularity throughout.
-3. **Affected set** — on save (or per commit), changed files are looked up in the map.
-   Mapped files → run just those test classes (`dotnet test --filter`). Unmapped files →
-   conservative fallback: run every test project that transitively references the
-   changed file's project (computed from the `ProjectReference` graph).
+## Why it's fast
 
-Live map refresh uses the Microsoft.CodeCoverage collector (bundled with
-`Microsoft.NET.Test.Sdk`) — block-level instrumentation, much faster than Coverlet —
-and falls back to `coverlet.collector` automatically where it's unavailable. Map
-building itself is static analysis and needs no collector; running affected tests
-works regardless.
+Most "run tests on save" tools pay the full toll every time: MSBuild spin-up,
+test-host spawn, suite discovery — seconds of ceremony before a single assert
+runs. Impact removes the toll booths:
 
-## VS Code extension
+- **Hot patching** — your edit is compiled into an [Edit-and-Continue
+  delta](https://learn.microsoft.com/visualstudio/debugger/hot-reload) (the same
+  engine behind `dotnet watch` hot reload) and injected into already-running
+  test hosts. Method bodies, new methods, new fields, new types, lambdas — no
+  build at all.
+- **Warm test sessions** — pre-warmed testhosts stay alive between runs, so
+  even when a real build is needed, running the tests costs milliseconds of
+  dispatch instead of seconds of startup.
+- **Affected-test selection** — an IL-based impact map (refined by measured
+  coverage as tests run) knows which test classes can reach the file you
+  changed, so only those run.
+- **Shadow worktree** — everything happens in a background `git worktree`
+  mirror of your repo, so background builds never fight your editor over
+  `bin`/`obj`.
 
-Native Test Explorer integration via the `TestController` API — no custom UI:
+Every run logs an honest timing line to the *Impact* output channel:
+`timing: fastpath=hit build=0ms tests=12ms total=36ms` — and when the fast path
+can't be used (a changed public signature, a rude edit), it says exactly why
+and falls back to a minimal rebuild.
 
-- **Continuous run** — toggle the "eye" on the *Affected tests* profile and affected
-  tests re-run on every `.cs` save (also available as plain auto-run-on-save via
-  `dotnetImpact.autoRunOnSave`). A save during a run supersedes it: the in-flight run
-  is cancelled and its files fold into the new one.
-- **Persistent test sessions** — a small shipped helper (built once on first use)
-  keeps vstest.console and pre-warmed testhosts alive between runs, so an
-  incremental run costs milliseconds of dispatch instead of seconds of process
-  startup. Sessions are freshness-checked against the build output (never run
-  stale assemblies) and everything falls back to plain `dotnet test` when
-  unavailable (`dotnetImpact.persistentTestSessions`).
-- **Live map refresh** — after each affected run, coverage is re-collected for the
-  classes that ran (low-priority, background), so map rows track your code as it
-  changes instead of going stale (`dotnetImpact.liveMapRefresh`). Full map builds
-  also prune entries for deleted test classes/projects.
-- **Automatic map build** — on workspace open, any test classes missing from the map
-  are mapped in the background (status-bar progress; disable via
-  `dotnetImpact.autoBuildMap`). `Impact: Build impact map (background)` runs
-  the same thing on demand with a cancellable progress notification.
-- `Impact: Run affected tests now` — affected set for the current dirty files.
-- Status bar shows the last run's result.
+## Getting started
 
-## CLI (pre-commit hooks / agents)
+1. Install the extension, open a .NET repo with test projects.
+2. The Testing panel populates with your tests (classes and methods) and an
+   impact map builds in the background.
+3. Save a `.cs` file — affected tests run automatically. Or toggle the
+   continuous-run "eye" on the *Affected tests* profile.
+
+Works with xUnit, NUnit, and MSTest via `dotnet test` / VSTest. Coverage runs
+(native VS Code coverage view) are built in via the *Coverage* profile.
+
+The first run on a repo pays a one-time setup: a full build, the impact map,
+and a small local build of the helper services. After that, saves are fast.
+
+## CLI (pre-commit hooks / AI agents)
+
+The same engine ships as a CLI for hooks and coding agents:
 
 ```
-impact build-map [--refresh]      # build or refresh the map (run overnight / in background)
-impact affected [file ...] [--base <ref>] [--staged]   # print affected test classes
-impact run [file ...] [--base <ref>] [--staged]        # run affected tests; exit 1 on failure
-impact status
+impact build-map                  # build or refresh the map (background/overnight)
+impact affected [file ...]        # print affected test classes
+impact run [file ...]             # run affected tests; exit 1 on failure
+impact run --staged               # pre-commit mode (index only)
+impact run --base <ref>           # everything the branch changed
 ```
 
-Selection, from tightest to broadest (CLI only — the extension keeps its
-save-driven path):
-
-- `impact run src/A.cs src/B.cs` — exactly those files. lint-staged and
-  [pre-commit](https://pre-commit.com) pass staged filenames as trailing
-  arguments, so impact is a drop-in hook entry; agents pass the files they just
-  edited.
-- `impact run --staged` — the index only: the fast pre-commit mode.
-- `impact run` — everything this branch changed: commits since the merge-base
-  with the auto-detected base (the branch's upstream, else `origin/HEAD`, else
-  `origin/main`/`origin/master`) plus the dirty tree. Right for pre-push hooks,
-  CI, and verifying a commit just made.
-- `impact run --base <ref>` — same shape with an explicit base: `<ref>...HEAD`
-  plus the dirty tree.
-
-Exit codes are the contract (stdout is human-oriented and may change): `run`
-exits 0 when affected tests pass or nothing is affected, 1 on test failure or
-error, 2 on usage errors. Infrastructure never blocks a commit: with no map
-built yet, or the shadow worktree locked by another impact process, `run` and
-`affected` warn on stderr and exit 0 — build the map explicitly (overnight or
-in the background) with `impact build-map`.
-
-Pre-commit via lint-staged (`{ "*.cs": "impact run" }`), or a plain hook:
-
-```sh
-#!/bin/sh
-# .git/hooks/pre-commit
-impact run --staged || exit 1
-```
-
-```sh
-#!/bin/sh
-# .git/hooks/pre-push
-impact run || exit 1
-```
-
-`--staged` caveat: selection comes from the index, but tests execute
-working-tree content — with partial staging (`git add -p`) the run can exercise
-unstaged edits. Agents that stage everything are unaffected.
+Exit codes are the contract: 0 pass/nothing affected, 1 failure, 2 usage.
+Infrastructure never blocks a commit — no map yet or shadow busy warns and
+exits 0. Pre-commit via lint-staged (`{ "*.cs": "impact run" }`) or a plain
+hook with `impact run --staged`.
 
 For an AI coding agent, `impact run <files>` after each edit gives sub-minute
-feedback scoped to the blast radius of the change, and `impact run` after each
-commit verifies the branch. Put those two lines in your repo's `CLAUDE.md` (or
-equivalent agent docs) so agents discover the workflow.
+feedback scoped to the blast radius of the change. Put that in your repo's
+agent docs (`CLAUDE.md` or equivalent) so agents discover it.
 
-## Known blind spots (by design, documented not solved)
+## How selection works
 
-- Reflection / DI indirection: coverage maps observed execution; a config change that
-  reroutes DI can affect tests the map doesn't predict. Unmapped/non-`.cs` files fall
-  back to project-level selection.
-- `.csproj` / config edits trigger the project-graph fallback, not the map.
-- Map rows go stale for code you aren't touching; they refresh as their tests re-run.
+1. **Impact map** — built statically in seconds from the assemblies' IL
+   metadata and portable PDBs: each test class's transitive type-reference
+   closure becomes `source file → test classes`. Measured per-class coverage
+   replaces the static rows as tests actually run, converging on observed
+   truth (including DI/reflection edges static analysis can't see).
+2. **On save** — changed files are looked up in the map; mapped files run just
+   those test classes, unmapped files fall back to every test project that
+   transitively references the changed project.
+
+## Known blind spots (by design)
+
+- Reflection / DI indirection: a config change that reroutes DI can affect
+  tests the map doesn't predict. Non-`.cs` and unmapped files fall back to
+  project-level selection.
+- `.csproj` / config edits use the project-graph fallback, not the map.
+- A changed **public/internal signature** always takes the rebuild path:
+  hot-patching it would leave dependent assemblies green against an API that
+  no longer compiles, so Impact refuses and rebuilds instead.
 
 ## Development
 
 ```
 npm install
 npm run compile     # or: npm run watch
-npm test            # unit tests (node --test) over the parsing/selection core
+npm test            # unit tests (node --test)
 ```
 
-Launch the extension with F5 (Extension Development Host). The shadow worktree and map
-live under `~/.impact/<repo>-<hash>/` — delete that folder to reset everything
-(then `git worktree prune` in the repo).
+Launch with F5 (Extension Development Host). All state lives under
+`~/.impact/<repo>-<hash>/` — delete that folder to reset everything (then
+`git worktree prune` in the repo).
