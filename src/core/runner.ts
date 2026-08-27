@@ -10,7 +10,6 @@ import {
   projectForFile,
   sourceStamp,
   testProjects,
-  transitiveSourceStamp,
 } from "./projects";
 import { ImpactMap } from "./map";
 import { findBuiltDll, StaticMapper } from "./staticmap";
@@ -289,10 +288,118 @@ export class Runner {
   }
 
   /**
+   * Minimal rebuild for the projects feeding `testRels`: build only projects
+   * whose own sources changed (dependency-ordered, BuildProjectReferences=false),
+   * then copy their fresh outputs into each involved test project's output dir.
+   * Returns false when anything went sideways — caller falls back to full builds.
+   */
+  private async minimalBuild(testRels: Set<string>, signal?: AbortSignal): Promise<boolean> {
+    const graph = this.projectGraph();
+    const stampsPath = path.join(cacheDirFor(this.repoRoot), "own-stamps.json");
+    let stamps: Record<string, string> = {};
+    try {
+      stamps = JSON.parse(fs.readFileSync(stampsPath, "utf8"));
+    } catch {
+      /* fresh: everything counts as changed */
+    }
+
+    // Projects that feed the involved test projects (deps + the tests themselves).
+    const relevant = new Map<string, ProjectInfo>();
+    const addWithDeps = (info: ProjectInfo) => {
+      const key = path.resolve(info.csproj).toLowerCase();
+      if (relevant.has(key)) return;
+      relevant.set(key, info);
+      for (const ref of info.references) {
+        const dep = graph.projects.get(path.resolve(ref).toLowerCase());
+        if (dep) addWithDeps(dep);
+      }
+    };
+    for (const rel of testRels) {
+      const info = [...graph.projects.values()].find(
+        (p) => toRepoRelative(this.repoRoot, p.csproj).toLowerCase() === rel.toLowerCase()
+      );
+      if (!info) return false;
+      addWithDeps(info);
+    }
+
+    // Changed = own-source stamp differs from the last successful build's.
+    const changed: ProjectInfo[] = [];
+    const newStamps: Record<string, string> = {};
+    for (const info of relevant.values()) {
+      const rel = toRepoRelative(this.repoRoot, info.csproj);
+      const stamp = sourceStamp(info.dir);
+      newStamps[rel] = stamp;
+      if (stamps[rel] !== stamp) changed.push(info);
+    }
+    if (changed.length === 0) return true;
+
+    // Dependency order (referenced before referencing).
+    const order: ProjectInfo[] = [];
+    const visiting = new Set<string>();
+    const visit = (info: ProjectInfo) => {
+      const key = path.resolve(info.csproj).toLowerCase();
+      if (visiting.has(key)) return;
+      visiting.add(key);
+      for (const ref of info.references) {
+        const dep = graph.projects.get(path.resolve(ref).toLowerCase());
+        if (dep && changed.includes(dep)) visit(dep);
+      }
+      order.push(info);
+    };
+    for (const info of changed) visit(info);
+
+    for (const info of order) {
+      if (signal?.aborted) return false;
+      const res = await exec(
+        "dotnet",
+        [
+          "msbuild",
+          this.shadowPath(info.csproj),
+          "-t:Build",
+          "-p:BuildProjectReferences=false",
+          "-restore:false",
+          "-nologo",
+          "-v:q",
+        ],
+        this.shadow!.dir,
+        10 * 60 * 1000,
+        signal
+      );
+      if (res.code !== 0) {
+        this.logSink(`minimal build failed for ${info.name}; falling back to full builds`);
+        return false;
+      }
+      const relKey = toRepoRelative(this.repoRoot, info.csproj);
+      stamps[relKey] = newStamps[relKey];
+    }
+
+    // Fan changed dependency outputs into each test project's output dir.
+    for (const rel of testRels) {
+      const testDll = this.findTestDll(rel);
+      if (!testDll) return false;
+      const outDir = path.dirname(testDll);
+      for (const info of order) {
+        if (testRels.has(toRepoRelative(this.repoRoot, info.csproj))) continue; // built its own output
+        const depDll = findBuiltDll(this.shadow!.dir, info, this.repoRoot);
+        if (!depDll) continue;
+        for (const ext of [".dll", ".pdb"]) {
+          const src = depDll.replace(/\.dll$/i, ext);
+          const dst = path.join(outDir, path.basename(src));
+          if (fs.existsSync(src) && fs.existsSync(dst)) fs.copyFileSync(src, dst);
+        }
+      }
+    }
+
+    fs.mkdirSync(path.dirname(stampsPath), { recursive: true });
+    fs.writeFileSync(stampsPath, JSON.stringify(stamps));
+    return true;
+  }
+
+  /**
    * Run the affected set inside the shadow worktree. Abort via `signal` to
-   * supersede. Build happens once up front (shared deps compile once), test
-   * runs go `--no-build` in parallel across projects, and classes that failed
-   * last time run in a first quick pass so red results surface early.
+   * supersede. Minimal rebuild happens up front, test runs go `--no-build` in
+   * parallel across projects, and classes that failed last time run in a first
+   * quick pass so red results surface early.
    * `onPartial` streams each test invocation's outcomes as it finishes.
    */
   async runAffected(
@@ -325,42 +432,28 @@ export class Runner {
       }
     }
 
-    // Build phase: every involved project once, serially — later builds reuse
-    // the shared dependencies the first ones compiled. Projects whose
-    // transitive sources are unchanged since their last successful shadow
-    // build skip entirely (a no-op dotnet build still costs seconds).
-    const builtStampsPath = path.join(cacheDirFor(this.repoRoot), "built-stamps.json");
-    let builtStamps: Record<string, string> = {};
-    try {
-      builtStamps = JSON.parse(fs.readFileSync(builtStampsPath, "utf8"));
-    } catch {
-      /* fresh */
-    }
-    const stampMemo = new Map<string, string>();
-    for (const rel of allRels) {
-      if (signal?.aborted) break;
-      const csprojAbs = path.join(this.repoRoot, rel);
-      const stamp = transitiveSourceStamp(this.projectGraph(), csprojAbs, stampMemo);
-      if (stamp && builtStamps[rel] === stamp) continue; // nothing changed since last build
-      const buildArgs = ["build", this.shadowPath(csprojAbs), "--nologo", "--verbosity", "quiet"];
-      let res = await exec(
-        "dotnet",
-        [...buildArgs, "--no-restore"],
-        this.shadow!.dir,
-        10 * 60 * 1000,
-        signal
-      );
-      if (res.code !== 0 && !signal?.aborted) {
-        // New/changed packages need a restore; retry once with it.
-        res = await exec("dotnet", buildArgs, this.shadow!.dir, 10 * 60 * 1000, signal);
-      }
-      if (res.code !== 0 && !signal?.aborted) {
-        ok = false;
-        output += res.stdout + res.stderr;
-      } else if (!signal?.aborted && stamp) {
-        builtStamps[rel] = stamp;
-        fs.mkdirSync(path.dirname(builtStampsPath), { recursive: true });
-        fs.writeFileSync(builtStampsPath, JSON.stringify(builtStamps));
+    // Build phase, minimal-rebuild strategy:
+    //   1. Rebuild ONLY projects whose OWN sources changed since their last
+    //      successful shadow build (BuildProjectReferences=false keeps MSBuild
+    //      from re-walking the whole reference graph).
+    //   2. Fan rebuilt dependency dlls into the involved test projects' output
+    //      dirs by file copy — milliseconds instead of test-project rebuilds.
+    // Any build failure falls back to the plain full `dotnet build` of the
+    // involved test projects, which is always correct.
+    if (!(await this.minimalBuild(allRels, signal))) {
+      for (const rel of allRels) {
+        if (signal?.aborted) break;
+        const res = await exec(
+          "dotnet",
+          ["build", this.shadowPath(path.join(this.repoRoot, rel)), "--nologo", "--verbosity", "quiet"],
+          this.shadow!.dir,
+          10 * 60 * 1000,
+          signal
+        );
+        if (res.code !== 0 && !signal?.aborted) {
+          ok = false;
+          output += res.stdout + res.stderr;
+        }
       }
     }
 
