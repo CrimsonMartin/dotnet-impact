@@ -34,10 +34,16 @@ async function main(): Promise<number> {
     case "build-map": {
       await runner.prepare();
       const configured = Number(arg("--parallel") ?? 0);
+      const parallel =
+        configured > 0 ? configured : Math.max(1, Math.min(12, os.cpus().length - 2));
+      const discovered = await runner.discoverAll({
+        parallel,
+        onPhase: (message) => process.stderr.write(`${message}\n`),
+      });
       const res = await runner.buildMap({
         refresh: has("--refresh"),
-        parallel:
-          configured > 0 ? configured : Math.max(1, Math.min(8, Math.floor(os.cpus().length / 2))),
+        parallel,
+        discovered,
         onPhase: (message) => process.stderr.write(`${message}\n`),
         onProgress: (done, total, current) =>
           process.stderr.write(`[${done + 1}/${total}] ${current}\n`),

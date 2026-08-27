@@ -60,10 +60,14 @@ export function parseListedTests(stdout: string): string[] {
  * List test classes (fully qualified) in a test project via
  * `dotnet test --list-tests`.
  */
-export async function discoverTestClasses(csproj: string, cwd: string): Promise<string[]> {
+export async function discoverTestClasses(
+  csproj: string,
+  cwd: string,
+  noBuild = false
+): Promise<string[]> {
   const res = await exec(
     "dotnet",
-    ["test", csproj, "--list-tests", "--nologo", "--verbosity", "quiet"],
+    ["test", csproj, "--list-tests", ...(noBuild ? ["--no-build"] : []), "--nologo", "--verbosity", "quiet"],
     cwd
   );
   const classes = parseListedTests(res.stdout);

@@ -2,7 +2,6 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
-import { discoverTestClasses } from "./core/discover";
 import { locateClasses, locateMethod, SourceLocation } from "./core/locate";
 import { testProjects } from "./core/projects";
 import { AffectedSet, Runner, TestOutcome } from "./core/runner";
@@ -104,40 +103,32 @@ function updateStatus(text: string, spin = false): void {
 
 // ---------- tree population ----------
 
-function discoveryCachePath(): string {
-  return path.join(cacheDirFor(runner!.repoRoot), "discovered.json");
-}
-
 /** Instant tree from the previous session's discovery, so the panel is never empty. */
 function populateTreeFromCache(): void {
-  let cached: Record<string, string[]> = {};
+  const cached: Record<string, string[]> = {};
   try {
-    cached = JSON.parse(fs.readFileSync(discoveryCachePath(), "utf8"));
+    const raw = JSON.parse(
+      fs.readFileSync(path.join(cacheDirFor(runner!.repoRoot), "discovery-cache.json"), "utf8")
+    );
+    for (const [rel, entry] of Object.entries<{ classes: string[] }>(raw?.projects ?? {})) {
+      cached[rel] = entry.classes;
+    }
   } catch {
     /* first session */
   }
   rebuildTree(cached);
 }
 
-/** Discover all test classes in the shadow worktree and refresh the tree. */
+/** Discover all test classes (freshness-skipped, parallel) and refresh the tree. */
 async function eagerDiscover(): Promise<void> {
   if (!runner || !controller) return;
   try {
     updateStatus("discovering tests…", true);
-    const shadow = await runner.prepare();
-    const graph = runner.projectGraph();
-    const discovered: Record<string, string[]> = {};
-    for (const p of testProjects(graph)) {
-      const rel = toRepoRelative(runner.repoRoot, p.csproj);
-      const shadowCsproj = path.join(shadow.dir, rel);
-      try {
-        discovered[rel] = await discoverTestClasses(shadowCsproj, shadow.dir);
-      } catch (e) {
-        output.appendLine(`discovery failed for ${p.name}: ${(e as Error).message}`);
-      }
-    }
-    fs.mkdirSync(path.dirname(discoveryCachePath()), { recursive: true });
-    fs.writeFileSync(discoveryCachePath(), JSON.stringify(discovered, null, 1));
+    await runner.prepare();
+    const discovered = await runner.discoverAll({
+      parallel: autoParallel(),
+      onPhase: (m) => updateStatus(m, true),
+    });
     rebuildTree(discovered);
     updateStatus(`${classOwners.size} test classes`);
 
@@ -482,6 +473,13 @@ async function buildMapWithProgress(
       async (progress, token) => {
         token.onCancellationRequested(() => (mapBuildCancelled = true));
         await runner!.prepare();
+        discovered ??= await runner!.discoverAll({
+          parallel: autoParallel(),
+          onPhase: (message) => {
+            progress.report({ message });
+            updateStatus(message, true);
+          },
+        });
         const configured = vscode.workspace
           .getConfiguration("dotnetImpact")
           .get<number>("maxParallelCoverageRuns", 0);

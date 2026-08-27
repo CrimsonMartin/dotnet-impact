@@ -3,7 +3,27 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
+import { sourceStamp } from "../core/projects";
 import { Runner } from "../core/runner";
+
+test("sourceStamp: changes on edit and on deletion, skips bin/obj", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "impact-stamp-test-"));
+  fs.writeFileSync(path.join(dir, "A.cs"), "class A {}");
+  fs.writeFileSync(path.join(dir, "B.cs"), "class B {}");
+  fs.mkdirSync(path.join(dir, "obj"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "obj", "gen.cs"), "");
+  const s1 = sourceStamp(dir);
+  assert.ok(s1.startsWith("2:")); // obj/gen.cs excluded from the count
+
+  fs.utimesSync(path.join(dir, "A.cs"), new Date(), new Date(Date.now() + 5000));
+  const s2 = sourceStamp(dir);
+  assert.notEqual(s2, s1);
+
+  fs.rmSync(path.join(dir, "B.cs"));
+  const s3 = sourceStamp(dir);
+  assert.ok(s3.startsWith("1:"));
+  assert.notEqual(s3, s2);
+});
 
 /** Scaffold Lib + Lib.Tests (references Lib) in a temp repo root. */
 function scaffoldRepo(): string {

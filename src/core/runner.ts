@@ -9,6 +9,7 @@ import {
   ProjectGraph,
   ProjectInfo,
   projectForFile,
+  sourceStamp,
   testProjects,
 } from "./projects";
 import { ImpactMap } from "./map";
@@ -117,6 +118,109 @@ export class Runner {
   private shadowPath(repoFile: string): string {
     if (!this.shadow) throw new Error("prepare() not called");
     return path.join(this.shadow.dir, toRepoRelative(this.repoRoot, repoFile));
+  }
+
+  /**
+   * Discover test classes across all test projects, fast:
+   * - projects whose sources are unchanged since the cached discovery are
+   *   skipped entirely (stamp = newest source mtime + file count);
+   * - dirty projects get one build (the solution when present — dependency-
+   *   correct and internally parallel — else serial per-project), then
+   *   `--list-tests --no-build` runs in parallel.
+   * Returns repo-relative csproj -> class FQNs for every test project.
+   */
+  async discoverAll(
+    opts: {
+      parallel?: number;
+      force?: boolean;
+      onPhase?: (message: string) => void;
+    } = {}
+  ): Promise<Record<string, string[]>> {
+    if (!this.shadow) await this.prepare();
+    const graph = this.projectGraph();
+    const cachePath = path.join(cacheDirFor(this.repoRoot), "discovery-cache.json");
+    let cache: { version: 2; projects: Record<string, { stamp: string; classes: string[] }> } = {
+      version: 2,
+      projects: {},
+    };
+    try {
+      const loaded = JSON.parse(fs.readFileSync(cachePath, "utf8"));
+      if (loaded?.version === 2) cache = loaded;
+    } catch {
+      /* fresh */
+    }
+
+    const projects = testProjects(graph);
+    const result: Record<string, string[]> = {};
+    const dirty: Array<{ p: ProjectInfo; rel: string; stamp: string }> = [];
+    for (const p of projects) {
+      const rel = toRepoRelative(this.repoRoot, p.csproj);
+      const stamp = sourceStamp(p.dir); // real repo is the source of truth
+      const cached = cache.projects[rel];
+      if (!opts.force && cached && cached.stamp === stamp) {
+        result[rel] = cached.classes;
+      } else {
+        dirty.push({ p, rel, stamp });
+      }
+    }
+    if (dirty.length === 0) return result;
+    opts.onPhase?.(`discovering tests in ${dirty.length}/${projects.length} changed projects`);
+
+    // Build phase for dirty projects: prefer one solution build.
+    const sln = fs
+      .readdirSync(this.repoRoot)
+      .find((f) => f.toLowerCase().endsWith(".sln") || f.toLowerCase().endsWith(".slnx"));
+    let slnOk = false;
+    if (sln && dirty.length > 1) {
+      opts.onPhase?.(`building solution ${sln}`);
+      const res = await exec(
+        "dotnet",
+        ["build", path.join(this.shadow!.dir, sln), "--nologo", "--verbosity", "quiet"],
+        this.shadow!.dir
+      );
+      slnOk = res.code === 0;
+    }
+    if (!slnOk) {
+      let n = 0;
+      for (const d of dirty) {
+        opts.onPhase?.(`building ${d.p.name} (${++n}/${dirty.length})`);
+        await exec(
+          "dotnet",
+          ["build", this.shadowPath(d.p.csproj), "--nologo", "--verbosity", "quiet"],
+          this.shadow!.dir
+        );
+      }
+    }
+
+    // Parallel discovery against the built outputs.
+    let next = 0;
+    let done = 0;
+    await Promise.all(
+      Array.from({ length: Math.min(Math.max(1, opts.parallel ?? 4), dirty.length) }, async () => {
+        for (;;) {
+          const i = next++;
+          if (i >= dirty.length) return;
+          const d = dirty[i];
+          opts.onPhase?.(`discovering ${d.p.name} (${++done}/${dirty.length})`);
+          try {
+            const classes = await discoverTestClasses(this.shadowPath(d.p.csproj), this.shadow!.dir, true);
+            result[d.rel] = classes;
+            cache.projects[d.rel] = { stamp: d.stamp, classes };
+          } catch {
+            // Keep the stale cache row if we have one; better than losing the tree.
+            const cached = cache.projects[d.rel];
+            if (cached) result[d.rel] = cached.classes;
+          }
+        }
+      })
+    );
+
+    // Drop cache rows for projects that no longer exist.
+    const live = new Set(projects.map((p) => toRepoRelative(this.repoRoot, p.csproj)));
+    for (const rel of Object.keys(cache.projects)) if (!live.has(rel)) delete cache.projects[rel];
+    fs.mkdirSync(path.dirname(cachePath), { recursive: true });
+    fs.writeFileSync(cachePath, JSON.stringify(cache, null, 1));
+    return result;
   }
 
   /** Changed files vs a git base ref plus uncommitted changes (repo-relative). */
@@ -365,11 +469,10 @@ export class Runner {
     /** Concurrent per-class coverage runs (ignored on the Coverlet fallback). */
     parallel?: number;
     /**
-     * Discovery results to reuse (repo-relative csproj -> class FQNs), e.g.
-     * from the extension's eager discovery. Skips the per-project
-     * build+--list-tests lead-in for projects with no unmapped classes.
+     * Discovery results (repo-relative csproj -> class FQNs), from
+     * discoverAll(). Only projects with unmapped classes get a warm build.
      */
-    discovered?: Record<string, string[]>;
+    discovered: Record<string, string[]>;
     onProgress?: (done: number, total: number, current: string) => void;
     /** Coarse phase updates before per-class progress exists (restore/build/discovery). */
     onPhase?: (message: string) => void;
@@ -395,58 +498,30 @@ export class Runner {
     const projects = testProjects(graph);
     const liveProjects = new Set(projects.map((p) => toRepoRelative(this.repoRoot, p.csproj)));
 
-    if (opts.discovered) {
-      // Reuse prior discovery; only projects with actual work get a warm build.
-      const needBuild: typeof projects = [];
-      for (const p of projects) {
-        const csprojRel = toRepoRelative(this.repoRoot, p.csproj);
-        const classes = opts.discovered[csprojRel];
-        if (!classes) continue; // discovery failed for it; leave its entries alone
-        discovered.set(csprojRel, new Set(classes));
-        const items = classes.filter((c) => opts.refresh || !this.map.has(c));
-        if (items.length > 0) {
-          needBuild.push(p);
-          work.push(...items.map((classFqn) => ({ csprojRel, classFqn })));
-        }
+    // Only projects with actual work get a warm build (coverage runs use --no-build).
+    const needBuild: typeof projects = [];
+    for (const p of projects) {
+      const csprojRel = toRepoRelative(this.repoRoot, p.csproj);
+      const classes = opts.discovered[csprojRel];
+      if (!classes) continue; // discovery failed for it; leave its entries alone
+      discovered.set(csprojRel, new Set(classes));
+      const items = classes.filter((c) => opts.refresh || !this.map.has(c));
+      if (items.length > 0) {
+        needBuild.push(p);
+        work.push(...items.map((classFqn) => ({ csprojRel, classFqn })));
       }
-      let built = 0;
-      for (const p of needBuild) {
-        if (wantCancel()) break;
-        opts.onPhase?.(`building ${p.name} (${++built}/${needBuild.length})`);
-        await exec(
-          "dotnet",
-          ["build", this.shadowPath(p.csproj), "--nologo", "--verbosity", "quiet"],
-          this.shadow!.dir,
-          10 * 60 * 1000,
-          ctrl.signal
-        );
-      }
-    } else {
-      let projDone = 0;
-      for (const p of projects) {
-        if (wantCancel()) break;
-        opts.onPhase?.(`building ${p.name} (${++projDone}/${projects.length})`);
-        const csprojRel = toRepoRelative(this.repoRoot, p.csproj);
-        const shadowCsproj = this.shadowPath(p.csproj);
-        // Warm restore/build once per project so per-class runs can use --no-build.
-        await exec(
-          "dotnet",
-          ["build", shadowCsproj, "--nologo", "--verbosity", "quiet"],
-          this.shadow!.dir,
-          10 * 60 * 1000,
-          ctrl.signal
-        );
-        opts.onPhase?.(`discovering tests in ${p.name} (${projDone}/${projects.length})`);
-        try {
-          const classes = await discoverTestClasses(shadowCsproj, this.shadow!.dir);
-          discovered.set(csprojRel, new Set(classes));
-          for (const cls of classes) {
-            if (opts.refresh || !this.map.has(cls)) work.push({ csprojRel, classFqn: cls });
-          }
-        } catch (e) {
-          failed.push(`${p.name}: ${(e as Error).message}`);
-        }
-      }
+    }
+    let built = 0;
+    for (const p of needBuild) {
+      if (wantCancel()) break;
+      opts.onPhase?.(`building ${p.name} (${++built}/${needBuild.length})`);
+      await exec(
+        "dotnet",
+        ["build", this.shadowPath(p.csproj), "--nologo", "--verbosity", "quiet"],
+        this.shadow!.dir,
+        10 * 60 * 1000,
+        ctrl.signal
+      );
     }
 
     let done = 0;

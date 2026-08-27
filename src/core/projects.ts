@@ -122,3 +122,37 @@ export function affectedTestProjects(graph: ProjectGraph, file: string): Project
 export function testProjects(graph: ProjectGraph): ProjectInfo[] {
   return [...graph.projects.values()].filter((p) => p.isTestProject);
 }
+
+const STAMP_FILE_RE = /\.(cs|csproj|props|targets|razor|cshtml|resx|config|json)$/i;
+
+/**
+ * Freshness stamp for a project directory: newest source mtime + file count
+ * (count catches deletions). Discovery can be skipped while the stamp holds.
+ */
+export function sourceStamp(projectDir: string): string {
+  let newest = 0;
+  let count = 0;
+  const walk = (dir: string) => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (e.isDirectory()) {
+        if (!SKIP_DIRS.has(e.name.toLowerCase())) walk(path.join(dir, e.name));
+      } else if (STAMP_FILE_RE.test(e.name)) {
+        count++;
+        try {
+          const m = fs.statSync(path.join(dir, e.name)).mtimeMs;
+          if (m > newest) newest = m;
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  };
+  walk(projectDir);
+  return `${count}:${Math.round(newest)}`;
+}
