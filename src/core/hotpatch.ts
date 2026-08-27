@@ -47,6 +47,16 @@ export class HotPatcher {
 
   /** Write the runsettings (hook dll must exist first); call before sessions start. */
   async prepareRunsettings(): Promise<boolean> {
+    try {
+      return await this.prepareRunsettingsInner();
+    } catch (e) {
+      // Never throw: a rejection here used to silently kill session setup.
+      this.log(`hot-patch: init failed: ${String(e)}`);
+      return false;
+    }
+  }
+
+  private async prepareRunsettingsInner(): Promise<boolean> {
     const hook = await this.buildHelper(this.hookSrcDir, "ImpactHotPatch");
     if (!hook) return false;
     fs.mkdirSync(this.hotDir, { recursive: true });

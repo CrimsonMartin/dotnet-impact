@@ -28,6 +28,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const ws = vscode.workspace.workspaceFolders?.[0];
   if (!ws) return;
   const repoRoot = ws.uri.fsPath;
+  // The channel must exist before anything can log: hot-patch init logs
+  // synchronously on a cold cache, and an undefined `output` there used to
+  // crash the whole session-runner setup silently (first run on a fresh
+  // machine never got a fast path).
+  output = vscode.window.createOutputChannel("Impact");
   runner = new Runner(repoRoot);
   runner.logSink = (m) => output.appendLine(m);
 
@@ -43,23 +48,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       context.asAbsolutePath("helper-hotpatch"),
       (m) => output.appendLine(m)
     );
-    void hot.prepareRunsettings().then((ok) => {
-      runner!.sessions = new SessionRunner(
-        repoRoot,
-        context.asAbsolutePath("helper"),
-        (m) => output.appendLine(m),
-        ok ? hot.runsettingsFile : undefined
-      );
-      if (ok) runner!.hotpatch = hot;
-      output.appendLine(
-        ok
-          ? "hot-patch: ready (runsettings prepared, delta service on demand)"
-          : "hot-patch: UNAVAILABLE — hook helper failed to build; every run takes the build path"
-      );
-    });
+    void hot
+      .prepareRunsettings()
+      .catch((e) => {
+        output.appendLine(`hot-patch: init error: ${String(e)}`);
+        return false;
+      })
+      .then((ok) => {
+        // Sessions are useful even without the hot-patch hook: warm testhosts
+        // still cut per-run startup. Never let hook trouble block them.
+        runner!.sessions = new SessionRunner(
+          repoRoot,
+          context.asAbsolutePath("helper"),
+          (m) => output.appendLine(m),
+          ok ? hot.runsettingsFile : undefined
+        );
+        if (ok) runner!.hotpatch = hot;
+        output.appendLine(
+          ok
+            ? "hot-patch: ready (runsettings prepared, delta service on demand)"
+            : "hot-patch: UNAVAILABLE — hook helper failed to build; runs use warm sessions + build path"
+        );
+      });
   } else {
-    // Deferred: output is created below, before any await resumes.
-    setTimeout(() => output.appendLine("persistent sessions disabled by setting — build path every run"), 0);
+    output.appendLine("persistent sessions disabled by setting — build path every run");
   }
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
@@ -67,7 +79,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     })
   );
 
-  output = vscode.window.createOutputChannel("Impact");
   statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
   statusBar.command = "dotnetImpact.showStatus";
   updateStatus("idle");
