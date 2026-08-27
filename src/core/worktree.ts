@@ -90,13 +90,17 @@ export async function syncOverlay(shadow: Shadow): Promise<string[]> {
   }
 
   // Files overlaid before but clean now: restore committed content in the shadow.
+  // Tracked and untracked must be handled separately — one untracked pathspec
+  // makes `git checkout -- <list>` fail wholesale, restoring nothing.
   const toRestore = previous.filter((f) => !current.has(f));
   if (toRestore.length > 0) {
-    await git(shadow.dir, ["checkout", "-f", "--", ...toRestore]).catch?.(() => undefined);
-    // Untracked files that were copied earlier and since deleted in the real repo:
+    const tracked: string[] = [];
     for (const f of toRestore) {
-      const tracked = await git(shadow.dir, ["ls-files", "--error-unmatch", f]);
-      if (tracked.code !== 0) {
+      const res = await git(shadow.dir, ["ls-files", "--error-unmatch", f]);
+      if (res.code === 0) {
+        tracked.push(f);
+      } else {
+        // Untracked file copied earlier and since deleted in the real repo.
         try {
           fs.rmSync(path.join(shadow.dir, f), { force: true });
         } catch {
@@ -104,6 +108,7 @@ export async function syncOverlay(shadow: Shadow): Promise<string[]> {
         }
       }
     }
+    if (tracked.length > 0) await git(shadow.dir, ["checkout", "-f", "--", ...tracked]);
   }
 
   fs.mkdirSync(path.dirname(manifestPath), { recursive: true });

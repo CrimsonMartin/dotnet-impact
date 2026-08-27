@@ -3,7 +3,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
-import { parseTrx } from "../core/runner";
+import { parseTrx, trxDurationToMs } from "../core/trx";
+
+test("trxDurationToMs: hours, precision, malformed", () => {
+  assert.equal(trxDurationToMs("01:02:03.5"), 3723500);
+  assert.ok(Math.abs(trxDurationToMs("00:00:00.0012345") - 1.2345) < 0.001);
+  assert.equal(trxDurationToMs("garbage"), 0);
+  assert.equal(trxDurationToMs(""), 0);
+});
 
 const TRX = `<?xml version="1.0" encoding="utf-8"?>
 <TestRun xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">

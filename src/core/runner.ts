@@ -1,4 +1,3 @@
-import { XMLParser } from "fast-xml-parser";
 import * as fs from "fs";
 import * as path from "path";
 import { buildRunsettings, collectClassCoverage } from "./coverage";
@@ -14,19 +13,13 @@ import {
 } from "./projects";
 import { ImpactMap } from "./map";
 import { findBuiltDll, StaticMapper } from "./staticmap";
+import { parseTrx, TestOutcome } from "./trx";
 import { cacheDirFor, classFilter, exec, git, parseStatusZ, toRepoRelative } from "./util";
 import type { SessionRunner } from "./vstestSession";
 import { ensureShadow, Shadow, syncOverlay } from "./worktree";
 
-export interface TestOutcome {
-  classFqn: string;
-  method: string;
-  passed: boolean;
-  /** Test was skipped (e.g. [Fact(Skip=...)]); passed is false but it is not a failure. */
-  skipped: boolean;
-  message?: string;
-  durationMs?: number;
-}
+export { parseTrx } from "./trx";
+export type { TestOutcome } from "./trx";
 
 export interface RunResult {
   ok: boolean;
@@ -122,6 +115,10 @@ export class Runner {
       parallel?: number;
       force?: boolean;
       onPhase?: (message: string) => void;
+      /** Test seam: replaces `dotnet test --list-tests` per project. */
+      discoverImpl?: (csproj: string, cwd: string, noBuild: boolean) => Promise<string[]>;
+      /** Test seam: replaces the warm build (also skips the solution-build shortcut). */
+      buildImpl?: (csprojAbs: string) => Promise<void>;
     } = {}
   ): Promise<Record<string, string[]>> {
     if (!this.shadow) await this.prepare();
@@ -155,11 +152,20 @@ export class Runner {
     opts.onPhase?.(`discovering tests in ${dirty.length}/${projects.length} changed projects`);
 
     // Build phase for dirty projects: prefer one solution build.
+    const build =
+      opts.buildImpl ??
+      (async (csprojAbs: string) => {
+        await exec(
+          "dotnet",
+          ["build", csprojAbs, "--nologo", "--verbosity", "quiet"],
+          this.shadow!.dir
+        );
+      });
     const sln = fs
       .readdirSync(this.repoRoot)
       .find((f) => f.toLowerCase().endsWith(".sln") || f.toLowerCase().endsWith(".slnx"));
     let slnOk = false;
-    if (sln && dirty.length > 1) {
+    if (!opts.buildImpl && sln && dirty.length > 1) {
       opts.onPhase?.(`building solution ${sln}`);
       const res = await exec(
         "dotnet",
@@ -172,15 +178,12 @@ export class Runner {
       let n = 0;
       for (const d of dirty) {
         opts.onPhase?.(`building ${d.p.name} (${++n}/${dirty.length})`);
-        await exec(
-          "dotnet",
-          ["build", this.shadowPath(d.p.csproj), "--nologo", "--verbosity", "quiet"],
-          this.shadow!.dir
-        );
+        await build(this.shadowPath(d.p.csproj));
       }
     }
 
     // Parallel discovery against the built outputs.
+    const discover = opts.discoverImpl ?? discoverTestClasses;
     let next = 0;
     let done = 0;
     await Promise.all(
@@ -191,7 +194,7 @@ export class Runner {
           const d = dirty[i];
           opts.onPhase?.(`discovering ${d.p.name} (${++done}/${dirty.length})`);
           try {
-            const classes = await discoverTestClasses(this.shadowPath(d.p.csproj), this.shadow!.dir, true);
+            const classes = await discover(this.shadowPath(d.p.csproj), this.shadow!.dir, true);
             result[d.rel] = classes;
             cache.projects[d.rel] = { stamp: d.stamp, classes };
           } catch {
@@ -603,58 +606,4 @@ export class Runner {
     }
     return done;
   }
-}
-
-function decodeXml(s: string): string {
-  return s
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&amp;/g, "&");
-}
-
-export function parseTrx(trxPath: string): TestOutcome[] {
-  const xml = fs.readFileSync(trxPath, "utf8");
-  const parser = new XMLParser({
-    ignoreAttributes: false,
-    attributeNamePrefix: "@_",
-    processEntities: false,
-    isArray: (name) => ["UnitTestResult", "UnitTest"].includes(name),
-  });
-  const doc = parser.parse(xml);
-  const results = doc?.TestRun?.Results?.UnitTestResult ?? [];
-  const defs = doc?.TestRun?.TestDefinitions?.UnitTest ?? [];
-  const classByTestId = new Map<string, string>();
-  for (const d of defs) {
-    const id = d["@_id"];
-    const cls = d?.TestMethod?.["@_className"];
-    if (id && cls) classByTestId.set(id, String(cls).split(",")[0]);
-  }
-  const outcomes: TestOutcome[] = [];
-  for (const r of results) {
-    const testName: string = decodeXml(r["@_testName"] ?? "");
-    const cls =
-      classByTestId.get(r["@_testId"]) ??
-      testName.replace(/\(.*\)$/s, "").split(".").slice(0, -1).join(".");
-    const duration: string | undefined = r["@_duration"];
-    const outcome: string = r["@_outcome"] ?? "";
-    outcomes.push({
-      classFqn: cls,
-      method: testName,
-      passed: outcome === "Passed",
-      skipped: outcome === "NotExecuted" || outcome === "Skipped" || outcome === "Inconclusive",
-      message: r?.Output?.ErrorInfo?.Message
-        ? decodeXml(String(r.Output.ErrorInfo.Message))
-        : undefined,
-      durationMs: duration ? trxDurationToMs(duration) : undefined,
-    });
-  }
-  return outcomes;
-}
-
-function trxDurationToMs(d: string): number {
-  const m = d.match(/^(\d+):(\d+):([\d.]+)$/);
-  if (!m) return 0;
-  return (Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3])) * 1000;
 }
