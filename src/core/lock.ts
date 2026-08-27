@@ -2,22 +2,25 @@ import * as fs from "fs";
 import * as path from "path";
 import { cacheDirFor } from "./util";
 
-/** A lock this old is presumed leaked even if its pid can't be probed. */
+/** Age-based reclaim applies only when the holder pid can't be probed. */
 const STALE_MS = 15 * 60 * 1000;
 
 function isStale(file: string): boolean {
   try {
-    const st = fs.statSync(file);
-    if (Date.now() - st.mtimeMs > STALE_MS) return true;
+    // Pid liveness first: a legitimately long-running holder (cold build-map
+    // on a large repo) must never lose its lock to an age cutoff.
     const pid = Number(fs.readFileSync(file, "utf8"));
-    if (!Number.isInteger(pid) || pid <= 0) return true;
-    try {
-      process.kill(pid, 0);
-      return false; // holder is alive
-    } catch (e) {
-      // ESRCH: dead. EPERM: alive but not ours — keep waiting.
-      return (e as NodeJS.ErrnoException).code === "ESRCH";
+    if (Number.isInteger(pid) && pid > 0) {
+      try {
+        process.kill(pid, 0);
+        return false; // holder is alive, however old the lock
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === "ESRCH") return true; // dead
+        // EPERM etc.: exists but unprobeable — fall through to the age check.
+      }
     }
+    const st = fs.statSync(file);
+    return Date.now() - st.mtimeMs > STALE_MS;
   } catch {
     return false; // raced with a release; retry the acquire
   }

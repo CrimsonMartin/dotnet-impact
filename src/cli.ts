@@ -24,7 +24,7 @@
 import * as os from "os";
 import * as path from "path";
 import { cliChangedFiles } from "./core/changeset";
-import { parseCliArgs } from "./core/cliArgs";
+import { parseCliArgs, validateCommandArgs } from "./core/cliArgs";
 import { acquireShadowLock } from "./core/lock";
 import { Runner } from "./core/runner";
 import { git } from "./core/util";
@@ -41,8 +41,9 @@ async function findRepoRoot(cwd: string): Promise<string> {
 
 async function main(): Promise<number> {
   const parsed = parseCliArgs(process.argv.slice(2));
-  if (parsed.errors.length > 0) {
-    for (const e of parsed.errors) console.error(e);
+  const argErrors = [...parsed.errors, ...validateCommandArgs(parsed)];
+  if (argErrors.length > 0) {
+    for (const e of argErrors) console.error(e);
     console.error(USAGE);
     return 2;
   }
@@ -50,6 +51,16 @@ async function main(): Promise<number> {
   const runner = new Runner(repoRoot);
   const base = parsed.flags.get("--base") as string | undefined;
   const staged = parsed.flags.has("--staged");
+
+  // An explicit base the user typed must resolve; a typo'd ref in a pre-push
+  // hook must not silently select nothing and green-light the push.
+  if (base) {
+    const ok = await git(repoRoot, ["rev-parse", "--verify", "--quiet", `${base}^{commit}`]);
+    if (ok.code !== 0) {
+      console.error(`--base ${base}: unknown revision`);
+      return 2;
+    }
+  }
 
   /** File args or git-derived selection, as repo-relative-friendly paths. */
   const selectFiles = async (): Promise<string[]> =>
