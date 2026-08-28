@@ -64,6 +64,20 @@ while ((line = Console.ReadLine()) != null)
                 // corrupt the baseline the way raw binlogs (path-only) would.
                 var binlog = root.GetProperty("binlog").GetString()!;
                 var complog = root.GetProperty("complog").GetString()!;
+                // A loaded session's SolutionReader keeps its complog open
+                // (it backs the solution's lazy text loaders), and FileShare
+                // is enforced even intra-process — on Linux via advisory
+                // locks — so converting over it would fail with a sharing
+                // violation. The rebuild that produced this binlog stales
+                // those baselines anyway: evict them before rewriting.
+                foreach (var stale in projects
+                    .Where(p => string.Equals(p.Value.ComplogPath, complog, StringComparison.OrdinalIgnoreCase))
+                    .Select(p => p.Key)
+                    .ToList())
+                {
+                    projects[stale].Dispose();
+                    projects.Remove(stale);
+                }
                 // An up-to-date build skips the compiler entirely; its binlog
                 // holds zero calls and converting it would replace a good
                 // baseline with an empty one. Count first, convert only if real.
@@ -172,6 +186,8 @@ sealed class EncProject : IDisposable
         "GenericAddFieldToExistingType");
 
     public required string AssemblyName;
+    /// <summary>The complog this session was loaded from (its reader holds the file open).</summary>
+    public required string ComplogPath;
     private AdhocWorkspace _workspace = null!;
     private ImpactHotReloadService _service = null!;
     private Solution _current = null!;
@@ -266,6 +282,7 @@ sealed class EncProject : IDisposable
             AssemblyName = project.AssemblyName.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)
                 ? Path.GetFileNameWithoutExtension(project.AssemblyName)
                 : project.AssemblyName,
+            ComplogPath = complogPath,
             _workspace = workspace,
             _service = service,
             _current = solution,
