@@ -30,6 +30,12 @@ runs. Impact removes the toll booths:
   mirror of your repo, so background builds never fight your editor over
   `bin`/`obj`.
 
+Adding a **brand-new method** and calling it is still a hot patch — the test
+goes red in 48ms because the method you just wrote is already running inside
+the warm test host:
+
+![Add a new method and call it — the affected test runs the new code in 48ms, no build.](docs/demo-add-method.gif)
+
 Every run logs an honest timing line to the *Impact* output channel:
 `timing: fastpath=hit build=0ms tests=12ms total=36ms` — and when the fast path
 can't be used (a changed public signature, a rude edit), it says exactly why
