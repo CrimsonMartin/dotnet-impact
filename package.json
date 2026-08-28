@@ -1,7 +1,7 @@
 {
   "name": "impact",
   "displayName": "Impact",
-  "description": "Impact — NCrunch-style affected-test runner for .NET: static IL impact map in seconds, warm test sessions, and hot-patched sub-second test feedback on save. Includes a CLI (dotnet-impact) for pre-commit hooks and AI coding agents.",
+  "description": "Live unit testing for .NET in VS Code — save a file, affected tests go green or red in ~50ms. Hot-patched warm test hosts, IL impact map, native Test Explorer. CLI included for pre-commit hooks and AI coding agents.",
   "version": "0.1.0",
   "publisher": "crimsonmartin",
   "license": "MIT",
@@ -114,5 +114,20 @@
     "@types/vscode": "^1.90.0",
     "typescript": "^5.5.0"
   },
-  "icon": "media/icon.png"
+  "icon": "media/icon.png",
+  "keywords": [
+    "live unit testing",
+    "test",
+    "tdd",
+    "hot reload",
+    "affected tests",
+    "test impact analysis",
+    "dotnet",
+    "csharp",
+    "xunit",
+    "nunit",
+    "mstest",
+    "coverage",
+    "ncrunch"
+  ]
 }
