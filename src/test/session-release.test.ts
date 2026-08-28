@@ -76,3 +76,25 @@ test("releaseAll without a live helper is a safe no-op", async () => {
   dlls(r).add("/shadow/A.Tests/bin/A.Tests.dll");
   await r.releaseAll(); // no proc: must neither throw nor hang
 });
+
+test("release waits for an in-flight run before talking to the helper", async () => {
+  // The helper reads commands serially: a release sent mid-run sits in the
+  // stdin buffer while the caller's timeout expires, and a build proceeding
+  // on that false ack hits the very dll lock release() exists to prevent.
+  const { r, sent } = stubbedRunner();
+  dlls(r).add("/shadow/A.Tests/bin/A.Tests.dll");
+
+  let finishRun: () => void = () => undefined;
+  (r as unknown as { chain: Promise<unknown> }).chain = new Promise<void>((res) => (finishRun = res));
+
+  const releasing = r.release("/shadow/A.Tests/bin/A.Tests.dll");
+  await new Promise((res) => setImmediate(res));
+  assert.equal(sent.length, 0, "release must not be sent while a run is in flight");
+
+  finishRun();
+  await releasing;
+  assert.deepEqual(
+    sent.map((m) => m.cmd),
+    ["release"]
+  );
+});

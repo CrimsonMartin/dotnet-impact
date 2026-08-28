@@ -53,7 +53,7 @@ export class SessionRunner {
   private starting: Promise<boolean> | null = null;
   private readonly pending = new Map<
     number,
-    { tests: HelperTest[]; resolve: (r: { ok: boolean; error?: string }) => void }
+    { tests: HelperTest[]; logs: string[]; resolve: (r: { ok: boolean; error?: string }) => void }
   >();
   /** Serializes runs: the helper handles one command at a time. */
   private chain: Promise<unknown> = Promise.resolve();
@@ -206,7 +206,14 @@ export class SessionRunner {
       const line = this.buffer.slice(0, nl).trim();
       this.buffer = this.buffer.slice(nl + 1);
       if (!line) continue;
-      let msg: { id?: number; type?: string; tests?: HelperTest[]; ok?: boolean; error?: string };
+      let msg: {
+        id?: number;
+        type?: string;
+        tests?: HelperTest[];
+        ok?: boolean;
+        error?: string;
+        message?: string;
+      };
       try {
         msg = JSON.parse(line);
       } catch {
@@ -219,6 +226,7 @@ export class SessionRunner {
       const p = msg.id !== undefined ? this.pending.get(msg.id) : undefined;
       if (!p) continue;
       if (msg.type === "results" && msg.tests) p.tests.push(...msg.tests);
+      if (msg.type === "log" && msg.message) p.logs.push(msg.message);
       if (msg.type === "done") {
         this.pending.delete(msg.id!);
         p.resolve({ ok: msg.ok === true, error: msg.error });
@@ -248,8 +256,9 @@ export class SessionRunner {
       if (signal?.aborted || !this.proc) return null;
       const id = this.nextId++;
       const tests: HelperTest[] = [];
+      const logs: string[] = [];
       const done = new Promise<{ ok: boolean; error?: string }>((resolve) => {
-        this.pending.set(id, { tests, resolve });
+        this.pending.set(id, { tests, logs, resolve });
       });
       const onAbort = () => {
         // No per-run cancel in the protocol: kill the helper; it respawns next run.
@@ -285,7 +294,8 @@ export class SessionRunner {
       return {
         ok: res.ok && outcomes.every((o) => o.passed || o.skipped),
         outcomes,
-        output: "",
+        // Testhost console output, so failure diagnostics match dotnet test.
+        output: logs.length > 0 ? logs.join("\n") + "\n" : "",
       };
     });
     this.chain = task.catch(() => undefined);
@@ -295,19 +305,30 @@ export class SessionRunner {
   /** Every dll a session was ever started for; the release-all sweep target. */
   private readonly sessionDlls = new Set<string>();
 
-  /** Stop the session holding `dll` so a rebuild can overwrite it (Windows locks). */
+  /**
+   * Stop the session holding `dll` so a rebuild can overwrite it (Windows
+   * locks). Serialized on the command chain: a release issued while a run is
+   * in flight must wait for that run — the helper only reads the next command
+   * afterwards, and a caller that proceeds to build before the host actually
+   * let go would hit the very dll lock this exists to prevent.
+   */
   async release(dll: string): Promise<void> {
     if (!this.proc || !this.ready) return;
     this.sessionDlls.delete(dll);
-    const id = this.nextId++;
-    const done = new Promise<{ ok: boolean }>((resolve) => {
-      this.pending.set(id, { tests: [], resolve });
+    const task = this.chain.then(async () => {
+      if (!this.proc) return;
+      const id = this.nextId++;
+      const done = new Promise<{ ok: boolean }>((resolve) => {
+        this.pending.set(id, { tests: [], logs: [], resolve });
+      });
+      this.send({ id, cmd: "release", dll });
+      let timer: NodeJS.Timeout | undefined;
+      await Promise.race([done, new Promise((r) => (timer = setTimeout(r, 10_000)))]);
+      clearTimeout(timer);
+      this.pending.delete(id); // a timed-out release must not leak its entry
     });
-    this.send({ id, cmd: "release", dll });
-    let timer: NodeJS.Timeout | undefined;
-    await Promise.race([done, new Promise((r) => (timer = setTimeout(r, 5000)))]);
-    clearTimeout(timer);
-    this.pending.delete(id); // a timed-out release must not leak its entry
+    this.chain = task.catch(() => undefined);
+    await task;
   }
 
   /**

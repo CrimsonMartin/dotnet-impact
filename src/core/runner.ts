@@ -21,7 +21,7 @@ import {
   testProjects,
 } from "./projects";
 import { ImpactMap } from "./map";
-import { findBuiltDll, StaticMapper } from "./staticmap";
+import { findBuiltDll, findBuiltDlls, StaticMapper } from "./staticmap";
 import { parseTrx, TestOutcome } from "./trx";
 import { cacheDirFor, classFilter, exec, git, parseStatusZ, toRepoRelative } from "./util";
 import type { SessionRunner } from "./vstestSession";
@@ -81,14 +81,14 @@ export class Runner {
     );
   }
 
-  /** Newest built test dll for a repo-relative csproj, inside the shadow. */
-  private findTestDll(csprojRel: string): string | undefined {
+  /** All built test dlls (one per TFM) for a repo-relative csproj. */
+  private findTestDlls(csprojRel: string): string[] {
     const graph = this.projectGraph();
     const info = [...graph.projects.values()].find(
       (p) => toRepoRelative(this.repoRoot, p.csproj).toLowerCase() === csprojRel.toLowerCase()
     );
-    if (!info) return undefined;
-    return findBuiltDll(this.shadow!.dir, info, this.repoRoot);
+    if (!info) return [];
+    return findBuiltDlls(this.shadow!.dir, info, this.repoRoot);
   }
 
   async prepare(): Promise<Shadow> {
@@ -432,19 +432,22 @@ export class Runner {
     }
     fs.writeFileSync(binlogsPath, JSON.stringify(binlogs));
 
-    // Fan changed dependency outputs into each test project's output dir.
+    // Fan changed dependency outputs into each test project's output dirs
+    // (one per TFM for multi-targeted test projects).
     for (const rel of testRels) {
-      const testDll = this.findTestDll(rel);
-      if (!testDll) return false;
-      const outDir = path.dirname(testDll);
-      for (const info of order) {
-        if (testRels.has(toRepoRelative(this.repoRoot, info.csproj))) continue; // built its own output
-        const depDll = findBuiltDll(this.shadow!.dir, info, this.repoRoot);
-        if (!depDll) continue;
-        for (const ext of [".dll", ".pdb"]) {
-          const src = depDll.replace(/\.dll$/i, ext);
-          const dst = path.join(outDir, path.basename(src));
-          if (fs.existsSync(src) && fs.existsSync(dst)) fs.copyFileSync(src, dst);
+      const testDlls = this.findTestDlls(rel);
+      if (testDlls.length === 0) return false;
+      for (const testDll of testDlls) {
+        const outDir = path.dirname(testDll);
+        for (const info of order) {
+          if (testRels.has(toRepoRelative(this.repoRoot, info.csproj))) continue; // built its own output
+          const depDll = findBuiltDll(this.shadow!.dir, info, this.repoRoot);
+          if (!depDll) continue;
+          for (const ext of [".dll", ".pdb"]) {
+            const src = depDll.replace(/\.dll$/i, ext);
+            const dst = path.join(outDir, path.basename(src));
+            if (fs.existsSync(src) && fs.existsSync(dst)) fs.copyFileSync(src, dst);
+          }
         }
       }
     }
@@ -556,13 +559,27 @@ export class Runner {
     ]);
 
     const runInvocation = async (inv: { rel: string; filter?: string }) => {
-      // Preferred: warm test session (milliseconds of dispatch). Falls back to
-      // dotnet test on any unavailability.
+      // Preferred: warm test sessions (milliseconds of dispatch) — one per
+      // built TFM, so multi-targeted test projects run every framework, same
+      // as `dotnet test` would. Falls back to dotnet test on any
+      // unavailability (which also covers every TFM).
       if (this.sessions?.available) {
-        const dll = this.findTestDll(inv.rel);
-        if (dll) {
+        const dlls = this.findTestDlls(inv.rel);
+        const results = [];
+        for (const dll of dlls) {
           const r = await this.sessions.runFilter(dll, inv.filter, signal);
-          if (r) return { ok: r.ok, outcomes: r.outcomes, output: r.output };
+          if (!r) {
+            results.length = 0;
+            break; // any session miss: run the whole invocation via dotnet test
+          }
+          results.push(r);
+        }
+        if (dlls.length > 0 && results.length === dlls.length) {
+          return {
+            ok: results.every((r) => r.ok),
+            outcomes: results.flatMap((r) => r.outcomes),
+            output: results.map((r) => r.output).join(""),
+          };
         }
       }
       return this.dotnetTest(

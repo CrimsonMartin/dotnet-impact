@@ -36,6 +36,38 @@ export function findBuiltDll(rootDir: string, info: ProjectInfo, repoRoot: strin
 }
 
 /**
+ * All built copies of a project's assembly, one (the newest) per target
+ * framework directory. Multi-TFM test projects build one dll per TFM; running
+ * only the newest-built one silently skips the other framework's tests.
+ */
+export function findBuiltDlls(rootDir: string, info: ProjectInfo, repoRoot: string): string[] {
+  const rel = path.relative(repoRoot, info.dir);
+  const binDir = path.join(rootDir, rel, "bin");
+  const bestPerTfm = new Map<string, { p: string; mtime: number }>();
+  const walk = (d: string, depth: number) => {
+    if (depth > 4) return;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory() && e.name.toLowerCase() !== "ref") walk(p, depth + 1);
+      else if (e.isFile() && e.name.toLowerCase() === `${info.assemblyName.toLowerCase()}.dll`) {
+        const tfm = path.basename(path.dirname(p)).toLowerCase();
+        const mtime = fs.statSync(p).mtimeMs;
+        const best = bestPerTfm.get(tfm);
+        if (!best || mtime > best.mtime) bestPerTfm.set(tfm, { p, mtime });
+      }
+    }
+  };
+  walk(binDir, 0);
+  return [...bestPerTfm.values()].map((b) => b.p).sort();
+}
+
+/**
  * Build (once) and run the ImpactStaticMap helper: reads the built assemblies'
  * IL metadata + portable PDBs and returns each test class's transitive
  * type-reference closure as source files. Requires the shadow to be built.
