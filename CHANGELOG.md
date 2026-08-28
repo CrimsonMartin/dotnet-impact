@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.4
+
+- Fixed a race that could abort a full run with "file not found" (most likely
+  on Windows): scanning for built test dlls while MSBuild was still replacing
+  outputs threw when a dll vanished between the directory listing and its
+  stat. A vanished file is now treated as absent, and a dependency copy that
+  loses the same race is skipped with a log line instead of failing the run.
+
 ## 0.2.3
 
 - Test Explorer no longer shows duplicate, empty project entries when the repo
