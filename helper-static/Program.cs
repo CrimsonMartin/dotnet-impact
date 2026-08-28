@@ -22,10 +22,12 @@ using System.Reflection.PortableExecutable;
 using System.Text.Json;
 
 string? repoRoot = null, assembliesPath = null;
+var godPercent = 30; // cap expansion through types referenced by >=N% of all types
 for (int i = 0; i < args.Length - 1; i++)
 {
     if (args[i] == "--repo-root") repoRoot = args[i + 1];
     if (args[i] == "--assemblies") assembliesPath = args[i + 1];
+    if (args[i] == "--god-percent") godPercent = int.Parse(args[i + 1]);
 }
 if (repoRoot == null || assembliesPath == null)
 {
@@ -67,6 +69,77 @@ foreach (var node in world.Values)
     }
 }
 
+// Name-graph union for enum / const-holder types: consumers inline their
+// values, so the consumer IL carries no TypeRef and the defining file is
+// invisible to the closure. Bridge with a source-text pass: any node whose
+// own source mentions the candidate's name gets an edge to it.
+var nameCandidates = world.Values
+    .Where(n => (n.IsEnum || n.IsConstOnly) && n.Files.Count > 0)
+    .Select(n =>
+    {
+        var shortName = n.Fqn[(n.Fqn.LastIndexOf('.') + 1)..];
+        return (Node: n, ShortName: shortName);
+    })
+    .Where(c => c.ShortName.Length >= 3 && !c.ShortName.Contains('<'))
+    .ToList();
+if (nameCandidates.Count > 0)
+{
+    var fileText = new Dictionary<string, string>(StringComparer.Ordinal);
+    string TextOf(string rel)
+    {
+        if (fileText.TryGetValue(rel, out var t)) return t;
+        try
+        {
+            t = File.ReadAllText(Path.Combine(repoRoot!, rel));
+        }
+        catch
+        {
+            t = "";
+        }
+        return fileText[rel] = t;
+    }
+    static bool MentionsWord(string text, string word)
+    {
+        for (var at = text.IndexOf(word, StringComparison.Ordinal); at >= 0;
+             at = text.IndexOf(word, at + 1, StringComparison.Ordinal))
+        {
+            var before = at == 0 ? '\0' : text[at - 1];
+            var afterIx = at + word.Length;
+            var after = afterIx >= text.Length ? '\0' : text[afterIx];
+            if (!char.IsLetterOrDigit(before) && before != '_' && !char.IsLetterOrDigit(after) && after != '_')
+                return true;
+        }
+        return false;
+    }
+    foreach (var node in world.Values)
+    {
+        foreach (var (candidate, shortName) in nameCandidates)
+        {
+            if (candidate == node || node.Edges.Contains(candidate)) continue;
+            if (node.Files.Any(f => !candidate.Files.Contains(f) && MentionsWord(TextOf(f), shortName)))
+                node.Edges.Add(candidate);
+        }
+    }
+}
+
+// God-type cap: a hub type referenced by a large share of the world drags its
+// entire dependency fan into every closure (~7x over-selection measured on a
+// real repo). Keep the hub's OWN files in closures but stop transitive
+// expansion through it. Safe: files that become unmapped fall back to
+// project-level selection at the runner, which only ever runs MORE tests.
+var capped = new HashSet<TypeNode>();
+if (world.Count >= 20)
+{
+    var referrers = new Dictionary<TypeNode, int>();
+    foreach (var node in world.Values)
+        foreach (var e in node.Edges)
+            referrers[e] = referrers.GetValueOrDefault(e) + 1;
+    var threshold = Math.Max(10, world.Count * godPercent / 100);
+    foreach (var (node, count) in referrers)
+        if (count >= threshold && !node.IsTestClass)
+            capped.Add(node);
+}
+
 // BFS closure per test class -> file union.
 var classes = new Dictionary<string, object>();
 foreach (var tc in testClasses)
@@ -79,6 +152,7 @@ foreach (var tc in testClasses)
     {
         var n = queue.Dequeue();
         foreach (var f in n.Files) files.Add(f);
+        if (capped.Contains(n) && n != tc) continue; // hub: files yes, fan-out no
         foreach (var e in n.Edges)
         {
             if (seen.Add(e)) queue.Enqueue(e);
@@ -87,7 +161,12 @@ foreach (var tc in testClasses)
     classes[tc.Fqn] = new { csproj = tc.Csproj, files = files.ToArray() };
 }
 
-Console.WriteLine(JsonSerializer.Serialize(new { classes, skipped }));
+Console.WriteLine(JsonSerializer.Serialize(new
+{
+    classes,
+    skipped,
+    capped = capped.Select(c => c.Fqn).OrderBy(f => f, StringComparer.Ordinal).ToArray(),
+}));
 return 0;
 
 void LoadAssembly(AssemblyInput input)
@@ -171,13 +250,18 @@ void LoadAssembly(AssemblyInput input)
             collector.AddEntity(md.GetInterfaceImplementation(impl).Interface);
         foreach (var cah in td.GetCustomAttributes()) collector.AddAttribute(cah);
 
+        int fieldCount = 0;
+        bool allFieldsLiteral = true;
         foreach (var fh in td.GetFields())
         {
             var fd = md.GetFieldDefinition(fh);
             fd.DecodeSignature(collector, null);
+            fieldCount++;
+            if ((fd.Attributes & System.Reflection.FieldAttributes.Literal) == 0) allFieldsLiteral = false;
         }
 
         bool isTestClass = false;
+        bool anyMethodBody = false;
         foreach (var mh in td.GetMethods())
         {
             var m = md.GetMethodDefinition(mh);
@@ -195,6 +279,7 @@ void LoadAssembly(AssemblyInput input)
             // Method body: every metadata token operand (calls, fields, typeof, newobj...).
             if (m.RelativeVirtualAddress > 0)
             {
+                anyMethodBody = true;
                 try
                 {
                     var body = pe.GetMethodBody(m.RelativeVirtualAddress);
@@ -224,6 +309,46 @@ void LoadAssembly(AssemblyInput input)
                     /* no debug info for this method */
                 }
             }
+        }
+
+        // Types with no method bodies (enums, const holders, interfaces) have
+        // no sequence points; Roslyn records their source files in the
+        // TypeDefinitionDocuments custom debug info instead.
+        if (pdb != null && node.Files.Count == 0)
+        {
+            try
+            {
+                foreach (var cdih in pdb.GetCustomDebugInformation((EntityHandle)tdh))
+                {
+                    var cdi = pdb.GetCustomDebugInformation(cdih);
+                    if (pdb.GetGuid(cdi.Kind) != TypeDefinitionDocumentsGuid) continue;
+                    var blob = pdb.GetBlobReader(cdi.Value);
+                    while (blob.RemainingBytes > 0)
+                    {
+                        var dh = MetadataTokens.DocumentHandle(blob.ReadCompressedInteger());
+                        if (docPaths.TryGetValue(dh, out var rel) && rel != null) node.Files.Add(rel);
+                    }
+                }
+            }
+            catch
+            {
+                /* absent or malformed: node simply keeps no files */
+            }
+        }
+
+        // Enum / const-holder detection for the name-graph union: consumers
+        // inline these types' values, leaving no IL reference. Top-level
+        // types only (nested fold upward and would mislabel their parent).
+        if (td.GetDeclaringType().IsNil)
+        {
+            var baseIsEnum = false;
+            if (td.BaseType.Kind == HandleKind.TypeReference)
+            {
+                var btr = md.GetTypeReference((TypeReferenceHandle)td.BaseType);
+                baseIsEnum = md.GetString(btr.Name) == "Enum" && md.GetString(btr.Namespace) == "System";
+            }
+            node.IsEnum = baseIsEnum;
+            node.IsConstOnly = fieldCount > 0 && allFieldsLiteral && !anyMethodBody;
         }
 
         // A [Fact] on a nested class marks the top-level node; skip compiler-generated.
@@ -359,6 +484,12 @@ static void ScanIl(MetadataReader md, byte[] il, RefCollector collector)
     }
 }
 
+partial class Program
+{
+    /// <summary>Portable-PDB custom debug info: source documents of a type with no method bodies.</summary>
+    internal static readonly Guid TypeDefinitionDocumentsGuid = new("932E74BC-DBA9-4478-8D46-0F32A7BAB3D3");
+}
+
 record AssemblyInput(string Csproj, string Dll, bool IsTest);
 
 sealed class TypeNode
@@ -366,6 +497,8 @@ sealed class TypeNode
     public required string Fqn;
     public required string Csproj;
     public bool IsTestClass;
+    public bool IsEnum;
+    public bool IsConstOnly;
     public readonly HashSet<string> Files = new(StringComparer.Ordinal);
     public readonly HashSet<string> RefNames = new(StringComparer.Ordinal);
     public readonly HashSet<TypeNode> Edges = new();
