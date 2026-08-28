@@ -1,12 +1,8 @@
 import * as assert from "node:assert/strict";
-import { spawn, execFileSync } from "node:child_process";
-import * as crypto from "node:crypto";
-import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
+import { spawn } from "node:child_process";
 import * as readline from "node:readline";
 import { test } from "node:test";
-import { resolveDotnet } from "../core/util";
+import { builtHelper, dotnetOrNull } from "./deltas-helper";
 
 /**
  * Unit tests for the delta service's API guard, driven through the helper's
@@ -23,48 +19,6 @@ import { resolveDotnet } from "../core/util";
  * edits, added members — passes through to the engine.
  */
 
-const HELPER_SRC = path.join(__dirname, "../../helper-deltas");
-const ENC_SRC = path.join(__dirname, "../../helper-enc");
-
-function dotnetOrNull(): string | null {
-  try {
-    const dotnet = resolveDotnet();
-    execFileSync(dotnet, ["--version"], { stdio: "pipe", timeout: 30_000 });
-    return dotnet;
-  } catch {
-    return null;
-  }
-}
-
-/** Build the helper into a stamped tmp cache (rebuilds only on source change). */
-function builtHelper(dotnet: string): string {
-  const bin = path.join(os.tmpdir(), "impact-guard-test-bin");
-  const dll = path.join(bin, "ImpactDeltas.dll");
-  const stampFile = path.join(bin, ".source-stamp");
-  const src = [HELPER_SRC, ENC_SRC]
-    .flatMap((dir) =>
-      fs
-        .readdirSync(dir)
-        .filter((f) => f.endsWith(".cs") || f.endsWith(".csproj") || f.endsWith(".snk"))
-        .sort()
-        .map((f) => fs.readFileSync(path.join(dir, f)).toString("base64"))
-    )
-    .join("\n");
-  const want = crypto.createHash("sha1").update(src).digest("hex");
-  try {
-    if (fs.existsSync(dll) && fs.readFileSync(stampFile, "utf8") === want) return dll;
-  } catch {
-    /* rebuild */
-  }
-  execFileSync(
-    dotnet,
-    ["build", path.join(HELPER_SRC, "ImpactDeltas.csproj"), "-c", "Release", "-o", bin, "--nologo", "-v", "quiet"],
-    { stdio: "pipe", timeout: 300_000, env: { ...process.env, MSBUILDTERMINALLOGGER: "off" } }
-  );
-  fs.writeFileSync(stampFile, want);
-  return dll;
-}
-
 interface GuardReply {
   ok: boolean;
   reason?: string;
@@ -76,7 +30,7 @@ async function withGuard(
 ): Promise<void> {
   const dotnet = dotnetOrNull();
   if (!dotnet) return; // no SDK on this machine: nothing to test against
-  const dll = builtHelper(dotnet);
+  const dll = await builtHelper(dotnet);
   const proc = spawn(dotnet, [dll], { stdio: ["pipe", "pipe", "pipe"] });
   const rl = readline.createInterface({ input: proc.stdout });
   const pending = new Map<number, (r: GuardReply) => void>();
