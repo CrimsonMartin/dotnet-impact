@@ -83,7 +83,9 @@ while ((line = Console.ReadLine()) != null)
                 var oldText = root.GetProperty("old").GetString()!;
                 var newText = root.GetProperty("new").GetString()!;
                 var removed = ApiGuard.RemovedVisibleDeclaration(oldText, newText);
+                var addedTest = removed == null ? ApiGuard.AddedTestMethod(oldText, newText) : null;
                 if (removed != null) Emit(new { id, type = "done", ok = false, reason = $"api change: {removed}" });
+                else if (addedTest != null) Emit(new { id, type = "done", ok = false, reason = $"new test method: {addedTest}" });
                 else Emit(new { id, type = "done", ok = true });
                 break;
             }
@@ -290,6 +292,14 @@ sealed class EncProject : IDisposable
         if (removed != null)
             return (null, $"api change: {removed} removed or signature changed — dependents must rebuild");
 
+        // A brand-new test method hot-patches cleanly but invisibly: the test
+        // runner discovers tests from the assembly on disk (a fresh testhost
+        // enumerates the un-patched dll), so the new [Fact] would neither run
+        // nor appear in the tree. Only a rebuild makes it discoverable.
+        var addedTest = ApiGuard.AddedTestMethod(oldText, text.ToString());
+        if (addedTest != null)
+            return (null, $"new test method: {addedTest} — rebuilding so the test runner discovers it");
+
         var updated = _current.WithDocumentText(docId, text);
 
         var updates = await _service.GetUpdatesAsync(
@@ -392,6 +402,46 @@ static class ApiGuard
             if (!newKeys.Contains(key))
                 return key;
         return null;
+    }
+
+    /// <summary>Attributes that make a method a discoverable test (xUnit, NUnit, MSTest).</summary>
+    private static readonly HashSet<string> TestAttributes = new(StringComparer.Ordinal)
+    {
+        "Fact", "Theory",                       // xUnit
+        "Test", "TestCase", "TestCaseSource",   // NUnit
+        "TestMethod", "DataTestMethod",         // MSTest
+    };
+
+    /// <summary>
+    /// Name of the first test-attributed method present in the new source but
+    /// not the old, or null. A hot patch would run such a method fine — but
+    /// the test runner discovers tests from the assembly on disk, so it would
+    /// never be scheduled; only a rebuild surfaces it (issue #12).
+    /// </summary>
+    public static string? AddedTestMethod(string oldSource, string newSource)
+    {
+        var oldTests = TestMethodNames(CSharpSyntaxTree.ParseText(oldSource));
+        foreach (var name in TestMethodNames(CSharpSyntaxTree.ParseText(newSource)))
+            if (!oldTests.Contains(name))
+                return name;
+        return null;
+    }
+
+    private static HashSet<string> TestMethodNames(SyntaxTree tree)
+    {
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var m in tree.GetRoot().DescendantNodes()
+                     .OfType<Microsoft.CodeAnalysis.CSharp.Syntax.MethodDeclarationSyntax>())
+        {
+            var isTest = m.AttributeLists
+                .SelectMany(l => l.Attributes)
+                .Select(a => a.Name.ToString().Split('.').Last())
+                .Any(n => TestAttributes.Contains(n)
+                    || (n.EndsWith("Attribute", StringComparison.Ordinal)
+                        && TestAttributes.Contains(n[..^"Attribute".Length])));
+            if (isTest) names.Add(m.Identifier.Text);
+        }
+        return names;
     }
 
     private static HashSet<string> DeclarationKeys(SyntaxTree tree)
