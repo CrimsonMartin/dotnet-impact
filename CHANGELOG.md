@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.3
+
+- Test Explorer no longer shows duplicate, empty project entries when the repo
+  contains git worktrees (e.g. Claude Code's `.claude/worktrees/`) or nested
+  clones — the project scan now stays out of directories that are their own
+  git repository.
+- Non-`.cs` saves after a rebuild no longer fail with "complog … being used by
+  another process": snapshot evicts the warm EnC session holding the old
+  baseline before rewriting it, so the fast path recovers instead of falling
+  back to full builds forever.
+- Static impact map: enum and const-only files now map to the tests that use
+  them (name-graph union), with a god-type cap to keep hub types from pulling
+  in everything.
+- Session runner correctness: abandoned test-host starts are swept, helper
+  logs are forwarded, and multi-TFM test projects run every framework's tests.
+
 ## 0.2.2
 
 - Adding a new test method (`[Fact]`, `[Theory]`, NUnit, MSTest) now takes one
