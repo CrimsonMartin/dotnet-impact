@@ -76,6 +76,29 @@ static DateTime FreshnessToken(string dll)
     return newest;
 }
 
+// Session starts that timed out but may still complete later; swept on the
+// main loop so a late-arriving testhost is stopped instead of leaked.
+var abandonedStarts = new List<SessionHandler>();
+
+void SweepAbandoned()
+{
+    for (var i = abandonedStarts.Count - 1; i >= 0; i--)
+    {
+        var h = abandonedStarts[i];
+        if (!h.Done.IsSet) continue;
+        abandonedStarts.RemoveAt(i);
+        if (h.Info != null)
+            try
+            {
+                wrapper.StopTestSession(h.Info, new SessionHandler());
+            }
+            catch
+            {
+                /* best effort */
+            }
+    }
+}
+
 TestSessionInfo? EnsureSession(string dll)
 {
     var mtime = FreshnessToken(dll);
@@ -86,7 +109,13 @@ TestSessionInfo? EnsureSession(string dll)
     }
     var handler = new SessionHandler();
     wrapper.StartTestSession(new[] { dll }, RunSettings, handler);
-    handler.Done.Wait(TimeSpan.FromSeconds(60));
+    if (!handler.Done.Wait(TimeSpan.FromSeconds(60)))
+    {
+        // The platform may still finish this start later; track it so the
+        // eventual testhost is stopped rather than leaked untracked.
+        abandonedStarts.Add(handler);
+        return null;
+    }
     if (handler.Info == null) return null; // platform refused; caller runs sessionless
     sessions[dll] = (handler.Info, mtime);
     return handler.Info;
@@ -113,6 +142,7 @@ while ((line = Console.ReadLine()) != null)
     int id = 0;
     try
     {
+        SweepAbandoned();
         using var doc = JsonDocument.Parse(line);
         var root = doc.RootElement;
         id = root.TryGetProperty("id", out var idEl) ? idEl.GetInt32() : 0;
@@ -241,6 +271,10 @@ sealed class RunHandler : ITestRunEventsHandler
 
     public void HandleLogMessage(TestMessageLevel level, string? message)
     {
+        if (string.IsNullOrWhiteSpace(message)) return;
+        // Forward testhost console output (informational) and warnings/errors
+        // to the client so failure diagnostics match the dotnet-test path.
+        _emit(new { id = _id, type = "log", message = message.TrimEnd() });
         if (level == TestMessageLevel.Error) Console.Error.WriteLine($"[vstest] {message}");
     }
 
