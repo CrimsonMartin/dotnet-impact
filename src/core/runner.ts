@@ -446,7 +446,15 @@ export class Runner {
           for (const ext of [".dll", ".pdb"]) {
             const src = depDll.replace(/\.dll$/i, ext);
             const dst = path.join(outDir, path.basename(src));
-            if (fs.existsSync(src) && fs.existsSync(dst)) fs.copyFileSync(src, dst);
+            if (fs.existsSync(src) && fs.existsSync(dst)) {
+              try {
+                fs.copyFileSync(src, dst);
+              } catch (e) {
+                // src replaced mid-copy, or dst still held by a testhost
+                // (Windows): the run proceeds on dst's existing copy.
+                this.logSink(`dep copy skipped for ${path.basename(dst)}: ${(e as Error).message}`);
+              }
+            }
           }
         }
       }

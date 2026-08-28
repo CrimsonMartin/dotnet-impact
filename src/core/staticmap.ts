@@ -26,7 +26,14 @@ export function findBuiltDll(rootDir: string, info: ProjectInfo, repoRoot: strin
       const p = path.join(d, e.name);
       if (e.isDirectory() && e.name.toLowerCase() !== "ref") walk(p, depth + 1);
       else if (e.isFile() && e.name.toLowerCase() === `${info.assemblyName.toLowerCase()}.dll`) {
-        const mtime = fs.statSync(p).mtimeMs;
+        // A build may replace the dll between readdir and stat; a vanished
+        // file is absent, not fatal.
+        let mtime: number;
+        try {
+          mtime = fs.statSync(p).mtimeMs;
+        } catch {
+          continue;
+        }
         if (!best || mtime > best.mtime) best = { p, mtime };
       }
     }
@@ -57,7 +64,12 @@ export function findBuiltDlls(rootDir: string, info: ProjectInfo, repoRoot: stri
       if (e.isDirectory() && e.name.toLowerCase() !== "ref") walk(p, depth + 1);
       else if (e.isFile() && e.name.toLowerCase() === `${info.assemblyName.toLowerCase()}.dll`) {
         const tfm = path.basename(path.dirname(p)).toLowerCase();
-        const mtime = fs.statSync(p).mtimeMs;
+        let mtime: number;
+        try {
+          mtime = fs.statSync(p).mtimeMs;
+        } catch {
+          continue; // replaced between readdir and stat
+        }
         const best = bestPerTfm.get(tfm);
         if (!best || mtime > best.mtime) bestPerTfm.set(tfm, { p, mtime });
       }
