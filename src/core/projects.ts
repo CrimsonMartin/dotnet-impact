@@ -22,6 +22,19 @@ export interface ProjectGraph {
 
 const SKIP_DIRS = new Set(["bin", "obj", "node_modules", ".git", ".vs", ".impact", "packages"]);
 
+/**
+ * A subdirectory with its own `.git` entry (a directory for a nested clone, a
+ * file for a worktree or submodule) is a different repository: its csproj
+ * copies are not this repo's projects, and the shadow worktree never contains
+ * its files, so anything found there could never build or run. Claude Code
+ * keeps worktrees at `.claude/worktrees/<name>/` inside the repo — scanning
+ * them produced one duplicate, forever-childless Test Explorer project node
+ * per worktree.
+ */
+function isNestedRepo(dir: string): boolean {
+  return fs.existsSync(path.join(dir, ".git"));
+}
+
 function findCsprojFiles(root: string): string[] {
   const out: string[] = [];
   const walk = (dir: string) => {
@@ -33,7 +46,8 @@ function findCsprojFiles(root: string): string[] {
     }
     for (const e of entries) {
       if (e.isDirectory()) {
-        if (!SKIP_DIRS.has(e.name.toLowerCase())) walk(path.join(dir, e.name));
+        const p = path.join(dir, e.name);
+        if (!SKIP_DIRS.has(e.name.toLowerCase()) && !isNestedRepo(p)) walk(p);
       } else if (e.name.endsWith(".csproj")) {
         out.push(path.join(dir, e.name));
       }
@@ -165,7 +179,8 @@ export function sourceStamp(projectDir: string): string {
     }
     for (const e of entries) {
       if (e.isDirectory()) {
-        if (!SKIP_DIRS.has(e.name.toLowerCase())) walk(path.join(dir, e.name));
+        const p = path.join(dir, e.name);
+        if (!SKIP_DIRS.has(e.name.toLowerCase()) && !isNestedRepo(p)) walk(p);
       } else if (STAMP_FILE_RE.test(e.name)) {
         count++;
         try {
