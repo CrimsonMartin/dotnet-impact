@@ -244,25 +244,22 @@ sealed class EncProject : IDisposable
                 foreach (var docu in solution.GetProject(project.Id)!.Documents)
                     if (docu.FilePath != null && byPath.TryGetValue(docu.FilePath, out var text))
                         solution = solution.WithDocumentText(docu.Id, text);
-                if (Environment.GetEnvironmentVariable("IMPACT_ENC_DEBUG") == "1")
+                // The dll may postdate the complog: any build that bypasses the
+                // snapshot path (test discovery's solution build, a manual
+                // dotnet build) rewrites outputs without refreshing the
+                // baseline. The engine then treats every baseline document as
+                // out-of-sync and reports each edit as "no changes" — the
+                // caller would keep running the stale assembly GREEN. Compare
+                // the complog texts' checksums against the PDB that shipped
+                // with the dll and refuse the pair outright: the build path
+                // rebuilds and re-snapshots, restoring a matched baseline.
+                var stale = StaleBaselineFile(dll, byPath);
+                if (stale != null)
                 {
-                    var pdbPath = Path.ChangeExtension(dll, ".pdb");
-                    if (File.Exists(pdbPath))
-                    {
-                        using var pdbStream = File.OpenRead(pdbPath);
-                        using var provider = System.Reflection.Metadata.MetadataReaderProvider.FromPortablePdbStream(pdbStream);
-                        var pdbReader = provider.GetMetadataReader();
-                        foreach (var dh in pdbReader.Documents)
-                        {
-                            var d = pdbReader.GetDocument(dh);
-                            var name = pdbReader.GetString(d.Name);
-                            var hash = Convert.ToHexString(pdbReader.GetBlobBytes(d.Hash))[..12];
-                            var mine = byPath.TryGetValue(name, out var t)
-                                ? Convert.ToHexString(t.GetChecksum().ToArray()).PadRight(12)[..12]
-                                : "<no tree>";
-                            Console.Error.WriteLine($"[enc] {Path.GetFileName(name)}: pdb={hash} text={mine}");
-                        }
-                    }
+                    workspace.Dispose();
+                    reader.Dispose();
+                    return (null, $"baseline mismatch: {stale} differs between the built pdb and the complog "
+                        + "— dll and complog come from different builds; rebuild needed");
                 }
             }
         }
@@ -326,6 +323,16 @@ sealed class EncProject : IDisposable
 
         if (updates.Status == ImpactHotReloadService.Status.NoChangesToApply)
         {
+            // "No changes" with an ENC diagnostic is not a semantic no-op —
+            // it's the engine refusing to see the document (out-of-sync
+            // baseline, ENC1005/1008). Reporting it as benign would let the
+            // caller keep running the stale assembly green; force the build
+            // path instead. The reason must NOT start with "no-op".
+            var enc = updates.PersistentDiagnostics
+                .Concat(updates.TransientDiagnostics.SelectMany(t => t.diagnostics))
+                .FirstOrDefault(d => d.Id.StartsWith("ENC", StringComparison.Ordinal));
+            if (enc != null)
+                return (null, $"stale baseline ({enc.Id}: {enc.GetMessage()}) — rebuild needed");
             _current = updated;
             var diag = updates.PersistentDiagnostics.FirstOrDefault()
                 ?? updates.TransientDiagnostics.SelectMany(t => t.diagnostics).FirstOrDefault();
@@ -361,6 +368,39 @@ sealed class EncProject : IDisposable
         _service.CommitUpdate();
         _current = updated;
         return ((u.MetadataDelta.ToArray(), u.ILDelta.ToArray(), u.PdbDelta.ToArray()), "");
+    }
+
+    /// <summary>
+    /// First complog document whose checksum disagrees with the dll's portable
+    /// PDB (file name only), or null when the pair is coherent. A missing or
+    /// unreadable PDB verifies nothing — the engine surfaces its own error at
+    /// the first delta and the caller falls back to the build path anyway.
+    /// </summary>
+    private static string? StaleBaselineFile(string dll, Dictionary<string, SourceText> byPath)
+    {
+        try
+        {
+            var pdbPath = Path.ChangeExtension(dll, ".pdb");
+            if (!File.Exists(pdbPath)) return null;
+            using var pdbStream = File.OpenRead(pdbPath);
+            using var provider = System.Reflection.Metadata.MetadataReaderProvider.FromPortablePdbStream(pdbStream);
+            var pdbReader = provider.GetMetadataReader();
+            foreach (var dh in pdbReader.Documents)
+            {
+                var d = pdbReader.GetDocument(dh);
+                var name = pdbReader.GetString(d.Name);
+                if (!byPath.TryGetValue(name, out var text)) continue; // generated/foreign doc
+                var pdbHash = Convert.ToHexString(pdbReader.GetBlobBytes(d.Hash));
+                var textHash = Convert.ToHexString(text.GetChecksum().ToArray());
+                if (!string.Equals(pdbHash, textHash, StringComparison.OrdinalIgnoreCase))
+                    return Path.GetFileName(name);
+            }
+            return null;
+        }
+        catch
+        {
+            return null; // unreadable pdb: let the engine report it on first use
+        }
     }
 
     private DocumentId? FindDocument(string file)

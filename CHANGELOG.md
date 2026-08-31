@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.2.7
+
+- Fixed a save that could stay silently GREEN after a breaking edit. Any
+  build that bypassed the baseline snapshot (test discovery's solution
+  build, a manual `dotnet build`) rewrote the shadow dll+pdb while the fast
+  path kept loading the previous complog; Roslyn's EnC engine then held
+  every baseline document out-of-sync and answered each edit with "no
+  changes to apply", which the runner treated as a benign no-op — saves
+  reported `fastpath=hit ... 0 delta(s)` while warm testhosts kept running
+  the pre-edit assembly. The delta service now verifies the complog's
+  source checksums against the dll's PDB at load and refuses a mismatched
+  pair ("baseline mismatch"), a "no changes" verdict carrying an ENC
+  diagnostic is refused instead of swallowed, and no-op saves log the
+  engine's reason. Refusals fall to the build path, which rebuilds and
+  re-snapshots a coherent baseline. Regression-tested at both layers: the
+  mismatched-pair refusal in the delta service, and the full README-gif
+  scenario (real git repo, real builds, warm testhosts) asserting a
+  breaking edit always turns the affected test red.
+
+- New README demo GIFs, re-recorded with the mouse cursor parked out of the
+  way of the edits.
+
 ## 0.2.6
 
 - Fixed stale assemblies after an edit raced the shadow sync (#16): a save

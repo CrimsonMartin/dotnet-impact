@@ -175,7 +175,11 @@ export class HotPatcher {
         file: shadowFile,
       });
       if (!r.ok && (r.reason ?? "").startsWith("no-op")) {
-        continue; // semantically unchanged file: nothing to patch, not a failure
+        // Semantically unchanged file: nothing to patch, not a failure — but
+        // say so. A no-op on an edit the user believes is real is the one
+        // trace of a stale baseline, and it must never vanish silently.
+        this.log(`hotpatch: ${path.basename(job.fileAbs)}: ${r.reason}`);
+        continue;
       }
       if (!r.ok) {
         this.log(`hotpatch: ${path.basename(job.fileAbs)}: ${r.reason} — using build path`);
