@@ -18,6 +18,7 @@ import {
   ProjectInfo,
   projectForFile,
   sourceStamp,
+  stampNewestMs,
   testProjects,
 } from "./projects";
 import { ImpactMap } from "./map";
@@ -70,6 +71,15 @@ export class Runner {
   /** Static (IL+PDB) map builder; log sink is swappable by the host. */
   readonly staticMapper: StaticMapper;
   logSink: (msg: string) => void = () => undefined;
+  /** Test seam: replaces the per-project msbuild invocation in minimalBuild. */
+  msbuildImpl?: (csprojShadowAbs: string, binlog: string) => Promise<{ code: number }>;
+  /**
+   * When the last overlay sync started. Stamps are read from the REAL repo but
+   * builds compile the SHADOW copy synced at this moment; a source mtime at or
+   * past it may postdate the shadow content, so such a stamp must never be
+   * recorded as built (#16) or cached as discovered.
+   */
+  private syncedAtMs = 0;
 
   constructor(readonly repoRoot: string) {
     this.map = new ImpactMap(repoRoot);
@@ -93,6 +103,9 @@ export class Runner {
 
   async prepare(): Promise<Shadow> {
     this.shadow = await ensureShadow(this.repoRoot);
+    // Captured BEFORE the sync reads git status: everything modified before
+    // this instant is guaranteed to be in the shadow afterwards.
+    this.syncedAtMs = Date.now();
     await syncOverlay(this.shadow);
     this.graph = buildProjectGraph(this.repoRoot);
     // Instrument only first-party assemblies (derived from the graph, not config).
@@ -209,7 +222,13 @@ export class Runner {
           try {
             const methods = await discover(this.shadowPath(d.p.csproj), this.shadow!.dir, true);
             result[d.rel] = methods;
-            cache.projects[d.rel] = { stamp: d.stamp, methods };
+            // Same post-sync guard as minimalBuild's stamp recording (#16):
+            // an edit landing after the overlay sync is in the stamp but not
+            // in the discovered build; caching it would serve stale methods
+            // until the next unrelated edit. Skip the row; next run re-lists.
+            if (stampNewestMs(d.stamp) < this.syncedAtMs) {
+              cache.projects[d.rel] = { stamp: d.stamp, methods };
+            }
           } catch {
             // Keep the stale cache row if we have one; better than losing the tree.
             const cached = cache.projects[d.rel];
@@ -394,27 +413,40 @@ export class Runner {
       const relKey = toRepoRelative(this.repoRoot, info.csproj);
       // The binlog is the hot-patch baseline material for this project.
       const binlog = path.join(binlogDir, info.name + ".binlog");
-      const res = await exec(
-        "dotnet",
-        [
-          "msbuild",
-          this.shadowPath(info.csproj),
-          "-t:Build",
-          "-p:BuildProjectReferences=false",
-          "-restore:false",
-          "-nologo",
-          "-v:q",
-          `-bl:${binlog}`,
-        ],
-        this.shadow!.dir,
-        10 * 60 * 1000,
-        signal
-      );
+      const res = this.msbuildImpl
+        ? await this.msbuildImpl(this.shadowPath(info.csproj), binlog)
+        : await exec(
+            "dotnet",
+            [
+              "msbuild",
+              this.shadowPath(info.csproj),
+              "-t:Build",
+              "-p:BuildProjectReferences=false",
+              "-restore:false",
+              "-nologo",
+              "-v:q",
+              `-bl:${binlog}`,
+            ],
+            this.shadow!.dir,
+            10 * 60 * 1000,
+            signal
+          );
       if (res.code !== 0) {
         this.logSink(`minimal build failed for ${info.name}; falling back to full builds`);
         return false;
       }
-      stamps[relKey] = newStamps[relKey];
+      // Record the stamp only when every source predates the overlay sync:
+      // this build compiled the shadow copy, and an edit that landed after the
+      // sync is IN the stamp but NOT in the compiled source. Recording it
+      // would mark the project up to date forever while its dll predates the
+      // edit — dependents then rebuild against an API surface the binary
+      // doesn't have (MissingMethodException at test runtime, #16). Dropping
+      // the row instead costs one re-build of this project on the next run.
+      if (stampNewestMs(newStamps[relKey]) < this.syncedAtMs) {
+        stamps[relKey] = newStamps[relKey];
+      } else {
+        delete stamps[relKey];
+      }
       built.push({ info, relKey, binlog });
     }
 

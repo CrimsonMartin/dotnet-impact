@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.6
+
+- Fixed stale assemblies after an edit raced the shadow sync (#16): a save
+  landing between the overlay sync and the incremental build's freshness-stamp
+  read was recorded as built even though the compiled shadow source predated
+  it. The project then looked up to date forever while dependents rebuilt
+  against members its binary didn't have, surfacing as a misleading
+  `MissingMethodException` deep in a dependent project's tests. Stamps (and
+  discovery-cache rows) are now recorded only when every source file predates
+  the sync; a raced edit costs a single extra project build on the next run
+  instead of a stale-binary run.
+
 ## 0.2.5
 
 - Fixed stale entries lingering in the Test Explorer after a test class was

@@ -171,6 +171,16 @@ export function transitiveSourceStamp(
  * and the count, and a stamp blind to paths kept serving the pre-move FQNs
  * from the discovery cache (#17). Discovery can be skipped while the stamp holds.
  */
+/**
+ * The newest source mtime encoded in a sourceStamp(). Unparseable stamps
+ * report Infinity — "newer than anything" — so callers treating post-sync
+ * stamps as unproven never record garbage as built.
+ */
+export function stampNewestMs(stamp: string): number {
+  const newest = Number(stamp.split(":")[1]);
+  return Number.isFinite(newest) ? newest : Infinity;
+}
+
 export function sourceStamp(projectDir: string): string {
   let newest = 0;
   const rels: string[] = [];
