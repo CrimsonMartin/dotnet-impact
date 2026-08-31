@@ -9,9 +9,11 @@
 // diagnostic so the caller falls back to a real build.
 //
 // Protocol: JSON lines on stdin/stdout.
-//   -> {"id":1,"cmd":"load","binlog":"/abs/x.complog","csproj":"/abs/Lib.csproj","dll":"/abs/Lib.dll"}
+//   -> {"id":1,"cmd":"load","binlog":"/abs/x.complog","csproj":"/abs/Lib.csproj","dll":"/abs/Lib.dll",
+//       "caps":["Baseline","AddMethodToExistingType",...]}   caps optional: live-host capability intersection
 //   <- {"id":1,"type":"done","ok":true,"assembly":"Lib"}
-//   -> {"id":2,"cmd":"delta","csproj":"/abs/Lib.csproj","file":"/abs/Calc.cs"}
+//   -> {"id":2,"cmd":"delta","csproj":"/abs/Lib.csproj","files":["/abs/Calc.cs","/abs/Extra.cs"]}
+//      ("file":"/abs/Calc.cs" also accepted for a single edit)
 //   <- {"id":2,"type":"done","ok":true,"assembly":"Lib","md":"<b64>","il":"<b64>","pdb":"<b64>"}
 //      or {"id":2,"type":"done","ok":false,"reason":"rude edit ENC0023: ..."}
 //   -> {"id":3,"cmd":"reset"}   drop all state (after a real rebuild)
@@ -108,7 +110,20 @@ while ((line = Console.ReadLine()) != null)
                 var binlog = root.GetProperty("binlog").GetString()!;
                 var csproj = root.GetProperty("csproj").GetString()!;
                 var dll = root.GetProperty("dll").GetString()!;
-                var (state, reason) = EncProject.LoadAsync(binlog, csproj, dll).GetAwaiter().GetResult();
+                // Optional live capability set (#11 P2): the intersection of
+                // what the registered testhost runtimes report they can apply.
+                // Absent → the safe modern-runtime default.
+                ImmutableArray<string>? caps = null;
+                if (root.TryGetProperty("caps", out var capsEl) && capsEl.ValueKind == JsonValueKind.Array)
+                {
+                    var list = capsEl.EnumerateArray()
+                        .Select(c => c.GetString())
+                        .Where(c => !string.IsNullOrWhiteSpace(c))
+                        .Select(c => c!)
+                        .ToImmutableArray();
+                    if (list.Length > 0) caps = list;
+                }
+                var (state, reason) = EncProject.LoadAsync(binlog, csproj, dll, caps).GetAwaiter().GetResult();
                 if (state == null)
                 {
                     Emit(new { id, type = "done", ok = false, reason });
@@ -122,13 +137,25 @@ while ((line = Console.ReadLine()) != null)
             case "delta":
             {
                 var csproj = root.GetProperty("csproj").GetString()!;
-                var file = root.GetProperty("file").GetString()!;
+                // One save can touch several files of a project (#11 P3): all
+                // of them go into a single emit so interdependent edits are
+                // analyzed together. "file" stays accepted for single edits.
+                var files = new List<string>();
+                if (root.TryGetProperty("files", out var filesEl) && filesEl.ValueKind == JsonValueKind.Array)
+                    files.AddRange(filesEl.EnumerateArray().Select(f => f.GetString()!).Where(f => f != null));
+                else if (root.TryGetProperty("file", out var fileEl))
+                    files.Add(fileEl.GetString()!);
+                if (files.Count == 0)
+                {
+                    Emit(new { id, type = "done", ok = false, reason = "no files in delta request" });
+                    break;
+                }
                 if (!projects.TryGetValue(csproj, out var state))
                 {
                     Emit(new { id, type = "done", ok = false, reason = "not loaded" });
                     break;
                 }
-                var (delta, reason) = state.DeltaAsync(file).GetAwaiter().GetResult();
+                var (delta, reason) = state.DeltaAsync(files).GetAwaiter().GetResult();
                 if (delta == null)
                 {
                     Emit(new { id, type = "done", ok = false, reason });
@@ -168,10 +195,12 @@ return 0;
 sealed class EncProject : IDisposable
 {
     /// <summary>
-    /// CoreCLR (.NET 8+) hot-reload capabilities. Until the startup hook
-    /// reports MetadataUpdater.GetCapabilities() per host, this is the safe
-    /// modern-runtime set — anything a host can't do would be refused at
-    /// ApplyUpdate and the push failure already forces the build path.
+    /// Fallback CoreCLR (.NET 8+) hot-reload capabilities, used when no live
+    /// host reported a set (cold preload before the first host registers).
+    /// Live hosts report MetadataUpdater.GetCapabilities() through their
+    /// registration files and the caller sends the intersection with "load";
+    /// anything a host can't do beyond this guess would still be refused at
+    /// ApplyUpdate, and that push failure already forces the build path.
     /// </summary>
     private static readonly ImmutableArray<string> Capabilities = ImmutableArray.Create(
         "Baseline",
@@ -195,7 +224,8 @@ sealed class EncProject : IDisposable
     /// <summary>Backs the solution's lazy text loaders; must outlive the session.</summary>
     private SolutionReader _reader = null!;
 
-    public static async Task<(EncProject?, string)> LoadAsync(string complogPath, string csproj, string dll)
+    public static async Task<(EncProject?, string)> LoadAsync(
+        string complogPath, string csproj, string dll, ImmutableArray<string>? capabilities = null)
     {
         var reader = SolutionReader.Create(complogPath, BasicAnalyzerKind.OnDisk);
         var workspace = ImpactEncWorkspace.Create();
@@ -264,7 +294,7 @@ sealed class EncProject : IDisposable
             }
         }
 
-        var service = new ImpactHotReloadService(workspace.Services, Capabilities);
+        var service = new ImpactHotReloadService(workspace.Services, capabilities ?? Capabilities);
         await service.StartSessionAsync(solution, CancellationToken.None).ConfigureAwait(false);
 
         var documents = new Dictionary<string, DocumentId>(StringComparer.OrdinalIgnoreCase);
@@ -288,33 +318,41 @@ sealed class EncProject : IDisposable
         }, "");
     }
 
-    public async Task<((byte[] Md, byte[] Il, byte[] Pdb)?, string)> DeltaAsync(string file)
+    public async Task<((byte[] Md, byte[] Il, byte[] Pdb)?, string)> DeltaAsync(IReadOnlyList<string> files)
     {
-        var docId = FindDocument(file);
-        if (docId == null) return (null, "file not in compilation");
+        // All of a save's edits to this project enter one emit (#11 P3):
+        // per-file emits would analyze each edit against a solution missing
+        // its siblings, refusing interdependent edits (a method added in one
+        // file, called from another) that the engine accepts together.
+        var updated = _current;
+        foreach (var file in files)
+        {
+            var docId = FindDocument(file);
+            if (docId == null) return (null, $"{Path.GetFileName(file)}: file not in compilation");
 
-        var text = SourceText.From(File.ReadAllText(file), Encoding.UTF8);
+            var text = SourceText.From(File.ReadAllText(file), Encoding.UTF8);
 
-        // Cross-project safety valve. The EnC session spans one project, so
-        // the engine happily models a changed public signature as "add new,
-        // keep old alive in metadata" — dependent test assemblies would keep
-        // calling the old member and stay green even though the solution no
-        // longer compiles. Any disappeared non-private declaration therefore
-        // forces the build path, where the dependent compile failure surfaces.
-        var oldText = (await _current.GetDocument(docId)!.GetTextAsync().ConfigureAwait(false)).ToString();
-        var removed = ApiGuard.RemovedVisibleDeclaration(oldText, text.ToString());
-        if (removed != null)
-            return (null, $"api change: {removed} removed or signature changed — dependents must rebuild");
+            // Cross-project safety valve. The EnC session spans one project, so
+            // the engine happily models a changed public signature as "add new,
+            // keep old alive in metadata" — dependent test assemblies would keep
+            // calling the old member and stay green even though the solution no
+            // longer compiles. Any disappeared non-private declaration therefore
+            // forces the build path, where the dependent compile failure surfaces.
+            var oldText = (await _current.GetDocument(docId)!.GetTextAsync().ConfigureAwait(false)).ToString();
+            var removed = ApiGuard.RemovedVisibleDeclaration(oldText, text.ToString());
+            if (removed != null)
+                return (null, $"api change: {removed} removed or signature changed — dependents must rebuild");
 
-        // A brand-new test method hot-patches cleanly but invisibly: the test
-        // runner discovers tests from the assembly on disk (a fresh testhost
-        // enumerates the un-patched dll), so the new [Fact] would neither run
-        // nor appear in the tree. Only a rebuild makes it discoverable.
-        var addedTest = ApiGuard.AddedTestMethod(oldText, text.ToString());
-        if (addedTest != null)
-            return (null, $"new test method: {addedTest} — rebuilding so the test runner discovers it");
+            // A brand-new test method hot-patches cleanly but invisibly: the test
+            // runner discovers tests from the assembly on disk (a fresh testhost
+            // enumerates the un-patched dll), so the new [Fact] would neither run
+            // nor appear in the tree. Only a rebuild makes it discoverable.
+            var addedTest = ApiGuard.AddedTestMethod(oldText, text.ToString());
+            if (addedTest != null)
+                return (null, $"new test method: {addedTest} — rebuilding so the test runner discovers it");
 
-        var updated = _current.WithDocumentText(docId, text);
+            updated = updated.WithDocumentText(docId, text);
+        }
 
         var updates = await _service.GetUpdatesAsync(
             updated,

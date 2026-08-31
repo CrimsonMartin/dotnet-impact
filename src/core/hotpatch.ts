@@ -104,7 +104,14 @@ export class HotPatcher {
   preload(csprojAbs: string, complog: string, shadowCsproj: string, dll: string): void {
     void (async () => {
       if (!(await this.ensureStarted()) || this.loaded.has(csprojAbs)) return;
-      const r = await this.request({ cmd: "load", binlog: complog, csproj: shadowCsproj, dll });
+      const caps = intersectCapabilities(this.liveHosts().map((h) => h.capabilities));
+      const r = await this.request({
+        cmd: "load",
+        binlog: complog,
+        csproj: shadowCsproj,
+        dll,
+        ...(caps ? { caps } : {}),
+      });
       if (r.ok) this.loaded.add(csprojAbs);
     })();
   }
@@ -133,7 +140,11 @@ export class HotPatcher {
       return false;
     }
 
-    const jobs: Array<{ csprojAbs: string; fileAbs: string }> = [];
+    // One save can span several files and projects: group by owning project
+    // so each project's edits enter a single emit (#11 P3) — per-file emits
+    // would refuse interdependent edits (a method added in one file, called
+    // from another) that the engine accepts together.
+    const byProject = new Map<string, string[]>(); // csprojAbs -> changed file abs paths
     for (const rel of changedRel) {
       const abs = path.join(this.repoRoot, rel);
       const owner = projectForFile(graph, abs);
@@ -146,43 +157,52 @@ export class HotPatcher {
         this.log(`hotpatch: no baseline yet for ${owner.name} — using build path`);
         return false;
       }
-      jobs.push({ csprojAbs: owner.csproj, fileAbs: abs });
+      if (!byProject.has(owner.csproj)) byProject.set(owner.csproj, []);
+      byProject.get(owner.csproj)!.push(abs);
     }
     if (!(await this.ensureStarted())) return false;
 
+    // What the live hosts can actually apply (#11 P2), sent with each load so
+    // the engine refuses edits the runtimes can't take instead of emitting
+    // deltas that would die at ApplyUpdate.
+    const caps = intersectCapabilities(hosts.map((h) => h.capabilities));
+
     // Load projects on demand (once per epoch), then request deltas.
     const deltas: Array<{ assembly: string; md: Buffer; il: Buffer; pdb: Buffer }> = [];
-    for (const job of jobs) {
-      if (!this.loaded.has(job.csprojAbs)) {
-        const rel = toRepoRelative(this.repoRoot, job.csprojAbs);
-        const shadowCsproj = this.shadowPathOf(job.csprojAbs);
-        const dll = this.builtDllFor(graph, job.csprojAbs);
+    for (const [csprojAbs, filesAbs] of byProject) {
+      if (!this.loaded.has(csprojAbs)) {
+        const rel = toRepoRelative(this.repoRoot, csprojAbs);
+        const shadowCsproj = this.shadowPathOf(csprojAbs);
+        const dll = this.builtDllFor(graph, csprojAbs);
         if (!dll) return false;
-        const r = await this.request({ cmd: "load", binlog: binlogs[rel], csproj: shadowCsproj, dll });
+        const r = await this.request({
+          cmd: "load",
+          binlog: binlogs[rel],
+          csproj: shadowCsproj,
+          dll,
+          ...(caps ? { caps } : {}),
+        });
         if (!r.ok) {
           this.log(`hotpatch: load failed for ${rel}: ${r.reason}`);
           return false;
         }
-        this.loaded.add(job.csprojAbs);
+        this.loaded.add(csprojAbs);
       }
-      const shadowFile = path.join(
-        this.shadowDir!,
-        toRepoRelative(this.repoRoot, job.fileAbs)
-      );
+      const label = filesAbs.map((f) => path.basename(f)).join("+");
       const r = await this.request({
         cmd: "delta",
-        csproj: this.shadowPathOf(job.csprojAbs),
-        file: shadowFile,
+        csproj: this.shadowPathOf(csprojAbs),
+        files: filesAbs.map((f) => path.join(this.shadowDir!, toRepoRelative(this.repoRoot, f))),
       });
       if (!r.ok && (r.reason ?? "").startsWith("no-op")) {
-        // Semantically unchanged file: nothing to patch, not a failure — but
-        // say so. A no-op on an edit the user believes is real is the one
+        // Semantically unchanged file(s): nothing to patch, not a failure —
+        // but say so. A no-op on an edit the user believes is real is the one
         // trace of a stale baseline, and it must never vanish silently.
-        this.log(`hotpatch: ${path.basename(job.fileAbs)}: ${r.reason}`);
+        this.log(`hotpatch: ${label}: ${r.reason}`);
         continue;
       }
       if (!r.ok) {
-        this.log(`hotpatch: ${path.basename(job.fileAbs)}: ${r.reason} — using build path`);
+        this.log(`hotpatch: ${label}: ${r.reason} — using build path`);
         return false;
       }
       deltas.push({
@@ -257,19 +277,19 @@ export class HotPatcher {
     return findBuiltDll(this.shadowDir, info, this.repoRoot);
   }
 
-  private liveHosts(): Array<{ pidFile: string; pipeName: string }> {
+  private liveHosts(): LiveHost[] {
     let entries: string[];
     try {
       entries = fs.readdirSync(this.hotDir);
     } catch {
       return [];
     }
-    const hosts: Array<{ pidFile: string; pipeName: string }> = [];
+    const hosts: LiveHost[] = [];
     for (const e of entries) {
       const pidFile = path.join(this.hotDir, e);
       try {
         process.kill(Number(e), 0); // alive?
-        hosts.push({ pidFile, pipeName: fs.readFileSync(pidFile, "utf8").trim() });
+        hosts.push({ pidFile, ...parseHostRegistration(fs.readFileSync(pidFile, "utf8")) });
       } catch {
         try {
           fs.rmSync(pidFile, { force: true }); // stale registration
@@ -475,6 +495,56 @@ export class HotPatcher {
     this.proc = undefined;
     this.starting = null;
   }
+}
+
+interface LiveHost {
+  pidFile: string;
+  pipeName: string;
+  /** Runtime hot-reload capabilities the host reported; undefined = unknown. */
+  capabilities?: string[];
+}
+
+/**
+ * Fallback capability set for hosts that predate the handshake (registration
+ * with no capabilities line). Mirrors the delta service's modern-CoreCLR
+ * default; a wrong guess dies at ApplyUpdate and forces the build path.
+ */
+export const DEFAULT_HOST_CAPABILITIES = [
+  "Baseline",
+  "AddMethodToExistingType",
+  "AddStaticFieldToExistingType",
+  "AddInstanceFieldToExistingType",
+  "NewTypeDefinition",
+  "ChangeCustomAttributes",
+  "UpdateParameters",
+  "GenericUpdateMethod",
+  "GenericAddMethodToExistingType",
+  "GenericAddFieldToExistingType",
+];
+
+/**
+ * Registration file written by the startup hook: line 1 the host's pipe name,
+ * line 2 (since #11 P2) its space-separated runtime capability set.
+ */
+export function parseHostRegistration(content: string): { pipeName: string; capabilities?: string[] } {
+  const lines = content.split(/\r?\n/);
+  const pipeName = (lines[0] ?? "").trim();
+  const caps = (lines[1] ?? "").trim();
+  return caps.length > 0 ? { pipeName, capabilities: caps.split(/\s+/) } : { pipeName };
+}
+
+/**
+ * Capabilities EVERY live host can apply — the only set safe to emit against.
+ * A host with an unknown set contributes the pre-handshake default, so mixed
+ * old/new fleets behave exactly as before. No hosts → null (caller lets the
+ * delta service use its own default).
+ */
+export function intersectCapabilities(reported: Array<string[] | undefined>): string[] | null {
+  if (reported.length === 0) return null;
+  const sets = reported.map((caps) => new Set<string>(caps ?? DEFAULT_HOST_CAPABILITIES));
+  const out: string[] = [];
+  for (const c of sets[0]) if (sets.every((s) => s.has(c))) out.push(c);
+  return out;
 }
 
 interface DeltaReply {

@@ -241,6 +241,20 @@ test("gif scenario: a breaking edit goes red even after an out-of-band build", {
         "a green result here means the pipeline ran stale code"
     );
 
+    // #11 P2: live testhosts must register with their runtime capability
+    // line (pipe name on line 1, capabilities on line 2) — the fast path
+    // gates delta generation on this handshake.
+    const hotDir = path.join(cacheDirFor(root), "hotpatch-hosts");
+    const regs = fs.readdirSync(hotDir).map((f) => fs.readFileSync(path.join(hotDir, f), "utf8"));
+    assert.ok(regs.length > 0, "a warm testhost must be registered");
+    for (const reg of regs) {
+      const caps = (reg.split(/\r?\n/)[1] ?? "").trim();
+      assert.ok(
+        caps.split(/\s+/).includes("Baseline"),
+        `host registration must report runtime capabilities, got: ${JSON.stringify(reg)}`
+      );
+    }
+
     // And the fix goes green again, like the gif's second half.
     fs.writeFileSync(calc, commented);
     const fixed = await run("fix edit", affectedSave);

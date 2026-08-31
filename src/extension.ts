@@ -9,6 +9,7 @@ import { KnownResult, pruneKnownResults, replayEvents } from "./core/replay";
 import { AffectedSet, Runner, TestOutcome } from "./core/runner";
 import { cacheDirFor, setDotnetPath, toRepoRelative } from "./core/util";
 import { HotPatcher } from "./core/hotpatch";
+import { waitForShadowLock, withShadowLock } from "./core/lock";
 import { SessionRunner } from "./core/vstestSession";
 
 let runner: Runner | undefined;
@@ -181,11 +182,19 @@ async function eagerDiscover(): Promise<void> {
   if (!runner || !controller) return;
   try {
     updateStatus("discovering tests…", true);
-    await runner.prepare();
-    const discovered = await runner.discoverAll({
-      parallel: discoveryParallel(),
-      onPhase: (m) => updateStatus(m, true),
-    });
+    // Background work: don't camp on the lock if a CLI hook holds it — the
+    // tree stays on its cache and discovery re-runs on the next trigger.
+    const discovered = await withShadowLock(runner.repoRoot, { waitMs: 120_000 }, async () => {
+      await runner!.prepare();
+      return runner!.discoverAll({
+        parallel: discoveryParallel(),
+        onPhase: (m) => updateStatus(m, true),
+      });
+    }).then((r) => r?.value);
+    if (!discovered) {
+      updateStatus("shadow busy (another impact process); discovery skipped");
+      return;
+    }
     rebuildTree(discovered);
     const methodCount = Object.values(discovered).reduce((n, m) => n + m.length, 0);
     updateStatus(`${methodCount} tests in ${classOwners.size} classes`);
@@ -351,6 +360,15 @@ async function doRun(
 ): Promise<void> {
   const run = controller!.createTestRun(request);
   updateStatus("running…", true);
+  // Cross-process guard (#8): a CLI hook invocation mutating the shadow
+  // (lint-staged, pre-commit) must not interleave with this run. The wait is
+  // abortable — a newer save supersedes a run still queued on the lock.
+  const releaseLock = await waitForShadowLock(runner!.repoRoot, { signal });
+  if (!releaseLock) {
+    updateStatus("superseded");
+    run.end();
+    return;
+  }
   try {
     await runner!.prepare();
     let affected: AffectedSet;
@@ -406,6 +424,7 @@ async function doRun(
     updateStatus("error");
     output.appendLine(String(e));
   } finally {
+    releaseLock();
     run.end();
   }
 }
@@ -435,6 +454,12 @@ async function coverageRunHandler(
 async function doCoverageRun(request: vscode.TestRunRequest, signal: AbortSignal): Promise<void> {
   const run = controller!.createTestRun(request);
   updateStatus("coverage run…", true);
+  const releaseLock = await waitForShadowLock(runner!.repoRoot, { signal });
+  if (!releaseLock) {
+    updateStatus("superseded");
+    run.end();
+    return;
+  }
   try {
     await runner!.prepare();
     const affected: AffectedSet =
@@ -480,6 +505,7 @@ async function doCoverageRun(request: vscode.TestRunRequest, signal: AbortSignal
     updateStatus("error");
     output.appendLine(String(e));
   } finally {
+    releaseLock();
     run.end();
   }
 }
@@ -490,12 +516,21 @@ async function kickRefresh(): Promise<void> {
   refreshing = true;
   refreshAbort = new AbortController();
   try {
-    const n = await runner.refreshPending({
-      signal: refreshAbort.signal,
-      onProgress: (remaining, cls) =>
-        updateStatus(`refreshing map (${remaining + 1} left): ${cls.split(".").pop()}`, true),
-    });
-    if (n > 0 && !refreshAbort.signal.aborted) {
+    // Opportunistic background work: skip outright when a CLI hook holds the
+    // shadow — the queue survives and the next save's run re-kicks it. A held
+    // lock here must also stay SHORT so hook invocations aren't starved;
+    // refreshPending already yields between classes via its abort signal.
+    const locked = await withShadowLock(
+      runner.repoRoot,
+      { signal: refreshAbort.signal, waitMs: 10_000 },
+      () =>
+        runner!.refreshPending({
+          signal: refreshAbort!.signal,
+          onProgress: (remaining, cls) =>
+            updateStatus(`refreshing map (${remaining + 1} left): ${cls.split(".").pop()}`, true),
+        })
+    );
+    if (locked && locked.value > 0 && !refreshAbort.signal.aborted) {
       updateStatus(`map: ${runner.map.classCount} classes (fresh)`);
     }
   } catch (e) {
@@ -692,6 +727,13 @@ async function buildMapWithProgress(
       },
       async (progress, token) => {
         token.onCancellationRequested(() => (mapBuildCancelled = true));
+        const abort = new AbortController();
+        token.onCancellationRequested(() => abort.abort());
+        // Long-running by nature; a concurrent CLI hook will skip against a
+        // held lock (its 10s wait, exit 0), which is the documented tradeoff.
+        const releaseLock = await waitForShadowLock(runner!.repoRoot, { signal: abort.signal });
+        if (!releaseLock) return;
+        try {
         await runner!.prepare();
         discovered ??= await runner!.discoverAll({
           parallel: discoveryParallel(),
@@ -721,6 +763,9 @@ async function buildMapWithProgress(
         if (res.failed.length > 0) {
           output.appendLine(`map build finished with ${res.failed.length} failures:`);
           for (const f of res.failed) output.appendLine(`  ${f}`);
+        }
+        } finally {
+          releaseLock();
         }
       }
     );

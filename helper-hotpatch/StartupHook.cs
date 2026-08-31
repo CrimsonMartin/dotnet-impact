@@ -22,7 +22,10 @@ internal sealed class StartupHook
     {
         // Each testhost gets its own pipe: <base>-<pid>, announced by touching a
         // pid-named file in IMPACT_HOTPATCH_DIR so the extension can find every
-        // live testhost and push deltas to all of them.
+        // live testhost and push deltas to all of them. Line 1 is the pipe
+        // name; line 2 reports this runtime's hot-reload capability set
+        // (space-separated) so delta generation is gated on what the hosts can
+        // actually apply, not an assumed list.
         var baseName = Environment.GetEnvironmentVariable("IMPACT_HOTPATCH_PIPE");
         if (string.IsNullOrEmpty(baseName)) return;
         var pipeName = baseName + "-" + Environment.ProcessId;
@@ -32,7 +35,9 @@ internal sealed class StartupHook
             if (!string.IsNullOrEmpty(dir))
             {
                 Directory.CreateDirectory(dir);
-                File.WriteAllText(Path.Combine(dir, Environment.ProcessId.ToString()), pipeName);
+                File.WriteAllText(
+                    Path.Combine(dir, Environment.ProcessId.ToString()),
+                    pipeName + "\n" + RuntimeCapabilities());
             }
         }
         catch
@@ -41,6 +46,29 @@ internal sealed class StartupHook
         }
         var thread = new Thread(() => Serve(pipeName)) { IsBackground = true, Name = "impact-hotpatch" };
         thread.Start();
+    }
+
+    /// <summary>
+    /// The runtime's own hot-reload capability set. GetCapabilities is
+    /// internal by design; dotnet-watch's delta applier reads it the same way.
+    /// An unreadable or empty answer degrades to "Baseline" — the delta
+    /// service then refuses anything beyond body edits, which the build path
+    /// covers, so a wrong guess can only cost speed, never correctness.
+    /// </summary>
+    private static string RuntimeCapabilities()
+    {
+        try
+        {
+            var m = typeof(MetadataUpdater).GetMethod(
+                "GetCapabilities",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+            var caps = m?.Invoke(null, null) as string;
+            return string.IsNullOrWhiteSpace(caps) ? "Baseline" : caps.Trim();
+        }
+        catch
+        {
+            return "Baseline";
+        }
     }
 
     private static void Serve(string pipeName)
