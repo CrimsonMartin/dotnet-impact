@@ -1,3 +1,4 @@
+import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
 
@@ -164,12 +165,15 @@ export function transitiveSourceStamp(
 }
 
 /**
- * Freshness stamp for a project directory: newest source mtime + file count
- * (count catches deletions). Discovery can be skipped while the stamp holds.
+ * Freshness stamp for a project directory: newest source mtime + file count +
+ * a digest of the relative paths. Count catches deletions; the path digest
+ * catches moves — dragging a file into a subfolder preserves both its mtime
+ * and the count, and a stamp blind to paths kept serving the pre-move FQNs
+ * from the discovery cache (#17). Discovery can be skipped while the stamp holds.
  */
 export function sourceStamp(projectDir: string): string {
   let newest = 0;
-  let count = 0;
+  const rels: string[] = [];
   const walk = (dir: string) => {
     let entries: fs.Dirent[];
     try {
@@ -182,9 +186,10 @@ export function sourceStamp(projectDir: string): string {
         const p = path.join(dir, e.name);
         if (!SKIP_DIRS.has(e.name.toLowerCase()) && !isNestedRepo(p)) walk(p);
       } else if (STAMP_FILE_RE.test(e.name)) {
-        count++;
+        const p = path.join(dir, e.name);
+        rels.push(path.relative(projectDir, p).split(path.sep).join("/"));
         try {
-          const m = fs.statSync(path.join(dir, e.name)).mtimeMs;
+          const m = fs.statSync(p).mtimeMs;
           if (m > newest) newest = m;
         } catch {
           /* ignore */
@@ -193,5 +198,6 @@ export function sourceStamp(projectDir: string): string {
     }
   };
   walk(projectDir);
-  return `${count}:${Math.round(newest)}`;
+  const digest = crypto.createHash("sha1").update(rels.sort().join("\n")).digest("hex").slice(0, 12);
+  return `${rels.length}:${Math.round(newest)}:${digest}`;
 }

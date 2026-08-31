@@ -5,7 +5,7 @@ import * as vscode from "vscode";
 import { classOf } from "./core/discover";
 import { locateClasses, locateMethod, locateMethods, SourceLocation, stripNesting } from "./core/locate";
 import { testProjects } from "./core/projects";
-import { KnownResult, replayEvents } from "./core/replay";
+import { KnownResult, pruneKnownResults, replayEvents } from "./core/replay";
 import { AffectedSet, Runner, TestOutcome } from "./core/runner";
 import { cacheDirFor, setDotnetPath, toRepoRelative } from "./core/util";
 import { HotPatcher } from "./core/hotpatch";
@@ -266,6 +266,10 @@ function rebuildTree(discovered: Record<string, string[]>): void {
       }
     }
   }
+
+  // Forget results for methods that just left the tree, or replay re-reports
+  // deleted tests at their last state after every subset run (#17).
+  pruneKnownResults(knownResults, new Set(Object.values(discovered).flat()));
 }
 
 // ---------- running ----------

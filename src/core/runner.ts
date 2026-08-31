@@ -115,7 +115,7 @@ export class Runner {
   /**
    * Discover test methods across all test projects, fast:
    * - projects whose sources are unchanged since the cached discovery are
-   *   skipped entirely (stamp = newest source mtime + file count);
+   *   skipped entirely (stamp = newest source mtime + file count + path digest);
    * - dirty projects get one build (the solution when present — dependency-
    *   correct and internally parallel — else serial per-project), then
    *   `--list-tests --no-build` runs in parallel.
@@ -224,6 +224,24 @@ export class Runner {
     for (const rel of Object.keys(cache.projects)) if (!live.has(rel)) delete cache.projects[rel];
     fs.mkdirSync(path.dirname(cachePath), { recursive: true });
     fs.writeFileSync(cachePath, JSON.stringify(cache, null, 1));
+
+    // Prune map rows for classes discovery no longer sees — without this the
+    // tree resurrects deleted/moved classes from the map forever (#17). A
+    // project whose discovery came back EMPTY is withheld from the alive set:
+    // discoverTests only throws on non-zero exit with zero methods, so an
+    // exit-0 run that listed nothing (unparsed MTP output, missing runner)
+    // would otherwise wipe measured coverage rows for untouched classes.
+    const alive = new Map<string, Set<string>>();
+    for (const [rel, classes] of Object.entries(classesRecord(result))) {
+      if (classes.length > 0) alive.set(rel, new Set(classes));
+    }
+    const removed = this.map.prune(alive, live);
+    if (removed.length > 0) {
+      opts.onPhase?.(`pruned ${removed.length} stale map entries`);
+      for (const cls of removed) this.lastFailures.delete(cls);
+      this.saveLastFailures();
+      this.map.save();
+    }
     return result;
   }
 
