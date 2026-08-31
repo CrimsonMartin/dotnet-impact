@@ -24,6 +24,20 @@ export interface ReplayEvent {
 }
 
 /**
+ * Forget results for methods that are no longer in the tree. Replay only ever
+ * re-emits remembered results, so a deleted or renamed test kept reappearing
+ * in the pane at its last state after every subset run (#17).
+ */
+export function pruneKnownResults(
+  known: Map<string, KnownResult>,
+  liveMethods: Set<string>
+): void {
+  for (const methodFqn of [...known.keys()]) {
+    if (!liveMethods.has(methodFqn)) known.delete(methodFqn);
+  }
+}
+
+/**
  * Results to re-emit at the end of a subset run: last known state of every
  * method that did not get a real result this run (`reported`).
  */
