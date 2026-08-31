@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.5
+
+- Fixed stale entries lingering in the Test Explorer after a test class was
+  moved or deleted (most visible on Windows): moving a class into a subfolder
+  kept its old namespace in the pane, because the freshness stamp saw an
+  unchanged file count and mtime and skipped re-discovery, while the impact
+  map kept resurrecting the dead class on every tree rebuild. The stamp now
+  folds in a digest of project-relative paths, discovery prunes the map (and
+  lastFailures) as it goes, and results for methods that no longer exist are
+  dropped so replay stops reporting phantom outcomes. Pruning is guarded: a
+  discovery that succeeds but lists nothing never wipes a project's rows.
+
 ## 0.2.4
 
 - Fixed a race that could abort a full run with "file not found" (most likely
