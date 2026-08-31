@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.2.8
+
+- Hot-patch capability handshake (#11 P2): every testhost now reports its
+  runtime's actual hot-reload capability set
+  (`MetadataUpdater.GetCapabilities()`) when it registers, and delta
+  generation is gated on the intersection across the live fleet instead of
+  an assumed modern-CoreCLR list. Edits a runtime can't apply are refused
+  up front with the engine's own ENC reason and fall to the build path,
+  rather than emitting deltas that would die inside the host.
+
+- Multi-file saves hot-patch as one unit (#11 P3): all changed files of a
+  project now enter a single Edit-and-Continue emit, so interdependent
+  edits — a method added in one file, called from another — patch together
+  where per-file emission used to refuse them and rebuild.
+
+- The extension now takes the cross-process shadow lock (#8) around its
+  shadow-mutating phases (runs, coverage runs, discovery, map build and
+  refresh), closing the race with CLI hook invocations (lint-staged,
+  pre-commit). Waits are abortable — a newer save supersedes a run still
+  queued on the lock — and background work skips rather than camps when a
+  CLI process holds the shadow. The lock is re-entrant within a process,
+  so the extension's own overlapping phases behave exactly as before.
+
 ## 0.2.7
 
 - Fixed a save that could stay silently GREEN after a breaking edit. Any
