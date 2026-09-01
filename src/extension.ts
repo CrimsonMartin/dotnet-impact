@@ -227,10 +227,20 @@ function updateStatus(text: string, spin = false): void {
 
 /**
  * Apply a runner DiagnosticsEvent to the editor: `set` replaces everything
- * this project last reported (errors always, warnings behind the
- * surfaceBuildWarnings setting), `clear` retires it. Files outside the
- * workspace root (SDK targets, generated sources) are dropped.
+ * this project last reported (errors always, warnings per the
+ * surfaceBuildWarnings setting — "auto" defers to the C# extension's live
+ * language-server warnings when it's installed), `clear` retires it. Files
+ * outside the workspace root (SDK targets, generated sources) are dropped.
  */
+function warningsEnabled(): boolean {
+  const mode = vscode.workspace
+    .getConfiguration("dotnetImpact")
+    .get<string>("surfaceBuildWarnings", "auto");
+  if (mode === "on") return true;
+  if (mode === "off") return false;
+  return !vscode.extensions.getExtension("ms-dotnettools.csharp");
+}
+
 function applyDiagnostics(e: DiagnosticsEvent): void {
   if (!buildDiags || !runner) return;
   for (const u of ownedDiags.get(e.projectRel) ?? []) buildDiags.delete(vscode.Uri.parse(u));
@@ -238,9 +248,7 @@ function applyDiagnostics(e: DiagnosticsEvent): void {
   buildErrorCounts.delete(e.projectRel);
   if (e.kind === "clear") return;
 
-  const showWarnings = vscode.workspace
-    .getConfiguration("dotnetImpact")
-    .get<boolean>("surfaceBuildWarnings", false);
+  const showWarnings = warningsEnabled();
   const byFile = new Map<string, vscode.Diagnostic[]>();
   let errors = 0;
   for (const d of e.diagnostics) {

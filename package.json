@@ -67,9 +67,10 @@
           "description": "Collect live map-refresh coverage through a resident dotnet-coverage session with instrumented warm testhosts (~3x faster per class). Installs the dotnet-coverage tool on first use; falls back to per-class collector runs when unavailable."
         },
         "dotnetImpact.surfaceBuildWarnings": {
-          "type": "boolean",
-          "default": false,
-          "description": "Also surface compiler warnings from failed builds as squigglies. Build errors are always shown."
+          "type": "string",
+          "enum": ["auto", "on", "off"],
+          "default": "auto",
+          "description": "Surface compiler warnings from builds as squigglies. Build errors are always shown. \"auto\" shows warnings only when the C# extension (ms-dotnettools.csharp) is not installed — its language server already provides live warnings, and doubling them up would duplicate squigglies."
         },
         "dotnetImpact.autoRunOnSave": {
           "type": "boolean",

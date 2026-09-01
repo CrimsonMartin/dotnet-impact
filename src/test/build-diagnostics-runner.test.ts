@@ -10,7 +10,9 @@ import { cacheDirFor } from "../core/util";
 /**
  * The runner's diagnostics stream: a failing minimal build parses its msbuild
  * output into a `set` event with file paths mapped from the shadow worktree
- * back to the real repo; the next clean build of the project emits `clear`.
+ * back to the real repo; the next clean build of the project re-parses its
+ * output, so warnings survive a green build while errors retire; a silent
+ * clean build replaces everything with an empty set.
  */
 
 /** Tmp git repo: leaf classlib L, test project T referencing it (same as stale-stamp). */
@@ -60,21 +62,23 @@ test("minimalBuild: failing msbuild output becomes a repo-mapped set event, then
     runner.diagnosticsSink = (e) => events.push(e);
     runner.logSink = (m) => logs.push(m);
 
-    let fail = true;
+    let mode: "fail" | "warn" | "clean" = "fail";
     runner.msbuildImpl = async (csprojShadowAbs) => {
       const name = path.basename(csprojShadowAbs, ".csproj");
-      if (fail && name === "L") {
+      const thing = path.join(path.dirname(csprojShadowAbs), "Thing.cs");
+      const warn = `${thing}(3,9): warning CS0168: unused variable [${csprojShadowAbs}]`;
+      if (mode === "fail" && name === "L") {
         // Canned compiler output as msbuild prints it: shadow paths, a
         // summary-block repeat of the same error, and one warning.
-        const thing = path.join(path.dirname(csprojShadowAbs), "Thing.cs");
         const line = `${thing}(12,34): error CS1002: ; expected [${csprojShadowAbs}]`;
-        const warn = `${thing}(3,9): warning CS0168: unused variable [${csprojShadowAbs}]`;
         return { code: 1, stdout: ["Build FAILED.", line, warn, "", line].join("\n"), stderr: "" };
       }
       const outDir = path.join(path.dirname(csprojShadowAbs), "bin", "Debug", "net10.0");
       fs.mkdirSync(outDir, { recursive: true });
       fs.writeFileSync(path.join(outDir, `${name}.dll`), "");
-      return { code: 0 };
+      // A clean exit still prints warnings; the runner must not drop them.
+      const stdout = mode === "warn" && name === "L" ? warn : "";
+      return { code: 0, stdout, stderr: "" };
     };
     const testRels = new Set(["tests/T/T.csproj"]);
     const minimalBuild = (): Promise<boolean> =>
@@ -103,14 +107,31 @@ test("minimalBuild: failing msbuild output becomes a repo-mapped set event, then
       "raw build output was discarded from the log"
     );
 
-    // Run 2: the build is fixed — every built project clears its diagnostics.
-    fail = false;
+    // Run 2: the error is fixed but the warning remains — a green build must
+    // retire the error while the warning survives.
+    mode = "warn";
     events.length = 0;
     assert.equal(await minimalBuild(), true, "clean minimal build failed");
-    const cleared = events.filter((e) => e.kind === "clear").map((e) => e.projectRel);
-    assert.ok(cleared.includes("src/L/L.csproj"), "fixed project did not clear its diagnostics");
-    assert.ok(cleared.includes("tests/T/T.csproj"));
-    assert.equal(events.some((e) => e.kind === "set"), false);
+    const setFor = (rel: string) =>
+      events.find((e): e is Extract<DiagnosticsEvent, { kind: "set" }> => e.kind === "set" && e.projectRel === rel);
+    const warnSet = setFor("src/L/L.csproj");
+    assert.ok(warnSet, "green build with warnings emitted no set for L");
+    assert.deepEqual(
+      warnSet.diagnostics.map((d) => [d.severity, d.code]),
+      [["warning", "CS0168"]],
+      "warning must survive a green build with the error gone"
+    );
+    assert.equal(setFor("tests/T/T.csproj")?.diagnostics.length, 0, "silent project must reset to empty");
+
+    // Run 3: warning fixed too (a real edit, or the stamps would rightly
+    // skip the rebuild and keep the still-valid warning) — the next silent
+    // build empties L as well.
+    mode = "clean";
+    events.length = 0;
+    fs.writeFileSync(path.join(root, "src", "L", "Thing.cs"), "class Thing { int x; }");
+    await runner.prepare();
+    assert.equal(await minimalBuild(), true, "clean minimal build failed");
+    assert.equal(setFor("src/L/L.csproj")?.diagnostics.length, 0, "fixed warning did not retire");
   } finally {
     cleanup(root);
   }

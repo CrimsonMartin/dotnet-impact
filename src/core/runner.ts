@@ -483,7 +483,9 @@ export class Runner {
         this.logSink(`minimal build failed for ${info.name}; falling back to full builds`);
         return false;
       }
-      this.diagnosticsSink({ kind: "clear", projectRel: relKey });
+      // A clean build still carries warnings; parsing (rather than clearing)
+      // sets those and retires everything else for this project.
+      this.emitBuildDiagnostics(relKey, (res.stdout ?? "") + (res.stderr ?? ""));
       // Record the stamp only when every source predates the overlay sync:
       // this build compiled the shadow copy, and an edit that landed after the
       // sync is IN the stamp but NOT in the compiled source. Recording it
@@ -833,9 +835,10 @@ export class Runner {
           this.emitBuildDiagnostics(rel, res.stdout + res.stderr);
         } else if (res.code === 0) {
           // A full build compiles the whole reference closure, so a clean exit
-          // also retires diagnostics filed under this project's dependencies
-          // (minimalBuild may have set them before falling back here).
-          for (const r of this.relClosure(rel)) this.diagnosticsSink({ kind: "clear", projectRel: r });
+          // surfaces its warnings and retires diagnostics filed under closure
+          // projects that came back silent (minimalBuild may have set them
+          // before falling back here).
+          this.emitBuildDiagnostics(rel, res.stdout + res.stderr, this.relClosure(rel));
         }
       }
       // Full builds rewrite dlls with no binlog: every hot-patch baseline is
@@ -853,12 +856,14 @@ export class Runner {
   }
 
   /**
-   * Parse a failed build's console output into diagnostics and emit `set`
-   * events. Shadow paths map back to the real repo; each diagnostic files
-   * under the project owning its file when that's identifiable (from the
-   * path or the trailing [proj] suffix), else under the built project.
+   * Parse a build's console output into diagnostics and emit `set` events —
+   * errors from failed builds, warnings from clean ones. Shadow paths map
+   * back to the real repo; each diagnostic files under the project owning
+   * its file when that's identifiable (from the path or the trailing [proj]
+   * suffix), else under the built project. Projects in `alsoClear` with no
+   * parsed diagnostics get an empty `set`, retiring anything stale.
    */
-  private emitBuildDiagnostics(builtRel: string, rawOutput: string): void {
+  private emitBuildDiagnostics(builtRel: string, rawOutput: string, alsoClear?: Iterable<string>): void {
     const shadowDir = this.shadow!.dir;
     const graph = this.projectGraph();
     const byRel = new Map<string, BuildDiagnostic[]>();
@@ -878,8 +883,10 @@ export class Runner {
       if (!byRel.has(rel)) byRel.set(rel, []);
       byRel.get(rel)!.push(d);
     }
-    // Nothing parsed still replaces stale diagnostics for the built project.
+    // Nothing parsed still replaces stale diagnostics for the built project
+    // (and, on a full build, its whole reference closure).
     if (!byRel.has(builtRel)) byRel.set(builtRel, []);
+    for (const rel of alsoClear ?? []) if (!byRel.has(rel)) byRel.set(rel, []);
     for (const [rel, diagnostics] of byRel) {
       this.diagnosticsSink({ kind: "set", projectRel: rel, diagnostics });
     }

@@ -10,8 +10,11 @@
   save, so squigglies land in ~100ms without waiting for a build. Rude
   edits (valid C# the runtime can't hot-patch) never squiggle. Diagnostics
   clear per project on its next clean build or clean delta emit, so they
-  can't go stale. Warnings are available behind
-  `dotnetImpact.surfaceBuildWarnings` (default off), and the status bar
+  can't go stale — and warnings survive a green build (a clean compile's
+  output is parsed too, not discarded). `dotnetImpact.surfaceBuildWarnings`
+  defaults to `auto`: warnings squiggle only when the C# extension isn't
+  installed, since its language server already shows them live and doubling
+  up would duplicate markers (`on`/`off` override). The status bar
   now says `✗ build failed (N errors)` instead of the misleading
   `✗ 0 failing` when a run dies in the compiler.
 
