@@ -69,3 +69,12 @@ test("--format values are validated, not passed through blind (#24)", () => {
   const p = parseCliArgs(["affected", "--format", "--staged"]);
   assert.deepEqual(p.errors, ["--format requires a value"]);
 });
+
+test("--parallel values are validated: positive integers only, never silently ignored", () => {
+  assert.deepEqual(validateCommandArgs(parseCliArgs(["build-map", "--parallel", "4"])), []);
+  for (const bad of ["abc", "0", "-2", "4.5"]) {
+    assert.deepEqual(validateCommandArgs(parseCliArgs(["build-map", "--parallel", bad])), [
+      `--parallel ${bad} is not valid (expected: a positive integer)`,
+    ]);
+  }
+});

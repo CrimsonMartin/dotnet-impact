@@ -19,7 +19,9 @@
  * Exit codes are the contract (stdout may change): 0 = affected tests passed,
  * or nothing to do; 1 = test failure or internal error; 2 = usage. And
  * infrastructure never blocks a commit: no map yet, or the shadow lock held
- * by another impact process, warns on stderr and exits 0.
+ * by another impact process, warns on stderr and exits 0. (build-map is the
+ * infrastructure step itself, so a held lock there exits 1 — nothing was
+ * built and the caller must know.)
  *
  * --ci (run only) flips that last rule for pipelines, where a soft skip would
  * green-light an untested PR: a missing map or a held shadow lock exits 1

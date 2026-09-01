@@ -35,6 +35,11 @@ export function validateCommandArgs(p: ParsedArgs): string[] {
   if (typeof format === "string" && !(AFFECTED_FORMATS as readonly string[]).includes(format)) {
     errors.push(`--format ${format} is not valid (expected: ${AFFECTED_FORMATS.join(", ")})`);
   }
+  // A typo'd count must not silently fall back to the default width.
+  const parallel = p.flags.get("--parallel");
+  if (typeof parallel === "string" && !/^[1-9]\d*$/.test(parallel)) {
+    errors.push(`--parallel ${parallel} is not valid (expected: a positive integer)`);
+  }
   return errors;
 }
 

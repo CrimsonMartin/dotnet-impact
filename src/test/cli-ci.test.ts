@@ -278,3 +278,193 @@ test("run --ci exit codes: green affected run exits 0, a failing test exits 1", 
     cleanup(root);
   }
 });
+
+// ---------------------------------------------------------------------------
+// Full CLI-surface audit: every command and flag proven against the real
+// binary, not just the parser. Cheap by design — scaffolds reuse the seeded
+// map and none of these invocations pays for a dotnet build.
+// ---------------------------------------------------------------------------
+
+/** Git in a scaffold repo with a pinned identity (matches scaffoldGitRepo's). */
+function gitIn(root: string, ...args: string[]): void {
+  execFileSync("git", args, {
+    cwd: root,
+    env: {
+      ...process.env,
+      GIT_AUTHOR_NAME: "t",
+      GIT_AUTHOR_EMAIL: "t@t",
+      GIT_COMMITTER_NAME: "t",
+      GIT_COMMITTER_EMAIL: "t@t",
+    },
+  });
+}
+
+test("status: reports the mapped class count, cold and seeded", async () => {
+  const root = scaffoldGitRepo();
+  try {
+    const cold = await cli(root, "status");
+    assert.equal(cold.code, 0, cold.stderr);
+    assert.match(cold.stdout, /impact map: 0 test classes mapped/);
+    seedMap(root);
+    const seeded = await cli(root, "status");
+    assert.equal(seeded.code, 0);
+    assert.match(seeded.stdout, /impact map: 1 test classes mapped/);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("affected line output: fallback projects print as project:<name> lines", async () => {
+  const root = scaffoldGitRepo();
+  try {
+    seedMap(root);
+    const r = await cli(root, "affected", "src/Lib/B.cs");
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(r.stdout.trim(), "project:T", "hooks parse this exact line form");
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("--base selection against real git history; a bad ref exits 2, never selects nothing", async () => {
+  const root = scaffoldGitRepo();
+  try {
+    seedMap(root);
+    // A typo'd ref in a pre-push hook must fail loudly, not green-light the push.
+    const bad = await cli(root, "affected", "--base", "no-such-ref");
+    assert.equal(bad.code, 2);
+    assert.match(bad.stderr, /--base no-such-ref: unknown revision/);
+
+    // Real selection: a commit touching the mapped file lands on top of the
+    // base, no file args — the diff drives it.
+    fs.appendFileSync(path.join(root, "src", "Lib", "A.cs"), "\n// touched\n");
+    gitIn(root, "add", "-A");
+    gitIn(root, "commit", "-qm", "touch A");
+    const r = await cli(root, "affected", "--base", "HEAD~1");
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(r.stdout.trim(), "Lib.Tests.ATests");
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("--staged selects the index only, through the real binary", async () => {
+  const root = scaffoldGitRepo();
+  try {
+    seedMap(root);
+    // Unstaged edit: --staged must NOT see it.
+    fs.appendFileSync(path.join(root, "src", "Lib", "A.cs"), "\n// dirty\n");
+    const unstaged = await cli(root, "affected", "--staged");
+    assert.equal(unstaged.code, 0, unstaged.stderr);
+    assert.equal(unstaged.stdout.trim(), "", "unstaged edits are invisible to --staged");
+    // Staged: selected.
+    gitIn(root, "add", "src/Lib/A.cs");
+    const staged = await cli(root, "affected", "--staged");
+    assert.equal(staged.code, 0, staged.stderr);
+    assert.equal(staged.stdout.trim(), "Lib.Tests.ATests");
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("file arguments and --base/--staged are mutually exclusive (exit 2) for affected and run", async () => {
+  const root = scaffoldGitRepo();
+  try {
+    seedMap(root);
+    for (const args of [
+      ["affected", "src/Lib/A.cs", "--staged"],
+      ["run", "src/Lib/A.cs", "--base", "HEAD"],
+    ]) {
+      const r = await cli(root, ...args);
+      assert.equal(r.code, 2, `${args.join(" ")} must be a usage error`);
+      assert.match(r.stderr, /mutually exclusive/);
+    }
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("usage errors exit 2: unknown command, no command, bad --parallel; outside a repo exits 1", async () => {
+  const root = scaffoldGitRepo();
+  try {
+    const unknown = await cli(root, "bogus");
+    assert.equal(unknown.code, 2);
+    assert.match(unknown.stderr, /usage: impact/);
+
+    const none = await cli(root);
+    assert.equal(none.code, 2);
+
+    const badParallel = await cli(root, "build-map", "--parallel", "abc");
+    assert.equal(badParallel.code, 2, "a typo'd --parallel must not be silently ignored");
+    assert.match(badParallel.stderr, /--parallel abc is not valid/);
+
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), "impact-cli-nongit-"));
+    try {
+      const r = await cli(outside, "status");
+      assert.equal(r.code, 1);
+      assert.match(r.stderr, /not inside a git repository/);
+    } finally {
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  } finally {
+    cleanup(root);
+  }
+});
+
+test("run: a clean tree reports 'no changes'; a non-source change reports 'no tests affected' — both exit 0", async () => {
+  const root = scaffoldGitRepo();
+  try {
+    seedMap(root);
+    const clean = await cli(root, "run");
+    assert.equal(clean.code, 0, clean.stderr);
+    assert.match(clean.stdout, /no changes detected; nothing to run/);
+
+    fs.writeFileSync(path.join(root, "README.md"), "docs only\n");
+    const docs = await cli(root, "run");
+    assert.equal(docs.code, 0, docs.stderr);
+    assert.match(docs.stdout, /no tests affected by this change/);
+  } finally {
+    try {
+      execFileSync("git", ["worktree", "prune"], { cwd: root });
+    } catch {
+      /* ignore */
+    }
+    cleanup(root);
+  }
+});
+
+test("build-map end to end on a projectless repo: maps 0, honors --parallel, --refresh beats --if-missing", async () => {
+  // No csproj anywhere → discovery finds nothing and no dotnet build runs,
+  // so the full command path (lock → prepare → discover → map → summary)
+  // stays cheap enough to drive for real.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "impact-cli-bm-"));
+  fs.writeFileSync(path.join(root, "README.md"), "empty\n");
+  gitIn(root, "init", "-q");
+  gitIn(root, "add", "-A");
+  gitIn(root, "commit", "-qm", "init");
+  try {
+    const first = await cli(root, "build-map", "--parallel", "4");
+    assert.equal(first.code, 0, first.stderr);
+    // A projectless repo maps nothing and still exits 0. (The static-map
+    // stage reports one "failed" row here — nothing buildable to analyze —
+    // which is summary noise, not an error exit; pinned as-is.)
+    assert.match(first.stdout, /mapped 0 test classes/);
+
+    // --if-missing alone would skip once a map exists; --refresh overrides it.
+    seedMap(root);
+    const skip = await cli(root, "build-map", "--if-missing");
+    assert.equal(skip.code, 0);
+    assert.match(skip.stdout, /skipping build/);
+    const forced = await cli(root, "build-map", "--if-missing", "--refresh");
+    assert.equal(forced.code, 0, forced.stderr);
+    assert.doesNotMatch(forced.stdout, /skipping build/, "--refresh must force the pass");
+    assert.match(forced.stdout, /mapped \d+ test classes/);
+  } finally {
+    try {
+      execFileSync("git", ["worktree", "prune"], { cwd: root });
+    } catch {
+      /* ignore */
+    }
+    cleanup(root);
+  }
+});
