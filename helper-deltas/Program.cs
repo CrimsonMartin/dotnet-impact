@@ -1,25 +1,34 @@
 // Impact delta service.
 //
-// Resident process holding Roslyn workspaces reconstructed from complogs
-// (Basic.CompilerLog). Edits are evaluated by Roslyn's own Edit-and-Continue
-// engine (the one behind dotnet-watch hot reload) via the vendored
-// ImpactHotReloadService facade: everything the runtime supports — method
-// bodies, added methods/fields/types, lambdas — becomes deltas the extension
-// pushes into live testhosts; rude edits are refused with their ENC
-// diagnostic so the caller falls back to a real build.
+// Resident process holding ONE Roslyn workspace reconstructed from complogs
+// (Basic.CompilerLog), spanning every loaded project (#22). Edits are
+// evaluated by Roslyn's own Edit-and-Continue engine (the one behind
+// dotnet-watch hot reload) via the vendored ImpactHotReloadService facade:
+// everything the runtime supports — method bodies, added methods/fields/
+// types, lambdas, and with the solution-wide session cross-project changes —
+// becomes deltas the extension pushes into live testhosts; rude edits are
+// refused with their ENC diagnostic so the caller falls back to a real build.
 //
 // Protocol: JSON lines on stdin/stdout.
 //   -> {"id":1,"cmd":"load","binlog":"/abs/x.complog","csproj":"/abs/Lib.csproj","dll":"/abs/Lib.dll",
 //       "caps":["Baseline","AddMethodToExistingType",...]}   caps optional: live-host capability intersection
 //   <- {"id":1,"type":"done","ok":true,"assembly":"Lib"}
-//   -> {"id":2,"cmd":"delta","csproj":"/abs/Lib.csproj","files":["/abs/Calc.cs","/abs/Extra.cs"]}
-//      ("file":"/abs/Calc.cs" also accepted for a single edit)
-//   <- {"id":2,"type":"done","ok":true,"assembly":"Lib","md":"<b64>","il":"<b64>","pdb":"<b64>"}
+//   -> {"id":2,"cmd":"delta","files":["/abs/Calc.cs","/abs/Consumer.cs"],
+//       "apiGuardExempt":["/abs/Lib.csproj"]}
+//      ("file":"/abs/Calc.cs" also accepted for a single edit; "csproj" accepted and ignored
+//       for lookup — documents resolve across the whole loaded solution)
+//   <- {"id":2,"type":"done","ok":true,
+//       "updates":[{"assembly":"Lib","md":"<b64>","il":"<b64>","pdb":"<b64>"}, ...]}
+//      (plus legacy top-level assembly/md/il/pdb when exactly one update)
 //      or {"id":2,"type":"done","ok":false,"reason":"rude edit ENC0023: ..."}
 //   -> {"id":3,"cmd":"reset"}   drop all state (after a real rebuild)
 //
-// Baselines chain across generations inside the EnC session; a "load" for an
-// already-loaded project re-initializes it (fresh dll after a rebuild).
+// Baselines chain across generations inside the EnC session. Loading a
+// project REBUILDS the merged solution and RESTARTS the session, which
+// re-reads baselines from disk — safe only while no delta has been committed
+// this epoch. A load after a committed delta is therefore refused
+// ("mid-epoch load"), and the caller takes the build path, which resets the
+// epoch and reloads everything fresh.
 
 using System.Collections.Immutable;
 using System.Text;
@@ -30,15 +39,9 @@ using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.ExternalAccess.HotReload.Api;
 using Microsoft.CodeAnalysis.Text;
 
-var projects = new Dictionary<string, EncProject>(StringComparer.OrdinalIgnoreCase);
+var solution = new EncSolution();
 var stdout = Console.Out;
 void Emit(object payload) => stdout.WriteLine(JsonSerializer.Serialize(payload));
-
-void ResetAll()
-{
-    foreach (var p in projects.Values) p.Dispose();
-    projects.Clear();
-}
 
 Emit(new { type = "ready" });
 string? line;
@@ -53,10 +56,10 @@ while ((line = Console.ReadLine()) != null)
         switch (root.GetProperty("cmd").GetString())
         {
             case "shutdown":
-                ResetAll();
+                solution.Reset();
                 return 0;
             case "reset":
-                ResetAll();
+                solution.Reset();
                 Emit(new { id, type = "done", ok = true });
                 break;
             case "snapshot":
@@ -66,20 +69,13 @@ while ((line = Console.ReadLine()) != null)
                 // corrupt the baseline the way raw binlogs (path-only) would.
                 var binlog = root.GetProperty("binlog").GetString()!;
                 var complog = root.GetProperty("complog").GetString()!;
-                // A loaded session's SolutionReader keeps its complog open
+                // A loaded project's SolutionReader keeps its complog open
                 // (it backs the solution's lazy text loaders), and FileShare
                 // is enforced even intra-process — on Linux via advisory
                 // locks — so converting over it would fail with a sharing
                 // violation. The rebuild that produced this binlog stales
-                // those baselines anyway: evict them before rewriting.
-                foreach (var stale in projects
-                    .Where(p => string.Equals(p.Value.ComplogPath, complog, StringComparison.OrdinalIgnoreCase))
-                    .Select(p => p.Key)
-                    .ToList())
-                {
-                    projects[stale].Dispose();
-                    projects.Remove(stale);
-                }
+                // those baselines anyway: evict before rewriting.
+                solution.EvictComplog(complog);
                 // An up-to-date build skips the compiler entirely; its binlog
                 // holds zero calls and converting it would replace a good
                 // baseline with an empty one. Count first, convert only if real.
@@ -123,23 +119,16 @@ while ((line = Console.ReadLine()) != null)
                         .ToImmutableArray();
                     if (list.Length > 0) caps = list;
                 }
-                var (state, reason) = EncProject.LoadAsync(binlog, csproj, dll, caps).GetAwaiter().GetResult();
-                if (state == null)
-                {
-                    Emit(new { id, type = "done", ok = false, reason });
-                    break;
-                }
-                if (projects.TryGetValue(csproj, out var old)) old.Dispose();
-                projects[csproj] = state;
-                Emit(new { id, type = "done", ok = true, assembly = state.AssemblyName });
+                var (ok, reason, assembly) = solution.Load(binlog, csproj, dll, caps);
+                if (ok) Emit(new { id, type = "done", ok = true, assembly });
+                else Emit(new { id, type = "done", ok = false, reason });
                 break;
             }
             case "delta":
             {
-                var csproj = root.GetProperty("csproj").GetString()!;
-                // One save can touch several files of a project (#11 P3): all
-                // of them go into a single emit so interdependent edits are
-                // analyzed together. "file" stays accepted for single edits.
+                // One save can touch several files across several projects
+                // (#11 P3, #22): all of them enter a single solution-wide
+                // emit so interdependent edits are analyzed together.
                 var files = new List<string>();
                 if (root.TryGetProperty("files", out var filesEl) && filesEl.ValueKind == JsonValueKind.Array)
                     files.AddRange(filesEl.EnumerateArray().Select(f => f.GetString()!).Where(f => f != null));
@@ -150,28 +139,47 @@ while ((line = Console.ReadLine()) != null)
                     Emit(new { id, type = "done", ok = false, reason = "no files in delta request" });
                     break;
                 }
-                if (!projects.TryGetValue(csproj, out var state))
+                // Projects whose in-repo dependents are ALL in the session:
+                // the engine sees the whole picture, so the cross-project
+                // API-surface valve steps aside and the engine decides.
+                var exempt = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                if (root.TryGetProperty("apiGuardExempt", out var exemptEl) && exemptEl.ValueKind == JsonValueKind.Array)
+                    foreach (var e in exemptEl.EnumerateArray())
+                        if (e.GetString() is { } s)
+                            exempt.Add(s);
+
+                var (updates, reason2) = solution.DeltaAsync(files, exempt).GetAwaiter().GetResult();
+                if (updates == null)
                 {
-                    Emit(new { id, type = "done", ok = false, reason = "not loaded" });
-                    break;
-                }
-                var (delta, reason) = state.DeltaAsync(files).GetAwaiter().GetResult();
-                if (delta == null)
-                {
-                    Emit(new { id, type = "done", ok = false, reason });
+                    Emit(new { id, type = "done", ok = false, reason = reason2 });
                 }
                 else
                 {
-                    Emit(new
-                    {
-                        id,
-                        type = "done",
-                        ok = true,
-                        assembly = state.AssemblyName,
-                        md = Convert.ToBase64String(delta.Value.Md),
-                        il = Convert.ToBase64String(delta.Value.Il),
-                        pdb = Convert.ToBase64String(delta.Value.Pdb),
-                    });
+                    var list = updates
+                        .Select(u => new
+                        {
+                            assembly = u.Assembly,
+                            md = Convert.ToBase64String(u.Md),
+                            il = Convert.ToBase64String(u.Il),
+                            pdb = Convert.ToBase64String(u.Pdb),
+                        })
+                        .ToArray();
+                    // Legacy single-update fields kept for protocol/test
+                    // compatibility when the emit spans exactly one module.
+                    if (list.Length == 1)
+                        Emit(new
+                        {
+                            id,
+                            type = "done",
+                            ok = true,
+                            updates = list,
+                            assembly = list[0].assembly,
+                            md = list[0].md,
+                            il = list[0].il,
+                            pdb = list[0].pdb,
+                        });
+                    else
+                        Emit(new { id, type = "done", ok = true, updates = list });
                 }
                 break;
             }
@@ -185,14 +193,18 @@ while ((line = Console.ReadLine()) != null)
         Emit(new { id, type = "done", ok = false, reason = e.Message });
     }
 }
-ResetAll();
+solution.Reset();
 return 0;
 
+sealed record AssemblyUpdate(string Assembly, byte[] Md, byte[] Il, byte[] Pdb);
+
 /// <summary>
-/// One project's EnC session: workspace + solution reconstructed from its
-/// complog, driven through Roslyn's Edit-and-Continue engine.
+/// The merged EnC session: every loaded project lives in one AdhocWorkspace
+/// solution with metadata references to sibling outputs rewired into
+/// ProjectReferences, so a change in a library flows into its dependents'
+/// compilations and one emit can span modules (#22).
 /// </summary>
-sealed class EncProject : IDisposable
+sealed class EncSolution
 {
     /// <summary>
     /// Fallback CoreCLR (.NET 8+) hot-reload capabilities, used when no live
@@ -202,7 +214,7 @@ sealed class EncProject : IDisposable
     /// anything a host can't do beyond this guess would still be refused at
     /// ApplyUpdate, and that push failure already forces the build path.
     /// </summary>
-    private static readonly ImmutableArray<string> Capabilities = ImmutableArray.Create(
+    private static readonly ImmutableArray<string> DefaultCapabilities = ImmutableArray.Create(
         "Baseline",
         "AddMethodToExistingType",
         "AddStaticFieldToExistingType",
@@ -214,44 +226,64 @@ sealed class EncProject : IDisposable
         "GenericAddMethodToExistingType",
         "GenericAddFieldToExistingType");
 
-    public required string AssemblyName;
-    /// <summary>The complog this session was loaded from (its reader holds the file open).</summary>
-    public required string ComplogPath;
-    private AdhocWorkspace _workspace = null!;
-    private ImpactHotReloadService _service = null!;
-    private Solution _current = null!;
-    private Dictionary<string, DocumentId> _documents = null!;
-    /// <summary>Backs the solution's lazy text loaders; must outlive the session.</summary>
-    private SolutionReader _reader = null!;
-
-    public static async Task<(EncProject?, string)> LoadAsync(
-        string complogPath, string csproj, string dll, ImmutableArray<string>? capabilities = null)
+    private sealed class LoadedProject : IDisposable
     {
+        public required string Csproj;
+        public required string ComplogPath;
+        public required string Dll;
+        public required string AssemblyName;
+        /// <summary>Project skeleton from the complog; re-added on every session rebuild.</summary>
+        public required ProjectInfo Info;
+        /// <summary>Checksummed source texts keyed by build-time file path.</summary>
+        public required Dictionary<string, SourceText> Texts;
+        /// <summary>Backs the solution's lazy loaders; must outlive every session using Info.</summary>
+        public required SolutionReader Reader;
+        /// <summary>File path -> document id, valid for the CURRENT session build.</summary>
+        public Dictionary<string, DocumentId> Documents = new(StringComparer.OrdinalIgnoreCase);
+        public void Dispose() => Reader.Dispose();
+    }
+
+    private readonly Dictionary<string, LoadedProject> _projects = new(StringComparer.OrdinalIgnoreCase);
+    private AdhocWorkspace? _workspace;
+    private ImpactHotReloadService? _service;
+    private Solution? _current;
+    private ImmutableArray<string> _caps = DefaultCapabilities;
+    /// <summary>True once a delta has been committed this epoch: session restarts would
+    /// re-read disk baselines the hosts have already moved past, so loads are refused.</summary>
+    private bool _committed;
+
+    public (bool Ok, string Reason, string Assembly) Load(
+        string complogPath, string csproj, string dll, ImmutableArray<string>? caps)
+    {
+        if (_committed)
+            // Restarting the session now would re-baseline from disk while the
+            // hosts run committed generations — the caller must rebuild
+            // (which resets the epoch) instead.
+            return (false, "mid-epoch load — rebuild needed", "");
+
         var reader = SolutionReader.Create(complogPath, BasicAnalyzerKind.OnDisk);
-        var workspace = ImpactEncWorkspace.Create();
-        var solution = workspace.AddSolution(reader.ReadSolutionInfo());
-
-        var project = solution.Projects.FirstOrDefault(p =>
-            string.Equals(p.FilePath, csproj, StringComparison.OrdinalIgnoreCase)
-            || Path.GetFileName(p.FilePath ?? "") == Path.GetFileName(csproj));
-        if (project == null)
+        ProjectInfo? info = null;
+        foreach (var candidate in reader.ReadSolutionInfo().Projects)
         {
-            workspace.Dispose();
-            reader.Dispose();
-            return (null, "project not found in binlog");
+            if (string.Equals(candidate.FilePath, csproj, StringComparison.OrdinalIgnoreCase)
+                || Path.GetFileName(candidate.FilePath ?? "") == Path.GetFileName(csproj))
+            {
+                info = candidate;
+                break;
+            }
         }
-
-        // The EnC engine reads the baseline module from the project's output
-        // path; the complog doesn't carry one, so point it at the built dll.
-        solution = solution
-            .WithProjectOutputFilePath(project.Id, dll)
-            .WithProjectCompilationOutputInfo(project.Id, project.CompilationOutputInfo.WithAssemblyPath(dll));
+        if (info == null)
+        {
+            reader.Dispose();
+            return (false, "project not found in binlog", "");
+        }
 
         // The engine trusts a baseline document only when its text checksum
         // matches the PDB's. SolutionReader materializes texts from strings
         // with no encoding, so GetChecksum() is empty and every document reads
         // as out-of-sync (ENC1008 "stale project"). Rebuild each text from the
         // complog tree's string WITH its encoding + checksum algorithm.
+        var texts = new Dictionary<string, SourceText>(StringComparer.OrdinalIgnoreCase);
         using (var callReader = CompilerCallReaderUtil.Create(complogPath, BasicAnalyzerKind.OnDisk))
         {
             var data = callReader
@@ -261,92 +293,108 @@ sealed class EncProject : IDisposable
                     || Path.GetFileName(d.CompilerCall.ProjectFilePath ?? "") == Path.GetFileName(csproj));
             if (data != null)
             {
-                var byPath = new Dictionary<string, SourceText>(StringComparer.OrdinalIgnoreCase);
                 foreach (var tree in data.Compilation.SyntaxTrees)
                 {
                     if (string.IsNullOrEmpty(tree.FilePath)) continue;
                     var text = tree.GetText();
-                    byPath[tree.FilePath] = SourceText.From(
+                    texts[tree.FilePath] = SourceText.From(
                         text.ToString(),
                         text.Encoding ?? tree.Encoding ?? new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
                         text.ChecksumAlgorithm);
                 }
-                foreach (var docu in solution.GetProject(project.Id)!.Documents)
-                    if (docu.FilePath != null && byPath.TryGetValue(docu.FilePath, out var text))
-                        solution = solution.WithDocumentText(docu.Id, text);
-                // The dll may postdate the complog: any build that bypasses the
-                // snapshot path (test discovery's solution build, a manual
-                // dotnet build) rewrites outputs without refreshing the
-                // baseline. The engine then treats every baseline document as
-                // out-of-sync and reports each edit as "no changes" — the
-                // caller would keep running the stale assembly GREEN. Compare
-                // the complog texts' checksums against the PDB that shipped
-                // with the dll and refuse the pair outright: the build path
-                // rebuilds and re-snapshots, restoring a matched baseline.
-                var stale = StaleBaselineFile(dll, byPath);
-                if (stale != null)
-                {
-                    workspace.Dispose();
-                    reader.Dispose();
-                    return (null, $"baseline mismatch: {stale} differs between the built pdb and the complog "
-                        + "— dll and complog come from different builds; rebuild needed");
-                }
             }
         }
 
-        var service = new ImpactHotReloadService(workspace.Services, capabilities ?? Capabilities);
-        await service.StartSessionAsync(solution, CancellationToken.None).ConfigureAwait(false);
-
-        var documents = new Dictionary<string, DocumentId>(StringComparer.OrdinalIgnoreCase);
-        foreach (var d in solution.GetProject(project.Id)!.Documents)
-            if (d.FilePath != null)
-                documents[d.FilePath] = d.Id;
-
-        return (new EncProject
+        // The dll may postdate the complog: any build that bypasses the
+        // snapshot path (test discovery's solution build, a manual
+        // dotnet build) rewrites outputs without refreshing the
+        // baseline. The engine then treats every baseline document as
+        // out-of-sync and reports each edit as "no changes" — the
+        // caller would keep running the stale assembly GREEN. Compare
+        // the complog texts' checksums against the PDB that shipped
+        // with the dll and refuse the pair outright: the build path
+        // rebuilds and re-snapshots, restoring a matched baseline.
+        var stale = StaleBaselineFile(dll, texts);
+        if (stale != null)
         {
+            reader.Dispose();
+            return (false, $"baseline mismatch: {stale} differs between the built pdb and the complog "
+                + "— dll and complog come from different builds; rebuild needed", "");
+        }
+
+        var loaded = new LoadedProject
+        {
+            Csproj = csproj,
+            ComplogPath = complogPath,
+            Dll = dll,
             // The hook routes deltas by simple assembly name; SolutionReader
             // carries the /out file name ("Lib.dll") here.
-            AssemblyName = project.AssemblyName.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)
-                ? Path.GetFileNameWithoutExtension(project.AssemblyName)
-                : project.AssemblyName,
-            ComplogPath = complogPath,
-            _workspace = workspace,
-            _service = service,
-            _current = solution,
-            _documents = documents,
-            _reader = reader,
-        }, "");
+            AssemblyName = TrimDll(string.IsNullOrEmpty(info.AssemblyName)
+                ? Path.GetFileNameWithoutExtension(csproj)
+                : info.AssemblyName),
+            Info = info,
+            Texts = texts,
+            Reader = reader,
+        };
+        if (caps.HasValue) _caps = caps.Value;
+        if (_projects.TryGetValue(csproj, out var old)) old.Dispose();
+        _projects[csproj] = loaded;
+
+        var (ok, reason) = RebuildSession();
+        if (!ok)
+        {
+            _projects.Remove(csproj);
+            loaded.Dispose();
+            RebuildSession(); // best effort back to the previous set
+            return (false, reason, "");
+        }
+        return (true, "", loaded.AssemblyName);
     }
 
-    public async Task<((byte[] Md, byte[] Il, byte[] Pdb)?, string)> DeltaAsync(IReadOnlyList<string> files)
+    public async Task<(List<AssemblyUpdate>?, string)> DeltaAsync(
+        IReadOnlyList<string> files, HashSet<string> apiGuardExempt)
     {
-        // All of a save's edits to this project enter one emit (#11 P3):
-        // per-file emits would analyze each edit against a solution missing
-        // its siblings, refusing interdependent edits (a method added in one
-        // file, called from another) that the engine accepts together.
+        // A snapshot eviction tears the session down but keeps the surviving
+        // projects; rebuild lazily so they stay hot-patchable (only ever at
+        // gen 0 — eviction resets the committed flag).
+        if (_service == null && _projects.Count > 0 && !_committed)
+        {
+            var (ok, reason) = RebuildSession();
+            if (!ok) return (null, reason);
+        }
+        if (_service == null || _current == null) return (null, "not loaded");
+
+        // All of a save's edits enter one emit (#11 P3, #22): per-file emits
+        // would analyze each edit against a solution missing its siblings,
+        // refusing interdependent edits the engine accepts together.
         var updated = _current;
         foreach (var file in files)
         {
-            var docId = FindDocument(file);
-            if (docId == null) return (null, $"{Path.GetFileName(file)}: file not in compilation");
+            var (owner, docId) = FindDocument(file);
+            if (owner == null || docId == null) return (null, $"{Path.GetFileName(file)}: file not in compilation");
 
             var text = SourceText.From(File.ReadAllText(file), Encoding.UTF8);
-
-            // Cross-project safety valve. The EnC session spans one project, so
-            // the engine happily models a changed public signature as "add new,
-            // keep old alive in metadata" — dependent test assemblies would keep
-            // calling the old member and stay green even though the solution no
-            // longer compiles. Any disappeared non-private declaration therefore
-            // forces the build path, where the dependent compile failure surfaces.
             var oldText = (await _current.GetDocument(docId)!.GetTextAsync().ConfigureAwait(false)).ToString();
-            var removed = ApiGuard.RemovedVisibleDeclaration(oldText, text.ToString());
-            if (removed != null)
-                return (null, $"api change: {removed} removed or signature changed — dependents must rebuild");
 
-            // A brand-new test method hot-patches cleanly but invisibly: the test
-            // runner discovers tests from the assembly on disk (a fresh testhost
-            // enumerates the un-patched dll), so the new [Fact] would neither run
-            // nor appear in the tree. Only a rebuild makes it discoverable.
+            // Cross-project safety valve. When the changed project's in-repo
+            // dependents are NOT all in the session, the engine happily
+            // models a changed public signature as "add new, keep old alive
+            // in metadata" — absent dependents would keep calling the old
+            // member and stay green even though the solution no longer
+            // compiles. Exempt projects (all dependents loaded, computed by
+            // the caller from the project graph) skip this and let the
+            // engine decide — a genuine rude edit still refuses below.
+            if (!apiGuardExempt.Contains(owner.Csproj))
+            {
+                var removed = ApiGuard.RemovedVisibleDeclaration(oldText, text.ToString());
+                if (removed != null)
+                    return (null, $"api change: {removed} removed or signature changed — dependents must rebuild");
+            }
+
+            // A brand-new test method hot-patches cleanly but invisibly: the
+            // test runner discovers tests from the assembly on disk (a fresh
+            // testhost enumerates the un-patched dll), so the new [Fact]
+            // would neither run nor appear in the tree. Never exempt.
             var addedTest = ApiGuard.AddedTestMethod(oldText, text.ToString());
             if (addedTest != null)
                 return (null, $"new test method: {addedTest} — rebuilding so the test runner discovers it");
@@ -393,19 +441,171 @@ sealed class EncProject : IDisposable
             return (null, error != null ? $"compile error: {error}" : "engine refused the update");
         }
 
-        if (updates.ProjectUpdates.Length != 1)
+        var result = new List<AssemblyUpdate>();
+        foreach (var u in updates.ProjectUpdates)
         {
-            // The hook protocol pushes one assembly per delta; multi-module
-            // updates from a single-project session would mean generators
-            // fanned out — refuse and let the build path handle it.
-            Discard();
-            return (null, $"multi-module update ({updates.ProjectUpdates.Length}) not supported");
+            var name = _projects.Values.FirstOrDefault(p => ProjectIdOf(p) == u.ProjectId)?.AssemblyName
+                ?? TrimDll(_current.GetProject(u.ProjectId)?.AssemblyName ?? "");
+            if (string.IsNullOrEmpty(name))
+            {
+                Discard();
+                return (null, "update for an unknown module — using build path");
+            }
+            result.Add(new AssemblyUpdate(
+                name, u.MetadataDelta.ToArray(), u.ILDelta.ToArray(), u.PdbDelta.ToArray()));
         }
-
-        var u = updates.ProjectUpdates[0];
         _service.CommitUpdate();
         _current = updated;
-        return ((u.MetadataDelta.ToArray(), u.ILDelta.ToArray(), u.PdbDelta.ToArray()), "");
+        _committed = true;
+        return (result, "");
+    }
+
+    /// <summary>Drop a project whose complog is about to be rewritten (post-rebuild snapshot).</summary>
+    public void EvictComplog(string complog)
+    {
+        var stale = _projects
+            .Where(p => string.Equals(p.Value.ComplogPath, complog, StringComparison.OrdinalIgnoreCase))
+            .Select(p => p.Key)
+            .ToList();
+        if (stale.Count == 0) return;
+        foreach (var key in stale)
+        {
+            _projects[key].Dispose();
+            _projects.Remove(key);
+        }
+        // The rebuild that produced this snapshot stales the whole epoch; the
+        // caller resets and reloads right after. Tear down now so the reader
+        // handles are gone before the complog is rewritten.
+        TearDownSession();
+        _committed = false;
+    }
+
+    public void Reset()
+    {
+        foreach (var p in _projects.Values) p.Dispose();
+        _projects.Clear();
+        TearDownSession();
+        _committed = false;
+    }
+
+    // ---- session assembly ----
+
+    private (bool Ok, string Reason) RebuildSession()
+    {
+        TearDownSession();
+        if (_projects.Count == 0) return (true, "");
+        try
+        {
+            var workspace = ImpactEncWorkspace.Create();
+            var merged = workspace.AddSolution(SolutionInfo.Create(
+                SolutionId.CreateNewId(),
+                VersionStamp.Create(),
+                projects: _projects.Values.Select(p => p.Info).ToImmutableArray()));
+
+            var byAssembly = new Dictionary<string, LoadedProject>(StringComparer.OrdinalIgnoreCase);
+            foreach (var p in _projects.Values) byAssembly[p.AssemblyName] = p;
+
+            foreach (var lp in _projects.Values)
+            {
+                var projectId = lp.Info.Id;
+                // The EnC engine reads the baseline module from the project's
+                // output path; the complog doesn't carry one, so point it at
+                // the built dll.
+                var project = merged.GetProject(projectId)!;
+                merged = merged
+                    .WithProjectOutputFilePath(projectId, lp.Dll)
+                    .WithProjectCompilationOutputInfo(projectId, project.CompilationOutputInfo.WithAssemblyPath(lp.Dll));
+
+                // Checksummed texts (see Load) replace the reader's raw ones.
+                foreach (var docu in merged.GetProject(projectId)!.Documents)
+                    if (docu.FilePath != null && lp.Texts.TryGetValue(docu.FilePath, out var text))
+                        merged = merged.WithDocumentText(docu.Id, text);
+
+                // Reference rewiring — the heart of the solution-wide session:
+                // the complog references sibling projects as built dlls, which
+                // freezes them; swap each such metadata reference for a
+                // ProjectReference so edits in the sibling flow into THIS
+                // project's compilation and one emit can span both modules.
+                foreach (var mref in merged.GetProject(projectId)!.MetadataReferences.ToList())
+                {
+                    if (mref is not PortableExecutableReference pe || pe.FilePath is null) continue;
+                    var refName = Path.GetFileNameWithoutExtension(pe.FilePath);
+                    if (!byAssembly.TryGetValue(refName, out var target) || target == lp) continue;
+                    merged = merged
+                        .RemoveMetadataReference(projectId, mref)
+                        .AddProjectReference(projectId, new ProjectReference(target.Info.Id));
+                }
+            }
+
+            var service = new ImpactHotReloadService(workspace.Services, _caps);
+            service.StartSessionAsync(merged, CancellationToken.None).GetAwaiter().GetResult();
+
+            foreach (var lp in _projects.Values)
+            {
+                lp.Documents = new Dictionary<string, DocumentId>(StringComparer.OrdinalIgnoreCase);
+                foreach (var d in merged.GetProject(lp.Info.Id)!.Documents)
+                    if (d.FilePath != null)
+                        lp.Documents[d.FilePath] = d.Id;
+            }
+
+            _workspace = workspace;
+            _service = service;
+            _current = merged;
+            return (true, "");
+        }
+        catch (Exception e)
+        {
+            TearDownSession();
+            return (false, $"session rebuild failed: {e.Message}");
+        }
+    }
+
+    private void TearDownSession()
+    {
+        try
+        {
+            _service?.EndSession();
+        }
+        catch
+        {
+            /* session never started or already ended */
+        }
+        _workspace?.Dispose();
+        _service = null;
+        _workspace = null;
+        _current = null;
+    }
+
+    private static ProjectId ProjectIdOf(LoadedProject p) => p.Info.Id;
+
+    private static string TrimDll(string assemblyName) =>
+        assemblyName.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)
+            ? Path.GetFileNameWithoutExtension(assemblyName)
+            : assemblyName;
+
+    private (LoadedProject?, DocumentId?) FindDocument(string file)
+    {
+        foreach (var lp in _projects.Values)
+            if (lp.Documents.TryGetValue(file, out var exact))
+                return (lp, exact);
+        var suffix = Path.DirectorySeparatorChar + Path.GetFileName(file);
+        foreach (var lp in _projects.Values)
+            foreach (var (path, docId) in lp.Documents)
+                if (path.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+                    return (lp, docId);
+        return (null, null);
+    }
+
+    private void Discard()
+    {
+        try
+        {
+            _service?.DiscardUpdate();
+        }
+        catch
+        {
+            // Nothing pending (e.g. Blocked before an emit): fine.
+        }
     }
 
     /// <summary>
@@ -440,51 +640,16 @@ sealed class EncProject : IDisposable
             return null; // unreadable pdb: let the engine report it on first use
         }
     }
-
-    private DocumentId? FindDocument(string file)
-    {
-        if (_documents.TryGetValue(file, out var exact)) return exact;
-        var suffix = Path.DirectorySeparatorChar + Path.GetFileName(file);
-        foreach (var (path, docId) in _documents)
-            if (path.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
-                return docId;
-        return null;
-    }
-
-    private void Discard()
-    {
-        try
-        {
-            _service.DiscardUpdate();
-        }
-        catch
-        {
-            // Nothing pending (e.g. Blocked before an emit): fine.
-        }
-    }
-
-    public void Dispose()
-    {
-        try
-        {
-            _service.EndSession();
-        }
-        catch
-        {
-            /* session never started or already ended */
-        }
-        _workspace.Dispose();
-        _reader.Dispose();
-    }
 }
 
 /// <summary>
-/// Cross-project safety valve for the per-project EnC sessions: detects
-/// declarations visible outside the file's own assembly-private scope that
-/// DISAPPEAR between two versions of a file. Additions and body edits pass;
-/// a removed/renamed/re-signatured non-private declaration must rebuild so
-/// dependent assemblies (tests, IVT friends) recompile against the new API.
-/// Trivia never participates (keys are token/signature based).
+/// Cross-project safety valve for projects whose dependents are NOT all in
+/// the session: detects declarations visible outside the file's own
+/// assembly-private scope that DISAPPEAR between two versions of a file.
+/// Additions and body edits pass; a removed/renamed/re-signatured non-private
+/// declaration must rebuild so dependent assemblies (tests, IVT friends)
+/// recompile against the new API. Trivia never participates (keys are
+/// token/signature based).
 /// </summary>
 static class ApiGuard
 {

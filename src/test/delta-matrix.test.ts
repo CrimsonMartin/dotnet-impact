@@ -198,12 +198,15 @@ test("fast-path patchability matrix", { timeout: 600_000 }, async () => {
     const snap = await send({ cmd: "snapshot", binlog, complog });
     assert.equal(snap.ok, true, `snapshot: ${snap.reason}`);
 
-    // Each row runs against a fresh generation-0 session (load re-initializes
-    // from the complog baseline), so rows are order-independent.
+    // Each row runs against a fresh generation-0 session. Since #22 a load
+    // cannot re-baseline past a committed delta (mid-epoch loads are refused
+    // to protect generation chaining), so do what the build path does between
+    // epochs: reset, then load.
     let hits = 0;
     const deltaMs: number[] = [];
     let loadMs = 0;
     for (const row of MATRIX) {
+      await send({ cmd: "reset" });
       const t0 = Date.now();
       const load = await send({ cmd: "load", binlog: complog, csproj, dll });
       loadMs = Date.now() - t0;

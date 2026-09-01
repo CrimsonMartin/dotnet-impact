@@ -167,50 +167,70 @@ export class HotPatcher {
     // deltas that would die at ApplyUpdate.
     const caps = intersectCapabilities(hosts.map((h) => h.capabilities));
 
-    // Load projects on demand (once per epoch), then request deltas.
-    const deltas: Array<{ assembly: string; md: Buffer; il: Buffer; pdb: Buffer }> = [];
-    for (const [csprojAbs, filesAbs] of byProject) {
-      if (!this.loaded.has(csprojAbs)) {
-        const rel = toRepoRelative(this.repoRoot, csprojAbs);
-        const shadowCsproj = this.shadowPathOf(csprojAbs);
-        const dll = this.builtDllFor(graph, csprojAbs);
-        if (!dll) return false;
-        const r = await this.request({
-          cmd: "load",
-          binlog: binlogs[rel],
-          csproj: shadowCsproj,
-          dll,
-          ...(caps ? { caps } : {}),
-        });
-        if (!r.ok) {
-          this.log(`hotpatch: load failed for ${rel}: ${r.reason}`);
-          return false;
-        }
-        this.loaded.add(csprojAbs);
-      }
-      const label = filesAbs.map((f) => path.basename(f)).join("+");
+    // The engine can only hot-patch an API change when every project consuming
+    // it recompiles inside the same session (#22): pull the owners' transitive
+    // dependents (those with baselines) into the session, and exempt an owner
+    // from the API-surface guard only when ALL its dependents made it in.
+    const hasBaseline = (csprojAbs: string): boolean => {
+      const b = binlogs[toRepoRelative(this.repoRoot, csprojAbs)];
+      return !!b && fs.existsSync(b);
+    };
+    const { exemptAbs, loadAlsoAbs } = apiGuardExemptFor(graph, [...byProject.keys()], hasBaseline);
+
+    // Load owners + dependents on demand (once per epoch). Mid-epoch loads
+    // are refused by the service (session restarts would corrupt generation
+    // chaining), which lands here as a load failure → build path → reset.
+    for (const csprojAbs of new Set([...byProject.keys(), ...loadAlsoAbs])) {
+      if (this.loaded.has(csprojAbs)) continue;
+      const rel = toRepoRelative(this.repoRoot, csprojAbs);
+      const shadowCsproj = this.shadowPathOf(csprojAbs);
+      const dll = this.builtDllFor(graph, csprojAbs);
+      if (!dll) return false;
       const r = await this.request({
-        cmd: "delta",
-        csproj: this.shadowPathOf(csprojAbs),
-        files: filesAbs.map((f) => path.join(this.shadowDir!, toRepoRelative(this.repoRoot, f))),
+        cmd: "load",
+        binlog: binlogs[rel],
+        csproj: shadowCsproj,
+        dll,
+        ...(caps ? { caps } : {}),
       });
-      if (!r.ok && (r.reason ?? "").startsWith("no-op")) {
-        // Semantically unchanged file(s): nothing to patch, not a failure —
-        // but say so. A no-op on an edit the user believes is real is the one
-        // trace of a stale baseline, and it must never vanish silently.
-        this.log(`hotpatch: ${label}: ${r.reason}`);
-        continue;
-      }
       if (!r.ok) {
-        this.log(`hotpatch: ${label}: ${r.reason} — using build path`);
+        this.log(`hotpatch: load failed for ${rel}: ${r.reason}`);
         return false;
       }
-      deltas.push({
-        assembly: r.assembly!,
-        md: Buffer.from(r.md!, "base64"),
-        il: Buffer.from(r.il!, "base64"),
-        pdb: Buffer.from(r.pdb!, "base64"),
-      });
+      this.loaded.add(csprojAbs);
+    }
+
+    // One solution-wide emit for the whole save (#22): every changed file in
+    // one request, so cross-project edits are analyzed together and the reply
+    // may carry one delta per touched module.
+    const filesAbs = [...byProject.values()].flat();
+    const label = filesAbs.map((f) => path.basename(f)).join("+");
+    const deltas: Array<{ assembly: string; md: Buffer; il: Buffer; pdb: Buffer }> = [];
+    const r = await this.request({
+      cmd: "delta",
+      files: filesAbs.map((f) => path.join(this.shadowDir!, toRepoRelative(this.repoRoot, f))),
+      ...(exemptAbs.length > 0 ? { apiGuardExempt: exemptAbs.map((p) => this.shadowPathOf(p)) } : {}),
+    });
+    if (!r.ok && (r.reason ?? "").startsWith("no-op")) {
+      // Semantically unchanged file(s): nothing to patch, not a failure — but
+      // say so. A no-op on an edit the user believes is real is the one trace
+      // of a stale baseline, and it must never vanish silently.
+      this.log(`hotpatch: ${label}: ${r.reason}`);
+    } else if (!r.ok) {
+      this.log(`hotpatch: ${label}: ${r.reason} — using build path`);
+      return false;
+    } else {
+      const updates =
+        r.updates ??
+        (r.assembly ? [{ assembly: r.assembly, md: r.md!, il: r.il!, pdb: r.pdb! }] : []);
+      for (const u of updates) {
+        deltas.push({
+          assembly: u.assembly,
+          md: Buffer.from(u.md, "base64"),
+          il: Buffer.from(u.il, "base64"),
+          pdb: Buffer.from(u.pdb, "base64"),
+        });
+      }
     }
 
     // Push every delta to every live testhost. A dead pipe (stale pid file,
@@ -547,6 +567,50 @@ export function intersectCapabilities(reported: Array<string[] | undefined>): st
   return out;
 }
 
+/**
+ * Which changed projects may skip the cross-project API-surface guard, and
+ * which additional projects must join the session for that to be sound (#22).
+ *
+ * An owner is exempt only when EVERY transitive dependent (graph reverse
+ * edges) has a baseline — then the engine sees the whole consumer set and can
+ * judge an API change itself (emit updates for dependents, or rude-edit).
+ * Any dependent without a baseline stays invisible to the session, so the
+ * guard keeps refusing exactly as it did pre-#22. Dependents WITH baselines
+ * are returned for loading either way: recompiling them inside the session is
+ * never wrong, and partial coverage still helps body-level edits.
+ */
+export function apiGuardExemptFor(
+  graph: ProjectGraph,
+  ownersAbs: string[],
+  hasBaseline: (csprojAbs: string) => boolean
+): { exemptAbs: string[]; loadAlsoAbs: string[] } {
+  const normKey = (p: string): string => path.resolve(p).toLowerCase();
+  const exemptAbs: string[] = [];
+  const loadAlso = new Set<string>();
+  for (const owner of ownersAbs) {
+    const seen = new Set<string>([normKey(owner)]);
+    const queue = [normKey(owner)];
+    let allCovered = true;
+    while (queue.length > 0) {
+      const cur = queue.shift()!;
+      for (const parentKey of graph.referencedBy.get(cur) ?? []) {
+        if (seen.has(parentKey)) continue;
+        seen.add(parentKey);
+        queue.push(parentKey);
+        const parent = graph.projects.get(parentKey);
+        if (!parent) {
+          allCovered = false;
+          continue;
+        }
+        if (hasBaseline(parent.csproj)) loadAlso.add(parent.csproj);
+        else allCovered = false;
+      }
+    }
+    if (allCovered) exemptAbs.push(owner);
+  }
+  return { exemptAbs, loadAlsoAbs: [...loadAlso] };
+}
+
 interface DeltaReply {
   ok: boolean;
   reason?: string;
@@ -555,6 +619,8 @@ interface DeltaReply {
   md?: string;
   il?: string;
   pdb?: string;
+  /** Solution-wide emits (#22): one entry per touched module. */
+  updates?: Array<{ assembly: string; md: string; il: string; pdb: string }>;
 }
 
 function hash(s: string): string {
