@@ -196,3 +196,85 @@ test("build-map --if-missing: no-op with a map present, exit 0", async () => {
     cleanup(root);
   }
 });
+
+/**
+ * The exit codes a pipeline actually branches on, pinned with REAL runs so
+ * 0 and 1 can never be swapped: `run --ci` must exit 0 when the affected
+ * tests pass and 1 when one fails. Unlike the tests above, this scaffolds a
+ * buildable repo and runs dotnet — the price of pinning the real mapping
+ * (`result.ok ? 0 : 1`) end to end rather than trusting a unit seam.
+ */
+test("run --ci exit codes: green affected run exits 0, a failing test exits 1", { timeout: 600_000 }, async () => {
+  const { dotnetOrNull } = await import("./deltas-helper");
+  if (!dotnetOrNull()) return; // no SDK on this machine: nothing to test against
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "impact-cli-exit-"));
+  fs.mkdirSync(path.join(root, "src", "Calc"), { recursive: true });
+  fs.mkdirSync(path.join(root, "tests", "Calc.Tests"), { recursive: true });
+  fs.writeFileSync(
+    path.join(root, "src", "Calc", "Calc.csproj"),
+    '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>'
+  );
+  const calcCs = path.join(root, "src", "Calc", "Calc.cs");
+  const GOOD = "namespace Calc;\n\npublic static class Calculator\n{\n    public static int Add(int a, int b)\n    {\n        return a + b;\n    }\n}\n";
+  fs.writeFileSync(calcCs, GOOD);
+  fs.writeFileSync(
+    path.join(root, "tests", "Calc.Tests", "Calc.Tests.csproj"),
+    `<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net10.0</TargetFramework><IsPackable>false</IsPackable></PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.0" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <ProjectReference Include="../../src/Calc/Calc.csproj" />
+  </ItemGroup>
+</Project>`
+  );
+  fs.writeFileSync(
+    path.join(root, "tests", "Calc.Tests", "CalcTests.cs"),
+    "using Xunit;\n\nnamespace Calc.Tests;\n\npublic class CalcTests\n{\n    [Fact] public void Adds() => Assert.Equal(5, Calc.Calculator.Add(2, 3));\n}\n"
+  );
+  const git = (...args: string[]) =>
+    execFileSync("git", args, {
+      cwd: root,
+      env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" },
+    });
+  git("init", "-q");
+  git("add", "-A");
+  git("commit", "-qm", "init");
+  fs.mkdirSync(cacheDirFor(root), { recursive: true });
+  fs.writeFileSync(
+    path.join(cacheDirFor(root), "impact-map.json"),
+    JSON.stringify({
+      version: 1,
+      entries: {
+        "Calc.Tests.CalcTests": {
+          csproj: "tests/Calc.Tests/Calc.Tests.csproj",
+          files: ["src/Calc/Calc.cs"],
+          source: "coverage",
+          updatedAt: new Date().toISOString(),
+        },
+      },
+    })
+  );
+
+  try {
+    // Green: the affected class passes → exit 0, and the summary says so.
+    const green = await cli(root, "run", "--ci", "src/Calc/Calc.cs");
+    assert.equal(green.code, 0, `green run must exit 0; stderr: ${green.stderr.slice(0, 500)}`);
+    assert.match(green.stdout + green.stderr, /1\/1 passed/);
+
+    // Red: break the method → the same invocation must exit 1 and name the failure.
+    fs.writeFileSync(calcCs, GOOD.replace("return a + b;", "return a - b;"));
+    const red = await cli(root, "run", "--ci", "src/Calc/Calc.cs");
+    assert.equal(red.code, 1, `a failing test must exit 1; stdout: ${red.stdout.slice(0, 500)}`);
+    assert.match(red.stdout + red.stderr, /FAIL .*Adds/);
+  } finally {
+    try {
+      execFileSync("git", ["worktree", "prune"], { cwd: root });
+    } catch {
+      /* ignore */
+    }
+    cleanup(root);
+  }
+});
