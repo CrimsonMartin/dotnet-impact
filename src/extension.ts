@@ -8,6 +8,7 @@ import { testProjects } from "./core/projects";
 import { KnownResult, pruneKnownResults, replayEvents } from "./core/replay";
 import { AffectedSet, Runner, TestOutcome } from "./core/runner";
 import { cacheDirFor, setDotnetPath, toRepoRelative } from "./core/util";
+import { WarmCoverage } from "./core/coverageSession";
 import { HotPatcher } from "./core/hotpatch";
 import { waitForShadowLock, withShadowLock } from "./core/lock";
 import { SessionRunner } from "./core/vstestSession";
@@ -70,6 +71,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             ? "hot-patch: ready (runsettings prepared, delta service on demand)"
             : "hot-patch: UNAVAILABLE — hook helper failed to build; runs use warm sessions + build path"
         );
+        // Warm coverage for live map refresh (#3): its own instrumented-copy
+        // fleet, never sharing hosts with the hot-patch sessions above.
+        if (vscode.workspace.getConfiguration("dotnetImpact").get<boolean>("warmCoverageRefresh", true)) {
+          runner!.coverageWarm = new WarmCoverage(repoRoot, context.asAbsolutePath("helper"), (m) =>
+            output.appendLine(m)
+          );
+        }
       });
   } else {
     output.appendLine("persistent sessions disabled by setting — build path every run");
@@ -777,4 +785,5 @@ async function buildMapWithProgress(
 export function deactivate(): void {
   runner?.sessions?.dispose(true); // shadow worktree itself persists intentionally
   runner?.hotpatch?.dispose();
+  (runner?.coverageWarm as WarmCoverage | null)?.dispose?.();
 }

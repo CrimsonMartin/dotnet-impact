@@ -61,6 +61,11 @@
           "default": true,
           "description": "After each affected run, re-collect coverage for the classes that ran (low-priority, background) so map rows stay fresh."
         },
+        "dotnetImpact.warmCoverageRefresh": {
+          "type": "boolean",
+          "default": true,
+          "description": "Collect live map-refresh coverage through a resident dotnet-coverage session with instrumented warm testhosts (~3x faster per class). Installs the dotnet-coverage tool on first use; falls back to per-class collector runs when unavailable."
+        },
         "dotnetImpact.autoRunOnSave": {
           "type": "boolean",
           "default": true,

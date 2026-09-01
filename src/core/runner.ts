@@ -68,6 +68,20 @@ export class Runner {
   sessions: SessionRunner | null = null;
   /** Optional hot-patch fast path (method-body edits patch live testhosts). */
   hotpatch: import("./hotpatch").HotPatcher | null = null;
+  /**
+   * Optional warm coverage pipeline for live map refresh (#3): resident
+   * dotnet-coverage session + instrumented copies + dedicated warm hosts.
+   * Any null result falls back to the classic per-class collector run.
+   */
+  coverageWarm: {
+    collectClass(
+      shadowDir: string,
+      firstPartyAssemblies: string[],
+      testDlls: string[],
+      classFqn: string,
+      signal?: AbortSignal
+    ): Promise<import("./coverage").ClassCoverageResult | null>;
+  } | null = null;
   /** Static (IL+PDB) map builder; log sink is swappable by the host. */
   readonly staticMapper: StaticMapper;
   logSink: (msg: string) => void = () => undefined;
@@ -1082,7 +1096,17 @@ export class Runner {
       this.pendingRefresh.delete(cls);
       opts.onProgress?.(this.pendingRefresh.size, cls);
       try {
-        const cov = await collectClassCoverage(
+        // Warm pipeline first (#3): instrumented copies + resident session,
+        // ~0.5s/class instead of a ~1.7s dotnet test spin-up. Any miss falls
+        // back to the classic collector run below.
+        let cov: import("./coverage").ClassCoverageResult | null = null;
+        if (this.coverageWarm) {
+          const names = [...this.projectGraph().projects.values()].map((p) => p.assemblyName);
+          cov = await this.coverageWarm
+            .collectClass(this.shadow!.dir, names, this.findTestDlls(csprojRel), cls, opts.signal)
+            .catch(() => null);
+        }
+        cov ??= await collectClassCoverage(
           this.shadow!.dir,
           this.shadowPath(path.join(this.repoRoot, csprojRel)),
           cls,
