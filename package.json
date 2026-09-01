@@ -66,6 +66,11 @@
           "default": true,
           "description": "Collect live map-refresh coverage through a resident dotnet-coverage session with instrumented warm testhosts (~3x faster per class). Installs the dotnet-coverage tool on first use; falls back to per-class collector runs when unavailable."
         },
+        "dotnetImpact.surfaceBuildWarnings": {
+          "type": "boolean",
+          "default": false,
+          "description": "Also surface compiler warnings from failed builds as squigglies. Build errors are always shown."
+        },
         "dotnetImpact.autoRunOnSave": {
           "type": "boolean",
           "default": true,

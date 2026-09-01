@@ -1,5 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
+import { BuildDiagnostic, mapShadowToRepo, parseMsbuildOutput } from "./buildDiagnostics";
 import {
   buildRunsettings,
   collectClassCoverage,
@@ -31,6 +32,15 @@ import { ensureShadow, Shadow, syncOverlay } from "./worktree";
 
 export { parseTrx } from "./trx";
 export type { TestOutcome } from "./trx";
+
+/**
+ * Build-diagnostics stream for the host: `set` replaces a project's
+ * diagnostics (file paths already mapped back to the real repo), `clear`
+ * retires them after that project builds clean again.
+ */
+export type DiagnosticsEvent =
+  | { kind: "set"; projectRel: string; diagnostics: BuildDiagnostic[] }
+  | { kind: "clear"; projectRel: string };
 
 export interface RunResult {
   ok: boolean;
@@ -93,8 +103,13 @@ export class Runner {
   /** Static (IL+PDB) map builder; log sink is swappable by the host. */
   readonly staticMapper: StaticMapper;
   logSink: (msg: string) => void = () => undefined;
+  /** Build diagnostics for the host's editor squigglies; see DiagnosticsEvent. */
+  diagnosticsSink: (e: DiagnosticsEvent) => void = () => undefined;
   /** Test seam: replaces the per-project msbuild invocation in minimalBuild. */
-  msbuildImpl?: (csprojShadowAbs: string, binlog: string) => Promise<{ code: number }>;
+  msbuildImpl?: (
+    csprojShadowAbs: string,
+    binlog: string
+  ) => Promise<{ code: number; stdout?: string; stderr?: string }>;
   /**
    * When the last overlay sync started. Stamps are read from the REAL repo but
    * builds compile the SHADOW copy synced at this moment; a source mtime at or
@@ -460,9 +475,15 @@ export class Runner {
             signal
           );
       if (res.code !== 0) {
+        // The raw compiler output used to be silently discarded here; keep it
+        // in the log and turn its errors into editor diagnostics.
+        const raw = (res.stdout ?? "") + (res.stderr ?? "");
+        if (raw.trim()) this.logSink(raw);
+        this.emitBuildDiagnostics(relKey, raw);
         this.logSink(`minimal build failed for ${info.name}; falling back to full builds`);
         return false;
       }
+      this.diagnosticsSink({ kind: "clear", projectRel: relKey });
       // Record the stamp only when every source predates the overlay sync:
       // this build compiled the shadow copy, and an edit that landed after the
       // sync is IN the stamp but NOT in the compiled source. Recording it
@@ -809,6 +830,12 @@ export class Runner {
         if (res.code !== 0 && !signal?.aborted) {
           ok = false;
           output += res.stdout + res.stderr;
+          this.emitBuildDiagnostics(rel, res.stdout + res.stderr);
+        } else if (res.code === 0) {
+          // A full build compiles the whole reference closure, so a clean exit
+          // also retires diagnostics filed under this project's dependencies
+          // (minimalBuild may have set them before falling back here).
+          for (const r of this.relClosure(rel)) this.diagnosticsSink({ kind: "clear", projectRel: r });
         }
       }
       // Full builds rewrite dlls with no binlog: every hot-patch baseline is
@@ -823,6 +850,58 @@ export class Runner {
       }
     }
     return { ok, output };
+  }
+
+  /**
+   * Parse a failed build's console output into diagnostics and emit `set`
+   * events. Shadow paths map back to the real repo; each diagnostic files
+   * under the project owning its file when that's identifiable (from the
+   * path or the trailing [proj] suffix), else under the built project.
+   */
+  private emitBuildDiagnostics(builtRel: string, rawOutput: string): void {
+    const shadowDir = this.shadow!.dir;
+    const graph = this.projectGraph();
+    const byRel = new Map<string, BuildDiagnostic[]>();
+    for (const parsed of parseMsbuildOutput(rawOutput, shadowDir)) {
+      const d = { ...parsed, file: mapShadowToRepo(parsed.file, shadowDir, this.repoRoot) };
+      let rel = builtRel;
+      const owner = projectForFile(graph, d.file);
+      if (owner) rel = toRepoRelative(this.repoRoot, owner.csproj);
+      else if (d.project) {
+        // [proj] suffixes name the shadow csproj; match on basename.
+        const base = path.basename(d.project).toLowerCase();
+        const p = [...graph.projects.values()].find(
+          (p) => path.basename(p.csproj).toLowerCase() === base
+        );
+        if (p) rel = toRepoRelative(this.repoRoot, p.csproj);
+      }
+      if (!byRel.has(rel)) byRel.set(rel, []);
+      byRel.get(rel)!.push(d);
+    }
+    // Nothing parsed still replaces stale diagnostics for the built project.
+    if (!byRel.has(builtRel)) byRel.set(builtRel, []);
+    for (const [rel, diagnostics] of byRel) {
+      this.diagnosticsSink({ kind: "set", projectRel: rel, diagnostics });
+    }
+  }
+
+  /** Repo-relative csproj keys for a project and its transitive references. */
+  private relClosure(rel: string): string[] {
+    const graph = this.projectGraph();
+    const start = this.projectInfoFor(rel);
+    if (!start) return [rel];
+    const seen = new Set<string>();
+    const walk = (info: ProjectInfo) => {
+      const key = toRepoRelative(this.repoRoot, info.csproj);
+      if (seen.has(key)) return;
+      seen.add(key);
+      for (const ref of info.references) {
+        const dep = graph.projects.get(path.resolve(ref).toLowerCase());
+        if (dep) walk(dep);
+      }
+    };
+    walk(start);
+    return [...seen];
   }
 
   /**
