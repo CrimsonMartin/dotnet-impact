@@ -7,6 +7,7 @@ import { locateClasses, locateMethod, locateMethods, SourceLocation, stripNestin
 import { testProjects } from "./core/projects";
 import { KnownResult, pruneKnownResults, replayEvents } from "./core/replay";
 import { AffectedSet, Runner, TestOutcome } from "./core/runner";
+import { failureLocation } from "./core/trx";
 import { cacheDirFor, setDotnetPath, toRepoRelative } from "./core/util";
 import { WarmCoverage } from "./core/coverageSession";
 import { MtpSessionRunner } from "./core/mtpSession";
@@ -669,7 +670,16 @@ function reportOutcomes(run: vscode.TestRun, outcomes: TestOutcome[], reported?:
       run.passed(methodItem, duration);
     } else {
       message = failed.map((f) => `${f.method}: ${f.message ?? "failed"}`).join("\n");
-      run.failed(methodItem, new vscode.TestMessage(message), duration);
+      const testMessage = new vscode.TestMessage(message);
+      const loc = resolveFailureLocation(failed);
+      if (loc) {
+        // TRX line numbers are 1-based; anchoring at column 0 red-squiggles the assert line.
+        testMessage.location = new vscode.Location(
+          vscode.Uri.file(loc.file),
+          new vscode.Position(loc.line - 1, 0)
+        );
+      }
+      run.failed(methodItem, testMessage, duration);
     }
     reported?.add(methodFqn);
     knownResults.set(methodFqn, {
@@ -693,6 +703,19 @@ function reportOutcomes(run: vscode.TestRun, outcomes: TestOutcome[], reported?:
     if (!item) continue;
     if (agg.passed) run.passed(item, agg.duration);
   }
+}
+
+/** First failing result whose stack trace resolves to a line inside the repo. */
+function resolveFailureLocation(failed: TestOutcome[]): { file: string; line: number } | undefined {
+  if (!runner) return undefined;
+  // Tests execute in the shadow worktree, so stack frames carry shadow paths.
+  const shadowDir = path.join(cacheDirFor(runner.repoRoot), "shadow");
+  for (const f of failed) {
+    if (!f.stackTrace) continue;
+    const loc = failureLocation(f.stackTrace, runner.repoRoot, shadowDir);
+    if (loc) return loc;
+  }
+  return undefined;
 }
 
 /** Settle the counter at "all/all" after a subset run; see core/replay.ts. */
