@@ -435,7 +435,13 @@ export class HotPatcher {
         this.pending.clear();
       });
       this.proc.stdout!.on("data", (d: Buffer) => this.onData(d.toString()));
-      this.proc.stderr!.on("data", () => undefined);
+      // Silent by default; IMPACT_ENC_DEBUG=1 surfaces the service's
+      // diagnostics (checksum dumps, delta text comparisons) in the log.
+      this.proc.stderr!.on("data", (d: Buffer) => {
+        if (process.env.IMPACT_ENC_DEBUG === "1") {
+          for (const line of d.toString().split("\n")) if (line.trim()) this.log(line.trim());
+        }
+      });
       const ok = await new Promise<boolean>((resolve) => {
         const t = setTimeout(() => resolve(false), 30_000);
         this.onReady = () => {
