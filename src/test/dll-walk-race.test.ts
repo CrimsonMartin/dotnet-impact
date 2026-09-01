@@ -26,6 +26,7 @@ function scaffold(): { root: string; info: ProjectInfo; outDir: string } {
     dir,
     assemblyName: "Lib.Tests",
     isTestProject: true,
+    usesMtpRunner: false,
     references: [],
   };
   return { root, info, outDir };

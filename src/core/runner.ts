@@ -10,7 +10,8 @@ import {
   parseCoberturaLineHits,
   preferredCollector,
 } from "./coverage";
-import { classesRecord, discoverTests } from "./discover";
+import { classesRecord, discoverTests, parseListedTests } from "./discover";
+import { mtpListTests, mtpOutcomes, mtpRun, parseMtpRunOutput } from "./mtp";
 import {
   affectedTestProjects,
   buildProjectGraph,
@@ -234,7 +235,13 @@ export class Runner {
           const d = dirty[i];
           opts.onPhase?.(`discovering ${d.p.name} (${++done}/${dirty.length})`);
           try {
-            const methods = await discover(this.shadowPath(d.p.csproj), this.shadow!.dir, true);
+            // MTP projects (#23): `dotnet test --list-tests` exits 0 with
+            // EMPTY output for them — list through the built app itself,
+            // whose --list-tests prints the standard marker format.
+            const methods =
+              d.p.usesMtpRunner && !opts.discoverImpl
+                ? await this.mtpDiscover(d.rel)
+                : await discover(this.shadowPath(d.p.csproj), this.shadow!.dir, true);
             result[d.rel] = methods;
             // Same post-sync guard as minimalBuild's stamp recording (#16):
             // an edit landing after the overlay sync is in the stamp but not
@@ -576,6 +583,11 @@ export class Runner {
     let fastPatched = false;
     let fastSkip = ""; // why the fast path was not even attempted
     if (affected.changedFiles.length === 0) fastSkip = "no-changed-files";
+    // MTP invocations (#23) run in FRESH processes that load the assemblies
+    // on disk — a hot patch pushed to warm vstest hosts would never reach
+    // them and the MTP tests would run stale code green. Build path only.
+    else if ([...allRels].some((rel) => this.projectInfoFor(rel)?.usesMtpRunner))
+      fastSkip = "mtp-project";
     else if (!this.sessions?.available) fastSkip = "sessions-unavailable";
     else if (!this.hotpatch) fastSkip = "hotpatch-unavailable";
     else {
@@ -638,6 +650,37 @@ export class Runner {
     ]);
 
     const runInvocation = async (inv: { rel: string; filter?: string }) => {
+      // MTP project (#23): no vstest hosting, no TRX, runner-specific filter
+      // options — run the project's own Microsoft.Testing.Platform app and
+      // synthesize per-method outcomes (failures from its output, passes
+      // from the discovery listing). Loud, correct, slower than warm.
+      const info = this.projectInfoFor(inv.rel);
+      if (info?.usesMtpRunner) {
+        this.logSink(
+          `${info.name}: MTP project — warm sessions and per-class filtering unavailable; running its Testing.Platform app`
+        );
+        const dlls = this.findTestDlls(inv.rel);
+        if (dlls.length > 0) {
+          const discovered = this.discoveredMethodsFor(inv.rel);
+          const results = [];
+          for (const dll of dlls) {
+            const r = await mtpRun(dll, this.shadow!.dir, signal);
+            const parsed = parseMtpRunOutput(r.stdout + r.stderr);
+            results.push({
+              ok: r.code === 0,
+              outcomes: mtpOutcomes(discovered, parsed),
+              output: r.stdout + r.stderr,
+            });
+          }
+          return {
+            ok: results.every((r) => r.ok),
+            outcomes: results.flatMap((r) => r.outcomes),
+            output: results.map((r) => r.output).join(""),
+          };
+        }
+        // No built app found: fall through to dotnet test, whose exit code
+        // is still correct for MTP even though it produces no TRX outcomes.
+      }
       // Preferred: warm test sessions (milliseconds of dispatch) — one per
       // built TFM, so multi-targeted test projects run every framework, same
       // as `dotnet test` would. Falls back to dotnet test on any
@@ -913,6 +956,34 @@ export class Runner {
     }
     fs.rmSync(resultsDir, { recursive: true, force: true });
     return { ok: res.code === 0, outcomes, output: res.stdout + res.stderr, coverage };
+  }
+
+  private projectInfoFor(csprojRel: string): ProjectInfo | undefined {
+    return this.projectGraph().projects.get(path.resolve(this.repoRoot, csprojRel).toLowerCase());
+  }
+
+  /** Discovery listing through an MTP app itself (#23): one list per built TFM. */
+  private async mtpDiscover(csprojRel: string): Promise<string[]> {
+    const methods = new Set<string>();
+    for (const dll of this.findTestDlls(csprojRel)) {
+      const r = await mtpListTests(dll, this.shadow!.dir);
+      if (r.code !== 0) throw new Error(`MTP listing failed for ${csprojRel}: ${r.stdout.slice(0, 300)}`);
+      for (const m of parseListedTests(r.stdout)) methods.add(m);
+    }
+    return [...methods].sort();
+  }
+
+  /** Last discovered methods for a project, from the persisted discovery cache. */
+  private discoveredMethodsFor(csprojRel: string): string[] {
+    try {
+      const cache = JSON.parse(
+        fs.readFileSync(path.join(cacheDirFor(this.repoRoot), "discovery-cache.json"), "utf8")
+      );
+      if (cache?.version === 3) return cache.projects?.[csprojRel]?.methods ?? [];
+    } catch {
+      /* no cache yet */
+    }
+    return [];
   }
 
   private async dotnetTest(
