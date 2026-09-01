@@ -487,10 +487,17 @@ export class Runner {
       // builds reset nothing — warm baselines stay warm.
       if (fresh.length > 0) {
         this.hotpatch.reset();
-        for (const f of fresh) {
-          // Warm the baseline now so the first fast save is milliseconds.
-          const dll = findBuiltDll(this.shadow!.dir, f.info, this.repoRoot);
-          if (dll) this.hotpatch.preload(f.info.csproj, f.complog, this.shadowPath(f.info.csproj), dll);
+        // Warm EVERY baseline project, not just the freshly built: the merged
+        // session refuses mid-epoch loads (#22), so the solution must be
+        // complete at epoch start for cross-project emits to see dependents.
+        const graph = this.projectGraph();
+        for (const [relKey, complog] of Object.entries(binlogs)) {
+          const info = [...graph.projects.values()].find(
+            (p) => toRepoRelative(this.repoRoot, p.csproj).toLowerCase() === relKey.toLowerCase()
+          );
+          if (!info) continue;
+          const dll = findBuiltDll(this.shadow!.dir, info, this.repoRoot);
+          if (dll) this.hotpatch.preload(info.csproj, complog, this.shadowPath(info.csproj), dll);
         }
       }
     }
