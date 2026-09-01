@@ -47,9 +47,11 @@ export function exec(
   args: string[],
   cwd: string,
   timeoutMs = 10 * 60 * 1000,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  /** Extra env vars layered over the inherited ones (e.g. DOTNET_ROOT for global-tool shims). */
+  envExtra?: NodeJS.ProcessEnv
 ): Promise<ExecResult> {
-  let env = process.env;
+  let env = envExtra ? { ...process.env, ...envExtra } : process.env;
   if (cmd === "dotnet") {
     cmd = resolveDotnet();
     // Persistent MSBuild between runs cuts incremental-build startup.

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.9
+
+- Live map refresh is ~3x faster per class (#3): coverage is now collected
+  through a resident `dotnet-coverage` server session with statically
+  instrumented copies of the built test outputs running on a dedicated warm
+  testhost fleet — measured ~0.5s per class against ~1.7s for the classic
+  `dotnet test --collect` spin-up. The instrumented copies never share
+  hosts with the hot-patch fast path (rewritten IL can't take EnC deltas),
+  are re-mirrored automatically after every rebuild, and any failure at any
+  stage (tool unavailable, instrument/server/snapshot error) falls back to
+  the classic per-class collector run. The `dotnet-coverage` tool installs
+  itself on first use; `dotnetImpact.warmCoverageRefresh` turns the
+  pipeline off.
+
 ## 0.2.8
 
 - Hot-patch capability handshake (#11 P2): every testhost now reports its
