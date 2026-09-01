@@ -1,6 +1,29 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
+
+- Solution-wide Edit and Continue (#22): all loaded projects now share one
+  Roslyn workspace with metadata references rewired into project
+  references, so a single save that spans projects — a signature change in
+  a library plus its call-site fixes — hot-patches every touched module in
+  one emit instead of falling to the build path. The API-surface guard
+  relaxes only for projects whose transitive dependents are all loaded in
+  the session (computed from the project graph); anything less refuses
+  exactly as before. Mid-epoch reloads are refused (a restarted session
+  would re-baseline from disk behind the hosts' committed generation) and
+  the delta reply is now uniformly `updates[]`, one entry per module.
+
+- Microsoft Testing Platform support (#23): MTP-native test projects
+  (xunit v3 with `UseMicrosoftTestingPlatformRunner`, and MSTest 4+) get
+  their own warm server-mode sessions with hot patching, per-test
+  attribution, and coverage — full parity with the VSTest path. Benchmarked
+  on the same xunit v3 suite, MTP-native warm saves land in ~200ms vs
+  ~1.3s through the VSTest adapter; xunit v3's VSTest adapter runs test
+  code in an unhooked child process and can never take a hot patch, so
+  MTP is the recommended shape for xunit v3 projects. MSTest 3.x runs
+  under MTP with run-level results (per-test attribution needs 4+).
+  Projects without a warm session fall back to `dotnet test` execution
+  with the fast path off.
 
 - CI integration (#24): `impact run --ci` makes a pipeline fail (exit 1)
   where hook safety would soft-skip — a cold map or a held shadow lock —
@@ -10,6 +33,19 @@
   workflow branching, and `impact build-map --if-missing` is the cached-CI
   no-op warmer. `docs/ci.md` carries a complete GitHub Actions recipe
   (map cached across runs, affected-only PR builds, full-suite fallback).
+
+- Fixed a silent-green in repos without a `.gitignore` (#28): untracked
+  `bin`/`obj` output mirrored into the shadow worktree could get picked up
+  as the hot-patch baseline, whose PDB matched no source document — the
+  save then "passed" without any code applied. Build-output directories
+  are never mirrored now, and the delta service refuses any baseline
+  whose PDB documents match nothing in the loaded compilation.
+
+- Fixed NUnit and MSTest test discovery returning empty when the adapter
+  lists bare display names: fully qualified names are now recovered via
+  `vstest --ListFullyQualifiedTests`, restoring class-level selection for
+  both frameworks. Also fixed `--parallel` silently accepting non-numeric
+  values.
 
 ## 0.2.10
 
