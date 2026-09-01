@@ -3,7 +3,9 @@ import * as fs from "fs";
 import * as net from "net";
 import * as os from "os";
 import * as path from "path";
+import type { BuildDiagnostic } from "./buildDiagnostics";
 import { ProjectGraph, projectForFile } from "./projects";
+import type { DiagnosticsEvent } from "./runner";
 import { cacheDirFor, exec, resolveDotnet, toRepoRelative } from "./util";
 
 /**
@@ -561,23 +563,7 @@ export class HotPatcher {
   }
 }
 
-// Structurally identical to BuildDiagnostic (./buildDiagnostics) and
-// DiagnosticsEvent (./runner); switch to importing theirs once those land.
-export interface BuildDiagnostic {
-  file: string;
-  startLine: number;
-  startCol: number;
-  endLine?: number;
-  endCol?: number;
-  severity: "error" | "warning";
-  code: string;
-  message: string;
-  project?: string;
-}
-
-export type DiagnosticsEvent =
-  | { kind: "set"; projectRel: string; diagnostics: BuildDiagnostic[] }
-  | { kind: "clear"; projectRel: string };
+export type { BuildDiagnostic, DiagnosticsEvent };
 
 /**
  * Map a delta-service file path (the compilation runs in the shadow worktree)
