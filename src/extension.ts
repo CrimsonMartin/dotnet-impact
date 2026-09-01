@@ -9,12 +9,14 @@ import { KnownResult, pruneKnownResults, replayEvents } from "./core/replay";
 import { AffectedSet, Runner, TestOutcome } from "./core/runner";
 import { cacheDirFor, setDotnetPath, toRepoRelative } from "./core/util";
 import { WarmCoverage } from "./core/coverageSession";
+import { ExternalChangeBatcher } from "./core/externalWatch";
 import { HotPatcher } from "./core/hotpatch";
 import { waitForShadowLock, withShadowLock } from "./core/lock";
 import { SessionRunner } from "./core/vstestSession";
 
 let runner: Runner | undefined;
 let controller: vscode.TestController | undefined;
+let externalBatcher: ExternalChangeBatcher | undefined;
 let statusBar: vscode.StatusBarItem;
 let output: vscode.OutputChannel;
 let mapBuildCancelled = false;
@@ -144,6 +146,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(
     vscode.workspace.onDidSaveTextDocument((doc) => {
       if (!/\.(cs|razor|cshtml)$/i.test(doc.fileName)) return;
+      // Recorded unconditionally: the save's own watcher echo must never
+      // masquerade as an external change, whatever the settings say.
+      externalBatcher?.noteSave(doc.fileName);
       if (continuousSessions > 0) return; // continuous run already watches saves
       if (!vscode.workspace.getConfiguration("dotnetImpact").get<boolean>("autoRunOnSave", true))
         return;
@@ -157,6 +162,39 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }, ms);
     })
   );
+
+  // External changes (#10): git checkout/pull/revert, scripts, other editors
+  // land on disk without a save. Batched under a longer rolling debounce so
+  // one git operation becomes one run; the save path above always wins for
+  // files the user is editing here.
+  externalBatcher = new ExternalChangeBatcher({
+    debounceMs: () =>
+      vscode.workspace.getConfiguration("dotnetImpact").get<number>("externalDebounceMs", 1000),
+    // Watcher echoes of saves land well within a couple of seconds; scale
+    // with the configured window but never dip below it.
+    saveDedupMs: () =>
+      Math.max(
+        3000,
+        2 * vscode.workspace.getConfiguration("dotnetImpact").get<number>("externalDebounceMs", 1000)
+      ),
+    isDirtyInEditor: (abs) =>
+      vscode.workspace.textDocuments.some((d) => d.uri.fsPath === abs && d.isDirty),
+    onBatch: (files) => {
+      if (continuousSessions > 0) return;
+      output.appendLine(`external change: ${files.length} file(s) — running affected`);
+      void executeRun(new vscode.TestRunRequest(), files);
+    },
+  });
+  const fsWatcher = vscode.workspace.createFileSystemWatcher("**/*.{cs,razor,cshtml}");
+  const onFsEvent = (uri: vscode.Uri) => {
+    if (!vscode.workspace.getConfiguration("dotnetImpact").get<boolean>("watchExternalChanges", true))
+      return;
+    externalBatcher?.noteChange(uri.fsPath);
+  };
+  fsWatcher.onDidChange(onFsEvent);
+  fsWatcher.onDidCreate(onFsEvent);
+  fsWatcher.onDidDelete(onFsEvent);
+  context.subscriptions.push(fsWatcher, { dispose: () => externalBatcher?.dispose() });
 }
 
 function updateStatus(text: string, spin = false): void {

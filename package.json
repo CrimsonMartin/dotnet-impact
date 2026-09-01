@@ -71,6 +71,16 @@
           "default": true,
           "description": "Run affected tests automatically when a .cs file is saved."
         },
+        "dotnetImpact.watchExternalChanges": {
+          "type": "boolean",
+          "default": true,
+          "description": "Also trigger affected runs when files change on disk without an editor save (git checkout/pull/revert, scripts, other editors). Files with unsaved editors are ignored; bursts run as one batch."
+        },
+        "dotnetImpact.externalDebounceMs": {
+          "type": "number",
+          "default": 1000,
+          "description": "Burst window for external file changes: a git operation touching many files collects into a single run this long after its last event."
+        },
         "dotnetImpact.debounceMs": {
           "type": "number",
           "default": 1500,
