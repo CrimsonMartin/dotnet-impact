@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
 
 - Compile errors now surface as red squigglies in the editor — no C# Dev
   Kit needed. Every failed build's msbuild output is parsed into VS Code
