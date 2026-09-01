@@ -6,16 +6,19 @@ export interface ParsedArgs {
   errors: string[];
 }
 
-const VALUE_FLAGS = new Set(["--base", "--parallel"]);
-const BOOL_FLAGS = new Set(["--staged", "--refresh"]);
+const VALUE_FLAGS = new Set(["--base", "--parallel", "--format"]);
+const BOOL_FLAGS = new Set(["--staged", "--refresh", "--if-missing", "--ci"]);
 
 const COMMAND_FLAGS: Record<string, string[]> = {
-  "build-map": ["--refresh", "--parallel"],
-  affected: ["--base", "--staged"],
-  run: ["--base", "--staged"],
+  "build-map": ["--refresh", "--parallel", "--if-missing"],
+  affected: ["--base", "--staged", "--format"],
+  run: ["--base", "--staged", "--ci"],
   status: [],
 };
 const FILE_COMMANDS = new Set(["affected", "run"]);
+
+/** Output formats `affected` can emit; "lines" is the default line-per-item form. */
+export const AFFECTED_FORMATS = ["lines", "json"] as const;
 
 /** Per-command validation: a flag the command ignores is an error, not a no-op. */
 export function validateCommandArgs(p: ParsedArgs): string[] {
@@ -27,6 +30,10 @@ export function validateCommandArgs(p: ParsedArgs): string[] {
   }
   if (p.files.length > 0 && !FILE_COMMANDS.has(p.command!)) {
     errors.push(`${p.command} does not take file arguments`);
+  }
+  const format = p.flags.get("--format");
+  if (typeof format === "string" && !(AFFECTED_FORMATS as readonly string[]).includes(format)) {
+    errors.push(`--format ${format} is not valid (expected: ${AFFECTED_FORMATS.join(", ")})`);
   }
   return errors;
 }

@@ -61,7 +61,7 @@ The same engine ships as a CLI for hooks and coding agents:
 
 ```
 impact build-map                  # build or refresh the map (background/overnight)
-impact affected [file ...]        # print affected test classes
+impact affected [file ...]        # print affected test classes (--format json for scripts)
 impact run [file ...]             # run affected tests; exit 1 on failure
 impact run --staged               # pre-commit mode (index only)
 impact run --base <ref>           # everything the branch changed
@@ -75,6 +75,12 @@ hook with `impact run --staged`.
 For an AI coding agent, `impact run <files>` after each edit gives sub-minute
 feedback scoped to the blast radius of the change. Put that in your repo's
 agent docs (`CLAUDE.md` or equivalent) so agents discover it.
+
+In CI, the same selection turns a PR build into an affected-only run:
+`impact run --base <PR base> --ci` (where `--ci` fails instead of soft-skips
+on missing infrastructure), with the map restored from a cache and
+`build-map --if-missing` as the no-op warmer. Full recipe with a GitHub
+Actions workflow: [docs/ci.md](docs/ci.md).
 
 ## How selection works
 
