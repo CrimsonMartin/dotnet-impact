@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.10
+
+- Affected runs now also trigger on external file changes (#10): `git
+  checkout` / `pull` / `revert`, scripts, or another editor writing source
+  files fires the same affected-test pipeline as an editor save. A file
+  with unsaved editor changes is left alone (the explicit save stays its
+  trigger); a save's own watcher echo never double-triggers; and batchy git
+  operations collect under a longer rolling debounce
+  (`dotnetImpact.externalDebounceMs`, default 1s) so a pull touching
+  hundreds of files becomes one run — which for large sets naturally
+  approaches a full run via the map's fallback machinery. Git-driven
+  structural changes usually land on the minimal-rebuild path (seconds),
+  not the hot-patch loop. `dotnetImpact.watchExternalChanges` (default on)
+  turns it off.
+
 ## 0.2.9
 
 - Live map refresh is ~3x faster per class (#3): coverage is now collected
