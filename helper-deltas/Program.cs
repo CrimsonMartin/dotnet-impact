@@ -325,12 +325,21 @@ sealed class EncProject : IDisposable
         // its siblings, refusing interdependent edits (a method added in one
         // file, called from another) that the engine accepts together.
         var updated = _current;
+        var semanticChange = false; // any file whose syntax differs beyond trivia
         foreach (var file in files)
         {
             var docId = FindDocument(file);
             if (docId == null) return (null, $"{Path.GetFileName(file)}: file not in compilation");
 
             var text = SourceText.From(File.ReadAllText(file), Encoding.UTF8);
+            if (Environment.GetEnvironmentVariable("IMPACT_ENC_DEBUG") == "1")
+            {
+                var baseDoc = _current.GetDocument(docId)!;
+                var baseText = (await baseDoc.GetTextAsync().ConfigureAwait(false)).ToString();
+                Console.Error.WriteLine(
+                    $"[enc-delta] req={file} doc={baseDoc.FilePath} readLen={text.Length} baseLen={baseText.Length} "
+                    + $"readHash={text.ToString().GetHashCode():x8} baseHash={baseText.GetHashCode():x8} equal={baseText == text.ToString()}");
+            }
 
             // Cross-project safety valve. The EnC session spans one project, so
             // the engine happily models a changed public signature as "add new,
@@ -347,6 +356,12 @@ sealed class EncProject : IDisposable
             // runner discovers tests from the assembly on disk (a fresh testhost
             // enumerates the un-patched dll), so the new [Fact] would neither run
             // nor appear in the tree. Only a rebuild makes it discoverable.
+            semanticChange = semanticChange
+                || !SyntaxFactory.AreEquivalent(
+                    CSharpSyntaxTree.ParseText(oldText),
+                    CSharpSyntaxTree.ParseText(text.ToString()),
+                    topLevel: false);
+
             var addedTest = ApiGuard.AddedTestMethod(oldText, text.ToString());
             if (addedTest != null)
                 return (null, $"new test method: {addedTest} — rebuilding so the test runner discovers it");
@@ -371,6 +386,13 @@ sealed class EncProject : IDisposable
                 .FirstOrDefault(d => d.Id.StartsWith("ENC", StringComparison.Ordinal));
             if (enc != null)
                 return (null, $"stale baseline ({enc.Id}: {enc.GetMessage()}) — rebuild needed");
+            // Backstop for silent skips: the engine reports out-of-sync
+            // documents with NO diagnostic when the session runs with
+            // reportDiagnostics off — "no changes" for an edit that DOES
+            // change syntax beyond trivia is a stale baseline, not a no-op
+            // (#28). Trivia-only saves keep their fast benign no-op.
+            if (semanticChange)
+                return (null, "stale baseline (engine ignored a semantic change — document out of sync with the baseline module) — rebuild needed");
             _current = updated;
             var diag = updates.PersistentDiagnostics.FirstOrDefault()
                 ?? updates.TransientDiagnostics.SelectMany(t => t.diagnostics).FirstOrDefault();
@@ -423,16 +445,27 @@ sealed class EncProject : IDisposable
             using var pdbStream = File.OpenRead(pdbPath);
             using var provider = System.Reflection.Metadata.MetadataReaderProvider.FromPortablePdbStream(pdbStream);
             var pdbReader = provider.GetMetadataReader();
+            var docs = 0;
+            var matched = 0;
             foreach (var dh in pdbReader.Documents)
             {
+                docs++;
                 var d = pdbReader.GetDocument(dh);
                 var name = pdbReader.GetString(d.Name);
-                if (!byPath.TryGetValue(name, out var text)) continue; // generated/foreign doc
+                if (!byPath.TryGetValue(name, out var text)) continue; // generated doc
+                matched++;
                 var pdbHash = Convert.ToHexString(pdbReader.GetBlobBytes(d.Hash));
                 var textHash = Convert.ToHexString(text.GetChecksum().ToArray());
                 if (!string.Equals(pdbHash, textHash, StringComparison.OrdinalIgnoreCase))
                     return Path.GetFileName(name);
             }
+            // A PDB whose documents match NOTHING in the compilation is a
+            // FOREIGN build (e.g. the same sources compiled in a different
+            // tree — its document paths differ wholesale). The engine would
+            // find no matching documents either and silently skip every edit
+            // (#28); checksum comparison verified nothing above, so refuse.
+            if (docs > 0 && matched == 0)
+                return $"{Path.GetFileName(dll)} (its pdb's {docs} document(s) match no compilation source — foreign build)";
             return null;
         }
         catch

@@ -10,6 +10,24 @@ export interface Shadow {
 const OVERLAY_MANIFEST = "overlay-manifest.json";
 
 /**
+ * Never mirror build outputs or tool junk into the shadow. In a repo without
+ * a .gitignore, `git status --untracked-files=all` lists bin/obj outputs of
+ * real-tree builds; overlaying them replaced the shadow's OWN build outputs
+ * with foreign-build dlls carrying real-tree PDB paths — the newest-mtime
+ * dll pick then baselined the EnC session on a module whose PDB documents
+ * matched nothing, and Roslyn silently skipped every edit: a breaking save
+ * stayed green with zero diagnostics (#28). Mirrors projects.ts SKIP_DIRS.
+ */
+const OVERLAY_SKIP_SEGMENTS = new Set(["bin", "obj", "node_modules", ".git", ".vs", ".impact", "packages"]);
+
+/** True when a repo-relative path has a segment the overlay must never copy. */
+export function isOverlaySkippedPath(repoRelative: string): boolean {
+  return repoRelative
+    .split(/[\\/]+/)
+    .some((s) => OVERLAY_SKIP_SEGMENTS.has(s.toLowerCase()));
+}
+
+/**
  * Ensure a detached git worktree exists for the repo and matches its current HEAD.
  * The worktree lives in the user cache dir, sharing the object store with the real repo.
  */
@@ -63,6 +81,7 @@ export async function syncOverlay(shadow: Shadow): Promise<string[]> {
   const current = new Set<string>();
 
   for (const { status, file, origin } of dirty) {
+    if (isOverlaySkippedPath(file)) continue; // build outputs are never source (#28)
     // A rename's origin no longer exists in the real tree; remove it in the shadow.
     if (origin && status.includes("R")) {
       try {
