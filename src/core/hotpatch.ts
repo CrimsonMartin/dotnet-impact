@@ -3,7 +3,9 @@ import * as fs from "fs";
 import * as net from "net";
 import * as os from "os";
 import * as path from "path";
+import type { BuildDiagnostic } from "./buildDiagnostics";
 import { ProjectGraph, projectForFile } from "./projects";
+import type { DiagnosticsEvent } from "./runner";
 import { cacheDirFor, exec, resolveDotnet, toRepoRelative } from "./util";
 
 /**
@@ -32,6 +34,13 @@ export class HotPatcher {
   /** Last generation each live testhost accepted, keyed by pid file. */
   private readonly hostGen = new Map<string, number>();
   private onReady: () => void = () => undefined;
+  /**
+   * Where fast-path compile errors land (~100ms squigglies, no msbuild wait):
+   * a refused delta with structured Roslyn errors emits "set" per owning
+   * project; a clean emit proves those projects compile and emits "clear".
+   * The runner points this at its diagnostics store; default is a no-op.
+   */
+  diagnosticsSink: (e: DiagnosticsEvent) => void = () => undefined;
 
   constructor(
     private readonly repoRoot: string,
@@ -236,6 +245,17 @@ export class HotPatcher {
       this.log(`hotpatch: ${label}: ${r.reason}`);
     } else if (!r.ok) {
       this.log(`hotpatch: ${label}: ${r.reason} — using build path`);
+      // A refusal that failed to COMPILE carries the exact Roslyn errors:
+      // surface them now (~100ms squigglies) instead of making the user wait
+      // for the msbuild path to rediscover them. Shadow paths map back to the
+      // repo; rude edits carry no diagnostics (valid C# — the build clears).
+      if (r.diagnostics?.length && this.shadowDir) {
+        const events = fastPathDiagnosticEvents(r.diagnostics, this.shadowDir, this.repoRoot, (abs) => {
+          const owner = projectForFile(graph, abs);
+          return owner ? toRepoRelative(this.repoRoot, owner.csproj) : undefined;
+        });
+        for (const e of events) this.diagnosticsSink(e);
+      }
       return false;
     } else {
       for (const u of r.updates ?? []) {
@@ -292,6 +312,11 @@ export class HotPatcher {
       for (const host of hosts) {
         if (fs.existsSync(host.pidFile)) this.hostGen.set(host.pidFile, this.gen);
       }
+    }
+    // A clean emit proves the touched projects compile: clear any squigglies
+    // an earlier refused save put up for them.
+    for (const csprojAbs of byProject.keys()) {
+      this.diagnosticsSink({ kind: "clear", projectRel: toRepoRelative(this.repoRoot, csprojAbs) });
     }
     this.log(`hotpatch: applied ${deltas.length} delta(s) to ${patchedHosts} testhost(s)`);
     return true;
@@ -538,6 +563,59 @@ export class HotPatcher {
   }
 }
 
+export type { BuildDiagnostic, DiagnosticsEvent };
+
+/**
+ * Map a delta-service file path (the compilation runs in the shadow worktree)
+ * back to the corresponding repo path: normalize separators, strip the shadow
+ * prefix case-insensitively, rejoin onto the repo root. Paths outside the
+ * shadow pass through unchanged.
+ */
+export function shadowToRepoPath(shadowDir: string, repoRoot: string, filePath: string): string {
+  const norm = (p: string): string => p.replace(/\\/g, "/").replace(/\/+$/, "");
+  const prefix = norm(shadowDir) + "/";
+  const normalized = filePath.replace(/\\/g, "/");
+  if (!normalized.toLowerCase().startsWith(prefix.toLowerCase())) return filePath;
+  return path.join(repoRoot, ...normalized.slice(prefix.length).split("/"));
+}
+
+/**
+ * Turn a refused delta's compiler errors into per-project "set" events for
+ * the extension's squiggly sink: shadow paths mapped back into the repo,
+ * grouped by owning project. Errors in files no project owns are dropped —
+ * there's nowhere to show them.
+ */
+export function fastPathDiagnosticEvents(
+  diagnostics: NonNullable<DeltaReply["diagnostics"]>,
+  shadowDir: string,
+  repoRoot: string,
+  projectRelFor: (absFile: string) => string | undefined
+): DiagnosticsEvent[] {
+  const byProject = new Map<string, BuildDiagnostic[]>();
+  for (const d of diagnostics) {
+    const file = shadowToRepoPath(shadowDir, repoRoot, d.file);
+    const projectRel = projectRelFor(file);
+    if (!projectRel) continue;
+    if (!byProject.has(projectRel)) byProject.set(projectRel, []);
+    byProject.get(projectRel)!.push({
+      file,
+      startLine: d.startLine,
+      startCol: d.startCol,
+      endLine: d.endLine,
+      endCol: d.endCol,
+      severity: "error",
+      code: d.id,
+      message: d.message,
+      project: projectRel,
+    });
+  }
+  return [...byProject.entries()].map(([projectRel, diags]) => ({
+    kind: "set" as const,
+    projectRel,
+    diagnostics: diags,
+  }));
+}
+
 interface LiveHost {
   pidFile: string;
   pipeName: string;
@@ -632,12 +710,27 @@ export function apiGuardExemptFor(
   return { exemptAbs, loadAlsoAbs: [...loadAlso] };
 }
 
-interface DeltaReply {
+export interface DeltaReply {
   ok: boolean;
   reason?: string;
   calls?: number;
   /** Delta replies: one entry per touched module (solution-wide emit, #22). */
   updates?: Array<{ assembly: string; md: string; il: string; pdb: string }>;
+  /**
+   * Refused deltas that failed to COMPILE carry the exact Roslyn errors
+   * (0-based positions, shadow-worktree file paths). Absent on every other
+   * refusal — rude edits are valid C# and never carry diagnostics.
+   */
+  diagnostics?: Array<{
+    id: string;
+    severity: string;
+    message: string;
+    file: string;
+    startLine: number;
+    startCol: number;
+    endLine?: number;
+    endCol?: number;
+  }>;
 }
 
 function hash(s: string): string {

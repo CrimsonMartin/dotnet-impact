@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+- Compile errors now surface as red squigglies in the editor — no C# Dev
+  Kit needed. Every failed build's msbuild output is parsed into VS Code
+  diagnostics with exact spans (previously that output was silently
+  discarded on the minimal-build path), and on the hot-patch fast path the
+  resident Roslyn session returns structured diagnostics with a refused
+  save, so squigglies land in ~100ms without waiting for a build. Rude
+  edits (valid C# the runtime can't hot-patch) never squiggle. Diagnostics
+  clear per project on its next clean build or clean delta emit, so they
+  can't go stale — and warnings survive a green build (a clean compile's
+  output is parsed too, not discarded). `dotnetImpact.surfaceBuildWarnings`
+  defaults to `auto`: warnings squiggle only when the C# extension isn't
+  installed, since its language server already shows them live and doubling
+  up would duplicate markers (`on`/`off` override). The status bar
+  now says `✗ build failed (N errors)` instead of the misleading
+  `✗ 0 failing` when a run dies in the compiler.
+
+- Tests no longer run against stale binaries after a failed build: a test
+  project whose build (or a dependency's) fails has its affected tests
+  reported as skipped ("build failed") — grey in the explorer, never a
+  stale green — while unrelated projects that still build keep running
+  for real. Failure-first ordering ignores the skips, and coverage runs
+  skip the same way so stale hits can't poison the map.
+
+- Failed tests now carry an inline annotation at the failing assert line:
+  the TRX stack trace is resolved to the first frame inside the repo
+  (shadow-worktree paths mapped back to the workspace) and attached as the
+  test message's location.
+
 ## 0.3.0
 
 - Solution-wide Edit and Continue (#22): all loaded projects now share one

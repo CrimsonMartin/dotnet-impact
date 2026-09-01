@@ -1,5 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
+import { BuildDiagnostic, mapShadowToRepo, parseMsbuildOutput } from "./buildDiagnostics";
 import {
   buildRunsettings,
   collectClassCoverage,
@@ -31,6 +32,15 @@ import { ensureShadow, Shadow, syncOverlay } from "./worktree";
 
 export { parseTrx } from "./trx";
 export type { TestOutcome } from "./trx";
+
+/**
+ * Build-diagnostics stream for the host: `set` replaces a project's
+ * diagnostics (file paths already mapped back to the real repo), `clear`
+ * retires them after that project builds clean again.
+ */
+export type DiagnosticsEvent =
+  | { kind: "set"; projectRel: string; diagnostics: BuildDiagnostic[] }
+  | { kind: "clear"; projectRel: string };
 
 export interface RunResult {
   ok: boolean;
@@ -93,8 +103,13 @@ export class Runner {
   /** Static (IL+PDB) map builder; log sink is swappable by the host. */
   readonly staticMapper: StaticMapper;
   logSink: (msg: string) => void = () => undefined;
+  /** Build diagnostics for the host's editor squigglies; see DiagnosticsEvent. */
+  diagnosticsSink: (e: DiagnosticsEvent) => void = () => undefined;
   /** Test seam: replaces the per-project msbuild invocation in minimalBuild. */
-  msbuildImpl?: (csprojShadowAbs: string, binlog: string) => Promise<{ code: number }>;
+  msbuildImpl?: (
+    csprojShadowAbs: string,
+    binlog: string
+  ) => Promise<{ code: number; stdout?: string; stderr?: string }>;
   /**
    * When the last overlay sync started. Stamps are read from the REAL repo but
    * builds compile the SHADOW copy synced at this moment; a source mtime at or
@@ -460,9 +475,17 @@ export class Runner {
             signal
           );
       if (res.code !== 0) {
+        // The raw compiler output used to be silently discarded here; keep it
+        // in the log and turn its errors into editor diagnostics.
+        const raw = (res.stdout ?? "") + (res.stderr ?? "");
+        if (raw.trim()) this.logSink(raw);
+        this.emitBuildDiagnostics(relKey, raw);
         this.logSink(`minimal build failed for ${info.name}; falling back to full builds`);
         return false;
       }
+      // A clean build still carries warnings; parsing (rather than clearing)
+      // sets those and retires everything else for this project.
+      this.emitBuildDiagnostics(relKey, (res.stdout ?? "") + (res.stderr ?? ""));
       // Record the stamp only when every source predates the overlay sync:
       // this build compiled the shadow copy, and an edit that landed after the
       // sync is IN the stamp but NOT in the compiled source. Recording it
@@ -626,6 +649,7 @@ export class Runner {
     // Any build failure falls back to the plain full `dotnet build` of the
     // involved test projects, which is always correct.
     let buildMs = 0;
+    let failedBuildRels: string[] = [];
     if (!fastPatched) {
       // Windows keeps loaded assemblies locked — and every warm testhost
       // locks its dependency dlls too, not just its own test dll, so ALL
@@ -642,6 +666,7 @@ export class Runner {
       buildMs = Date.now() - tBuild;
       ok = ok && built.ok;
       output += built.output;
+      failedBuildRels = built.failedRels;
     }
     const tTest = Date.now();
 
@@ -663,6 +688,12 @@ export class Runner {
     ]);
 
     const runInvocation = async (inv: { rel: string; filter?: string; classes?: string[] }) => {
+      const skips = this.buildFailureSkips(failedBuildRels, inv.rel, inv.classes);
+      if (skips) {
+        this.logSink(`${inv.rel}: build failed — tests skipped, stale binaries not run`);
+        // ok stays governed by built.ok; the skips themselves aren't failures.
+        return { ok: true, outcomes: skips, output: "" };
+      }
       // MTP project: vstest can't host it and it ignores TRX loggers, so it
       // runs through Testing.Platform surfaces instead. Preferred: the warm
       // server-mode session (resident app, per-class filtering by test node
@@ -793,9 +824,10 @@ export class Runner {
   private async buildProjects(
     allRels: Set<string>,
     signal?: AbortSignal
-  ): Promise<{ ok: boolean; output: string }> {
+  ): Promise<{ ok: boolean; output: string; failedRels: string[] }> {
     let ok = true;
     let output = "";
+    const failedRels: string[] = [];
     if (!(await this.minimalBuild(allRels, signal))) {
       for (const rel of allRels) {
         if (signal?.aborted) break;
@@ -808,7 +840,15 @@ export class Runner {
         );
         if (res.code !== 0 && !signal?.aborted) {
           ok = false;
+          failedRels.push(rel);
           output += res.stdout + res.stderr;
+          this.emitBuildDiagnostics(rel, res.stdout + res.stderr);
+        } else if (res.code === 0) {
+          // A full build compiles the whole reference closure, so a clean exit
+          // surfaces its warnings and retires diagnostics filed under closure
+          // projects that came back silent (minimalBuild may have set them
+          // before falling back here).
+          this.emitBuildDiagnostics(rel, res.stdout + res.stderr, this.relClosure(rel));
         }
       }
       // Full builds rewrite dlls with no binlog: every hot-patch baseline is
@@ -822,7 +862,102 @@ export class Runner {
         }
       }
     }
-    return { ok, output };
+    return { ok, output, failedRels };
+  }
+
+  /**
+   * A test project whose build (or a dependency's) just failed must not run:
+   * the only dlls on disk are from the previous successful build, and results
+   * against them would repaint the explorer with verdicts about code that no
+   * longer exists. Instead its mapped tests report as skipped ("build
+   * failed") — grey, not stale green — and, because failure bookkeeping
+   * ignores skipped outcomes, failure-first ordering is untouched. Returns
+   * null when the invocation is unaffected and should run normally.
+   */
+  private buildFailureSkips(
+    failedRels: string[],
+    rel: string,
+    classes: string[] | undefined
+  ): TestOutcome[] | null {
+    if (failedRels.length === 0) return null;
+    const failed = new Set(failedRels);
+    if (!this.relClosure(rel).some((r) => failed.has(r))) return null;
+    const skip = (classFqn: string, method: string): TestOutcome => ({
+      classFqn,
+      method,
+      passed: false,
+      skipped: true,
+      message: "build failed",
+    });
+    const wanted = classes ? new Set(classes) : null;
+    const outcomes: TestOutcome[] = [];
+    for (const m of this.discoveredMethodsFor(rel)) {
+      const cls = m.replace(/\.[^.]+$/, "");
+      if (wanted && !wanted.has(cls)) continue;
+      outcomes.push(skip(cls, m));
+    }
+    // No discovery cache yet: grey the classes themselves (method === class
+    // marks a class-level outcome for the explorer).
+    if (outcomes.length === 0 && classes) {
+      for (const cls of classes) outcomes.push(skip(cls, cls));
+    }
+    return outcomes;
+  }
+
+  /**
+   * Parse a build's console output into diagnostics and emit `set` events —
+   * errors from failed builds, warnings from clean ones. Shadow paths map
+   * back to the real repo; each diagnostic files under the project owning
+   * its file when that's identifiable (from the path or the trailing [proj]
+   * suffix), else under the built project. Projects in `alsoClear` with no
+   * parsed diagnostics get an empty `set`, retiring anything stale.
+   */
+  private emitBuildDiagnostics(builtRel: string, rawOutput: string, alsoClear?: Iterable<string>): void {
+    const shadowDir = this.shadow!.dir;
+    const graph = this.projectGraph();
+    const byRel = new Map<string, BuildDiagnostic[]>();
+    for (const parsed of parseMsbuildOutput(rawOutput, shadowDir)) {
+      const d = { ...parsed, file: mapShadowToRepo(parsed.file, shadowDir, this.repoRoot) };
+      let rel = builtRel;
+      const owner = projectForFile(graph, d.file);
+      if (owner) rel = toRepoRelative(this.repoRoot, owner.csproj);
+      else if (d.project) {
+        // [proj] suffixes name the shadow csproj; match on basename.
+        const base = path.basename(d.project).toLowerCase();
+        const p = [...graph.projects.values()].find(
+          (p) => path.basename(p.csproj).toLowerCase() === base
+        );
+        if (p) rel = toRepoRelative(this.repoRoot, p.csproj);
+      }
+      if (!byRel.has(rel)) byRel.set(rel, []);
+      byRel.get(rel)!.push(d);
+    }
+    // Nothing parsed still replaces stale diagnostics for the built project
+    // (and, on a full build, its whole reference closure).
+    if (!byRel.has(builtRel)) byRel.set(builtRel, []);
+    for (const rel of alsoClear ?? []) if (!byRel.has(rel)) byRel.set(rel, []);
+    for (const [rel, diagnostics] of byRel) {
+      this.diagnosticsSink({ kind: "set", projectRel: rel, diagnostics });
+    }
+  }
+
+  /** Repo-relative csproj keys for a project and its transitive references. */
+  private relClosure(rel: string): string[] {
+    const graph = this.projectGraph();
+    const start = this.projectInfoFor(rel);
+    if (!start) return [rel];
+    const seen = new Set<string>();
+    const walk = (info: ProjectInfo) => {
+      const key = toRepoRelative(this.repoRoot, info.csproj);
+      if (seen.has(key)) return;
+      seen.add(key);
+      for (const ref of info.references) {
+        const dep = graph.projects.get(path.resolve(ref).toLowerCase());
+        if (dep) walk(dep);
+      }
+    };
+    walk(start);
+    return [...seen];
   }
 
   /**
@@ -876,8 +1011,13 @@ export class Runner {
       ...[...byProject.entries()].map(([rel, classes]) => ({
         rel,
         filter: classFilter(classes) as string | undefined,
+        classes: classes as string[] | undefined,
       })),
-      ...fallbackRel.map((rel) => ({ rel, filter: undefined as string | undefined })),
+      ...fallbackRel.map((rel) => ({
+        rel,
+        filter: undefined as string | undefined,
+        classes: undefined as string[] | undefined,
+      })),
     ];
     let next = 0;
     await Promise.all(
@@ -887,6 +1027,15 @@ export class Runner {
           const i = next++;
           if (i >= invocations.length) return;
           const inv = invocations[i];
+          const skips = this.buildFailureSkips(built.failedRels, inv.rel, inv.classes);
+          if (skips) {
+            // Stale binaries would also poison the coverage rows, not just
+            // the verdicts; skip the invocation entirely.
+            this.logSink(`${inv.rel}: build failed — coverage run skipped, stale binaries not run`);
+            outcomes.push(...skips);
+            if (skips.length > 0) onPartial?.(skips);
+            continue;
+          }
           const res = await this.dotnetTestCoverage(inv.rel, inv.filter, signal);
           ok = ok && (res.ok || signal?.aborted === true);
           output += res.output;

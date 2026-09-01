@@ -20,6 +20,13 @@
 //   <- {"id":2,"type":"done","ok":true,
 //       "updates":[{"assembly":"Lib","md":"<b64>","il":"<b64>","pdb":"<b64>"}, ...]}
 //      or {"id":2,"type":"done","ok":false,"reason":"rude edit ENC0023: ..."}
+//      A refusal caused by code that does not compile also carries the exact
+//      Roslyn compiler errors (additive; absent on every other refusal):
+//       "diagnostics":[{"id":"CS0103","severity":"error","message":"...",
+//         "file":"/abs/Calc.cs","startLine":6,"startCol":19,"endLine":6,"endCol":24}]
+//      Positions are 0-based (Roslyn LinePosition passed through); ENCxxxx
+//      rude-edit diagnostics are deliberately excluded — rude edits are valid
+//      C#, the build path succeeds and would immediately clear the squiggly.
 //   -> {"id":3,"cmd":"reset"}   drop all state (after a real rebuild)
 //
 // Baselines chain across generations inside the EnC session. Loading a
@@ -147,10 +154,32 @@ while ((line = Console.ReadLine()) != null)
                         if (e.GetString() is { } s)
                             exempt.Add(s);
 
-                var (updates, reason2) = solution.DeltaAsync(files, exempt).GetAwaiter().GetResult();
+                var (updates, reason2, diags) = solution.DeltaAsync(files, exempt).GetAwaiter().GetResult();
                 if (updates == null)
                 {
-                    Emit(new { id, type = "done", ok = false, reason = reason2 });
+                    if (diags is { Count: > 0 })
+                        Emit(new
+                        {
+                            id,
+                            type = "done",
+                            ok = false,
+                            reason = reason2,
+                            diagnostics = diags
+                                .Select(d => new
+                                {
+                                    id = d.Id,
+                                    severity = d.Severity,
+                                    message = d.Message,
+                                    file = d.File,
+                                    startLine = d.StartLine,
+                                    startCol = d.StartCol,
+                                    endLine = d.EndLine,
+                                    endCol = d.EndCol,
+                                })
+                                .ToArray(),
+                        });
+                    else
+                        Emit(new { id, type = "done", ok = false, reason = reason2 });
                 }
                 else
                 {
@@ -181,6 +210,16 @@ solution.Reset();
 return 0;
 
 sealed record AssemblyUpdate(string Assembly, byte[] Md, byte[] Il, byte[] Pdb);
+
+/// <summary>
+/// One compiler error carried back to the extension on a refused delta so it
+/// can show squigglies without waiting for the msbuild path. Positions are
+/// 0-based (Roslyn LinePosition passed through); File is the span path as the
+/// compilation saw it (a shadow-worktree path — the caller maps it back).
+/// </summary>
+sealed record DiagInfo(
+    string Id, string Severity, string Message, string File,
+    int StartLine, int StartCol, int EndLine, int EndCol);
 
 /// <summary>
 /// The merged EnC session: every loaded project lives in one AdhocWorkspace
@@ -335,7 +374,7 @@ sealed class EncSolution
         return (true, "", loaded.AssemblyName);
     }
 
-    public async Task<(List<AssemblyUpdate>?, string)> DeltaAsync(
+    public async Task<(List<AssemblyUpdate>? Updates, string Reason, List<DiagInfo>? Diagnostics)> DeltaAsync(
         IReadOnlyList<string> files, HashSet<string> apiGuardExempt)
     {
         // A snapshot eviction tears the session down but keeps the surviving
@@ -344,9 +383,9 @@ sealed class EncSolution
         if (_service == null && _projects.Count > 0 && !_committed)
         {
             var (ok, reason) = RebuildSession();
-            if (!ok) return (null, reason);
+            if (!ok) return (null, reason, null);
         }
-        if (_service == null || _current == null) return (null, "not loaded");
+        if (_service == null || _current == null) return (null, "not loaded", null);
 
         // All of a save's edits enter one emit (#11 P3, #22): per-file emits
         // would analyze each edit against a solution missing its siblings,
@@ -356,7 +395,7 @@ sealed class EncSolution
         foreach (var file in files)
         {
             var (owner, docId) = FindDocument(file);
-            if (owner == null || docId == null) return (null, $"{Path.GetFileName(file)}: file not in compilation");
+            if (owner == null || docId == null) return (null, $"{Path.GetFileName(file)}: file not in compilation", null);
 
             var text = SourceText.From(File.ReadAllText(file), Encoding.UTF8);
             if (Environment.GetEnvironmentVariable("IMPACT_ENC_DEBUG") == "1")
@@ -381,7 +420,7 @@ sealed class EncSolution
             {
                 var removed = ApiGuard.RemovedVisibleDeclaration(oldText, text.ToString());
                 if (removed != null)
-                    return (null, $"api change: {removed} removed or signature changed — dependents must rebuild");
+                    return (null, $"api change: {removed} removed or signature changed — dependents must rebuild", null);
             }
 
             // Tracked for the #28 backstop below: does any file change syntax
@@ -399,7 +438,7 @@ sealed class EncSolution
             // would neither run nor appear in the tree. Never exempt.
             var addedTest = ApiGuard.AddedTestMethod(oldText, text.ToString());
             if (addedTest != null)
-                return (null, $"new test method: {addedTest} — rebuilding so the test runner discovers it");
+                return (null, $"new test method: {addedTest} — rebuilding so the test runner discovers it", null);
 
             updated = updated.WithDocumentText(docId, text);
         }
@@ -420,21 +459,21 @@ sealed class EncSolution
                 .Concat(updates.TransientDiagnostics.SelectMany(t => t.diagnostics))
                 .FirstOrDefault(d => d.Id.StartsWith("ENC", StringComparison.Ordinal));
             if (enc != null)
-                return (null, $"stale baseline ({enc.Id}: {enc.GetMessage()}) — rebuild needed");
+                return (null, $"stale baseline ({enc.Id}: {enc.GetMessage()}) — rebuild needed", null);
             // Backstop for silent skips: the engine reports out-of-sync
             // documents with NO diagnostic when the session runs with
             // reportDiagnostics off — "no changes" for an edit that DOES
             // change syntax beyond trivia is a stale baseline, not a no-op
             // (#28). Trivia-only saves keep their fast benign no-op.
             if (semanticChange)
-                return (null, "stale baseline (engine ignored a semantic change — document out of sync with the baseline module) — rebuild needed");
+                return (null, "stale baseline (engine ignored a semantic change — document out of sync with the baseline module) — rebuild needed", null);
             _current = updated;
             var diag = updates.PersistentDiagnostics.FirstOrDefault()
                 ?? updates.TransientDiagnostics.SelectMany(t => t.diagnostics).FirstOrDefault();
             return (null,
                 $"no-op (engine: no effective changes"
                 + $"{(diag != null ? $"; {diag.Id}: {diag.GetMessage()}" : "")}"
-                + $"; persistent={updates.PersistentDiagnostics.Length} transient={updates.TransientDiagnostics.Length} rebuild={updates.ProjectsToRebuild.Length})");
+                + $"; persistent={updates.PersistentDiagnostics.Length} transient={updates.TransientDiagnostics.Length} rebuild={updates.ProjectsToRebuild.Length})", null);
         }
 
         var rude = updates.TransientDiagnostics.SelectMany(t => t.diagnostics).FirstOrDefault();
@@ -444,10 +483,24 @@ sealed class EncSolution
             || updates.ProjectUpdates.IsEmpty)
         {
             Discard();
+            // Compiler errors travel back structured so the extension can show
+            // squigglies in ~100ms instead of waiting for the msbuild path.
+            // ENCxxxx rude-edit diagnostics are DELIBERATELY excluded: rude
+            // edits are valid C#, the build path then succeeds and would
+            // immediately clear the squiggly — surfacing them would flash red
+            // on correct code.
+            var compileErrors = updates.PersistentDiagnostics
+                .Concat(updates.TransientDiagnostics.SelectMany(t => t.diagnostics))
+                .Where(d => d.Severity == DiagnosticSeverity.Error
+                    && !d.Id.StartsWith("ENC", StringComparison.Ordinal))
+                .Select(ToDiagInfo)
+                .Where(d => d.File.Length > 0)
+                .ToList();
+            var diags = compileErrors.Count > 0 ? compileErrors : null;
             if (rude != null)
-                return (null, $"rude edit {rude.Id}: {rude.GetMessage()}");
+                return (null, $"rude edit {rude.Id}: {rude.GetMessage()}", diags);
             var error = updates.PersistentDiagnostics.FirstOrDefault(d => d.Severity == DiagnosticSeverity.Error);
-            return (null, error != null ? $"compile error: {error}" : "engine refused the update");
+            return (null, error != null ? $"compile error: {error}" : "engine refused the update", diags);
         }
 
         var result = new List<AssemblyUpdate>();
@@ -458,7 +511,7 @@ sealed class EncSolution
             if (string.IsNullOrEmpty(name))
             {
                 Discard();
-                return (null, "update for an unknown module — using build path");
+                return (null, "update for an unknown module — using build path", null);
             }
             result.Add(new AssemblyUpdate(
                 name, u.MetadataDelta.ToArray(), u.ILDelta.ToArray(), u.PdbDelta.ToArray()));
@@ -466,7 +519,7 @@ sealed class EncSolution
         _service.CommitUpdate();
         _current = updated;
         _committed = true;
-        return (result, "");
+        return (result, "", null);
     }
 
     /// <summary>Drop a project whose complog is about to be rewritten (post-rebuild snapshot).</summary>
@@ -586,6 +639,20 @@ sealed class EncSolution
     }
 
     private static ProjectId ProjectIdOf(LoadedProject p) => p.Info.Id;
+
+    /// <summary>
+    /// Structured form of a compiler error for the JSON protocol. Roslyn's
+    /// LinePosition is already 0-based — passed through unchanged; the span
+    /// path is the compilation's view of the file (shadow worktree).
+    /// </summary>
+    private static DiagInfo ToDiagInfo(Diagnostic d)
+    {
+        var span = d.Location.GetLineSpan();
+        return new DiagInfo(
+            d.Id, "error", d.GetMessage(), span.Path ?? "",
+            span.StartLinePosition.Line, span.StartLinePosition.Character,
+            span.EndLinePosition.Line, span.EndLinePosition.Character);
+    }
 
     private static string TrimDll(string assemblyName) =>
         assemblyName.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)

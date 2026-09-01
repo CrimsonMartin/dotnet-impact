@@ -6,7 +6,8 @@ import { classOf } from "./core/discover";
 import { locateClasses, locateMethod, locateMethods, SourceLocation, stripNesting } from "./core/locate";
 import { testProjects } from "./core/projects";
 import { KnownResult, pruneKnownResults, replayEvents } from "./core/replay";
-import { AffectedSet, Runner, TestOutcome } from "./core/runner";
+import { AffectedSet, DiagnosticsEvent, Runner, TestOutcome } from "./core/runner";
+import { failureLocation } from "./core/trx";
 import { cacheDirFor, setDotnetPath, toRepoRelative } from "./core/util";
 import { WarmCoverage } from "./core/coverageSession";
 import { MtpSessionRunner } from "./core/mtpSession";
@@ -24,6 +25,13 @@ let mapBuildCancelled = false;
 /** Active continuous-run sessions; while > 0 the plain auto-run-on-save listener stands down. */
 let continuousSessions = 0;
 
+/** Build-error squigglies parsed from failed msbuild output. */
+let buildDiags: vscode.DiagnosticCollection | undefined;
+/** projectRel -> URI strings this extension set diagnostics on, for clean retirement. */
+const ownedDiags = new Map<string, Set<string>>();
+/** projectRel -> surfaced error count, for the status bar's "build failed (N errors)". */
+const buildErrorCounts = new Map<string, number>();
+
 /** class FQN -> repo-relative csproj of the owning test project */
 const classOwners = new Map<string, string>();
 /** class FQN -> source location in the real repo */
@@ -40,6 +48,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   output = vscode.window.createOutputChannel("Impact");
   runner = new Runner(repoRoot);
   runner.logSink = (m) => output.appendLine(m);
+
+  // Compiler errors from failed shadow builds become native red squigglies.
+  buildDiags = vscode.languages.createDiagnosticCollection("impact");
+  context.subscriptions.push(buildDiags);
+  runner.diagnosticsSink = applyDiagnostics;
 
   const applyDotnetPath = () =>
     setDotnetPath(vscode.workspace.getConfiguration("dotnetImpact").get<string>("dotnetPath", ""));
@@ -69,6 +82,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           ok ? hot.runsettingsFile : undefined
         );
         if (ok) runner!.hotpatch = hot;
+        // Fast-path builds report diagnostics too, when the patcher grows the
+        // sink (wired defensively: older HotPatcher builds simply ignore it).
+        (hot as { diagnosticsSink?: (e: DiagnosticsEvent) => void }).diagnosticsSink =
+          applyDiagnostics;
         // Warm sessions for MTP test apps (resident server-mode processes).
         // With the hook env they register as patchable hosts, so MTP projects
         // get the same fast path as vstest ones.
@@ -204,6 +221,66 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
 function updateStatus(text: string, spin = false): void {
   statusBar.text = `$(${spin ? "sync~spin" : "beaker"}) impact: ${text}`;
+}
+
+// ---------- build diagnostics ----------
+
+/**
+ * Apply a runner DiagnosticsEvent to the editor: `set` replaces everything
+ * this project last reported (errors always, warnings per the
+ * surfaceBuildWarnings setting — "auto" defers to the C# extension's live
+ * language-server warnings when it's installed), `clear` retires it. Files
+ * outside the workspace root (SDK targets, generated sources) are dropped.
+ */
+function warningsEnabled(): boolean {
+  const mode = vscode.workspace
+    .getConfiguration("dotnetImpact")
+    .get<string>("surfaceBuildWarnings", "auto");
+  if (mode === "on") return true;
+  if (mode === "off") return false;
+  return !vscode.extensions.getExtension("ms-dotnettools.csharp");
+}
+
+function applyDiagnostics(e: DiagnosticsEvent): void {
+  if (!buildDiags || !runner) return;
+  for (const u of ownedDiags.get(e.projectRel) ?? []) buildDiags.delete(vscode.Uri.parse(u));
+  ownedDiags.delete(e.projectRel);
+  buildErrorCounts.delete(e.projectRel);
+  if (e.kind === "clear") return;
+
+  const showWarnings = warningsEnabled();
+  const byFile = new Map<string, vscode.Diagnostic[]>();
+  let errors = 0;
+  for (const d of e.diagnostics) {
+    if (d.severity === "warning" && !showWarnings) continue;
+    const rel = path.relative(runner.repoRoot, d.file);
+    if (rel.startsWith("..") || path.isAbsolute(rel)) continue; // outside the workspace
+    if (d.severity === "error") errors++;
+    const diag = new vscode.Diagnostic(
+      new vscode.Range(d.startLine, d.startCol, d.endLine ?? d.startLine, d.endCol ?? d.startCol + 1),
+      d.message,
+      d.severity === "error" ? vscode.DiagnosticSeverity.Error : vscode.DiagnosticSeverity.Warning
+    );
+    diag.code = d.code;
+    diag.source = "impact";
+    if (!byFile.has(d.file)) byFile.set(d.file, []);
+    byFile.get(d.file)!.push(diag);
+  }
+  const owned = new Set<string>();
+  for (const [file, list] of byFile) {
+    const uri = vscode.Uri.file(file);
+    buildDiags.set(uri, list);
+    owned.add(uri.toString());
+  }
+  ownedDiags.set(e.projectRel, owned);
+  buildErrorCounts.set(e.projectRel, errors);
+}
+
+/** Currently surfaced build errors across all projects. */
+function totalBuildErrors(): number {
+  let n = 0;
+  for (const c of buildErrorCounts.values()) n += c;
+  return n;
 }
 
 // ---------- tree population ----------
@@ -458,10 +535,15 @@ async function doRun(
     } else {
       // Settle the counter at all/all: everything not run reports its last state.
       if (subset) replayKnownSuite(run, reported);
+      const failing = result.outcomes.filter((o) => !o.passed && !o.skipped).length;
       updateStatus(
         result.ok
           ? `✓ ${result.outcomes.length} tests (${affected.classes.length} classes)`
-          : `✗ ${result.outcomes.filter((o) => !o.passed && !o.skipped).length} failing`
+          : failing > 0
+            ? `✗ ${failing} failing`
+            : // Not-ok with zero red tests means the build itself broke —
+              // "0 failing" would read as green.
+              `✗ build failed (${totalBuildErrors()} errors)`
       );
       // Live map refresh: re-collect coverage for what just ran, in the background.
       const cfg = vscode.workspace.getConfiguration("dotnetImpact");
@@ -658,10 +740,18 @@ function reportOutcomes(run: vscode.TestRun, outcomes: TestOutcome[], reported?:
     const classItem = findClassItem(cls) ?? ensureClassItem(cls);
     if (!classItem) continue;
 
-    const methodItem = ensureMethodItem(classItem, cls, methodFqn);
     const failed = results.filter((r) => !r.passed && !r.skipped);
     const duration = results.reduce((s, r) => s + (r.durationMs ?? 0), 0);
     const allSkipped = results.every((r) => r.skipped);
+    if (allSkipped && methodFqn === cls) {
+      // Class-level skip (no per-method data, e.g. "build failed" with an
+      // empty discovery cache): grey the class and its known children rather
+      // than inventing a phantom method item.
+      run.skipped(classItem);
+      classItem.children.forEach((m) => run.skipped(m));
+      continue;
+    }
+    const methodItem = ensureMethodItem(classItem, cls, methodFqn);
     let message: string | undefined;
     if (allSkipped) {
       run.skipped(methodItem);
@@ -669,7 +759,16 @@ function reportOutcomes(run: vscode.TestRun, outcomes: TestOutcome[], reported?:
       run.passed(methodItem, duration);
     } else {
       message = failed.map((f) => `${f.method}: ${f.message ?? "failed"}`).join("\n");
-      run.failed(methodItem, new vscode.TestMessage(message), duration);
+      const testMessage = new vscode.TestMessage(message);
+      const loc = resolveFailureLocation(failed);
+      if (loc) {
+        // TRX line numbers are 1-based; anchoring at column 0 red-squiggles the assert line.
+        testMessage.location = new vscode.Location(
+          vscode.Uri.file(loc.file),
+          new vscode.Position(loc.line - 1, 0)
+        );
+      }
+      run.failed(methodItem, testMessage, duration);
     }
     reported?.add(methodFqn);
     knownResults.set(methodFqn, {
@@ -693,6 +792,19 @@ function reportOutcomes(run: vscode.TestRun, outcomes: TestOutcome[], reported?:
     if (!item) continue;
     if (agg.passed) run.passed(item, agg.duration);
   }
+}
+
+/** First failing result whose stack trace resolves to a line inside the repo. */
+function resolveFailureLocation(failed: TestOutcome[]): { file: string; line: number } | undefined {
+  if (!runner) return undefined;
+  // Tests execute in the shadow worktree, so stack frames carry shadow paths.
+  const shadowDir = path.join(cacheDirFor(runner.repoRoot), "shadow");
+  for (const f of failed) {
+    if (!f.stackTrace) continue;
+    const loc = failureLocation(f.stackTrace, runner.repoRoot, shadowDir);
+    if (loc) return loc;
+  }
+  return undefined;
 }
 
 /** Settle the counter at "all/all" after a subset run; see core/replay.ts. */
