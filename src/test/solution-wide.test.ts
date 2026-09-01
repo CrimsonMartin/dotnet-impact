@@ -58,8 +58,6 @@ const CONSUMER_EDIT = CONSUMER.replace("return Calc.Add(a, b);", "return Calc.Ad
 interface Reply {
   ok: boolean;
   reason?: string;
-  assembly?: string;
-  md?: string;
   updates?: Array<{ assembly: string; md: string; il: string; pdb: string }>;
 }
 
@@ -163,8 +161,8 @@ test("solution-wide session: cross-project edits emit per-module; guard and epoc
     assert.match(midEpoch.reason ?? "", /mid-epoch/, `diagnosable refusal, got: ${midEpoch.reason}`);
 
     // Reset (what the build path does), restore, reload: a body-only edit
-    // emits a single module and the legacy single-update reply fields stay
-    // populated for pre-#22 callers.
+    // emits exactly one module through the same updates[] shape — the
+    // pre-#22 legacy top-level fields are gone from the protocol.
     assert.equal((await send({ cmd: "reset" })).ok, true);
     fs.writeFileSync(libCs, LIB);
     fs.writeFileSync(conCs, CONSUMER);
@@ -173,8 +171,9 @@ test("solution-wide session: cross-project edits emit per-module; guard and epoc
     const body = await send({ cmd: "delta", files: [libCs] });
     assert.equal(body.ok, true, `body edit: ${body.reason}`);
     assert.equal(body.updates?.length, 1, "body edit touches one module");
-    assert.equal(body.assembly, "Lib", "legacy assembly field populated on single-module emits");
-    assert.ok((body.md ?? "").length > 0, "legacy md field populated on single-module emits");
+    assert.equal(body.updates?.[0]?.assembly, "Lib");
+    assert.ok((body.updates?.[0]?.md ?? "").length > 0, "single-module emit must carry a real delta");
+    assert.ok(!("md" in body) && !("assembly" in body), "legacy top-level reply fields must stay gone");
   } finally {
     try {
       proc.stdin.write(JSON.stringify({ cmd: "shutdown" }) + "\n");

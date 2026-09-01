@@ -47,8 +47,7 @@ public class Extra
 interface Reply {
   ok: boolean;
   reason?: string;
-  md?: string;
-  il?: string;
+  updates?: Array<{ assembly: string; md: string; il: string; pdb: string }>;
 }
 
 async function withService(
@@ -142,7 +141,7 @@ test("caps handshake: a Baseline-only fleet refuses add-method but still patches
     fs.writeFileSync(calc, CALC.replace("return a + b;", "return a + b + 0;"));
     const body = await send({ cmd: "delta", csproj, file: calc });
     assert.equal(body.ok, true, `body edit under Baseline: ${body.reason}`);
-    assert.ok((body.md ?? "").length > 0, "body edit must produce a real delta");
+    assert.ok((body.updates?.[0]?.md ?? "").length > 0, "body edit must produce a real delta");
     fs.writeFileSync(calc, CALC);
   });
 });
@@ -170,7 +169,8 @@ test("multi-file save: interdependent edits patch as one batch, and per-file the
     fs.writeFileSync(calc, editedCalc);
     const batch = await send({ cmd: "delta", csproj, files: [calc, extra] });
     assert.equal(batch.ok, true, `batched interdependent edits must patch: ${batch.reason}`);
-    assert.ok((batch.md ?? "").length > 0 && (batch.il ?? "").length > 0, "batch must produce a real delta");
+    const u0 = batch.updates?.[0];
+    assert.ok((u0?.md ?? "").length > 0 && (u0?.il ?? "").length > 0, "batch must produce a real delta");
     fs.writeFileSync(calc, CALC);
     fs.writeFileSync(extra, EXTRA);
   });

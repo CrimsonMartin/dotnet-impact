@@ -19,7 +19,6 @@
 //       for lookup — documents resolve across the whole loaded solution)
 //   <- {"id":2,"type":"done","ok":true,
 //       "updates":[{"assembly":"Lib","md":"<b64>","il":"<b64>","pdb":"<b64>"}, ...]}
-//      (plus legacy top-level assembly/md/il/pdb when exactly one update)
 //      or {"id":2,"type":"done","ok":false,"reason":"rude edit ENC0023: ..."}
 //   -> {"id":3,"cmd":"reset"}   drop all state (after a real rebuild)
 //
@@ -164,22 +163,7 @@ while ((line = Console.ReadLine()) != null)
                             pdb = Convert.ToBase64String(u.Pdb),
                         })
                         .ToArray();
-                    // Legacy single-update fields kept for protocol/test
-                    // compatibility when the emit spans exactly one module.
-                    if (list.Length == 1)
-                        Emit(new
-                        {
-                            id,
-                            type = "done",
-                            ok = true,
-                            updates = list,
-                            assembly = list[0].assembly,
-                            md = list[0].md,
-                            il = list[0].il,
-                            pdb = list[0].pdb,
-                        });
-                    else
-                        Emit(new { id, type = "done", ok = true, updates = list });
+                    Emit(new { id, type = "done", ok = true, updates = list });
                 }
                 break;
             }

@@ -146,9 +146,7 @@ const MATRIX: Row[] = [
 interface Reply {
   ok: boolean;
   reason?: string;
-  md?: string;
-  il?: string;
-  pdb?: string;
+  updates?: Array<{ assembly: string; md: string; il: string; pdb: string }>;
 }
 
 test("fast-path patchability matrix", { timeout: 600_000 }, async () => {
@@ -225,7 +223,7 @@ test("fast-path patchability matrix", { timeout: 600_000 }, async () => {
         );
         if (r.ok) {
           assert.ok(
-            (r.md ?? "").length > 0 && (r.il ?? "").length > 0,
+            (r.updates?.[0]?.md ?? "").length > 0 && (r.updates?.[0]?.il ?? "").length > 0,
             `${row.name}: patch came back with empty deltas`
           );
           deltaMs.push(ms);
@@ -323,7 +321,7 @@ test("deltas chain across generations in one session", { timeout: 600_000 }, asy
     fs.writeFileSync(source, BASELINE.replace("return a + b;", "return a + b + 2;"));
     const g2 = await send({ cmd: "delta", csproj, file: source });
     assert.equal(g2.ok, true, `gen2: ${g2.reason}`);
-    assert.ok((g2.md ?? "").length > 0, "gen2 produced deltas");
+    assert.ok((g2.updates?.[0]?.md ?? "").length > 0, "gen2 produced deltas");
   } finally {
     try {
       proc.stdin.write(JSON.stringify({ cmd: "shutdown" }) + "\n");

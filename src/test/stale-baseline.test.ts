@@ -39,7 +39,7 @@ public static class Calc
 interface Reply {
   ok: boolean;
   reason?: string;
-  md?: string;
+  updates?: Array<{ assembly: string; md: string; il: string; pdb: string }>;
 }
 
 test("mismatched complog/dll baseline is refused at load, matched pair still deltas", { timeout: 600_000 }, async () => {
@@ -119,7 +119,7 @@ test("mismatched complog/dll baseline is refused at load, matched pair still del
     fs.writeFileSync(source, fs.readFileSync(source, "utf8").replace("price -", "price +"));
     const r = await send({ cmd: "delta", csproj, file: source });
     assert.equal(r.ok, true, `a real edit on a coherent baseline must delta: ${r.reason}`);
-    assert.ok((r.md ?? "").length > 0, "delta came back empty");
+    assert.ok((r.updates?.[0]?.md ?? "").length > 0, "delta came back empty");
   } finally {
     try {
       proc.stdin.write(JSON.stringify({ cmd: "shutdown" }) + "\n");

@@ -220,10 +220,7 @@ export class HotPatcher {
       this.log(`hotpatch: ${label}: ${r.reason} — using build path`);
       return false;
     } else {
-      const updates =
-        r.updates ??
-        (r.assembly ? [{ assembly: r.assembly, md: r.md!, il: r.il!, pdb: r.pdb! }] : []);
-      for (const u of updates) {
+      for (const u of r.updates ?? []) {
         deltas.push({
           assembly: u.assembly,
           md: Buffer.from(u.md, "base64"),
@@ -621,11 +618,7 @@ interface DeltaReply {
   ok: boolean;
   reason?: string;
   calls?: number;
-  assembly?: string;
-  md?: string;
-  il?: string;
-  pdb?: string;
-  /** Solution-wide emits (#22): one entry per touched module. */
+  /** Delta replies: one entry per touched module (solution-wide emit, #22). */
   updates?: Array<{ assembly: string; md: string; il: string; pdb: string }>;
 }
 

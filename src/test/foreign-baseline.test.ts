@@ -30,7 +30,7 @@ public static class Calc
 interface Reply {
   ok: boolean;
   reason?: string;
-  md?: string;
+  updates?: Array<{ assembly: string; md: string; il: string; pdb: string }>;
 }
 
 test("a complog paired with a foreign build's dll/pdb is refused at load", { timeout: 600_000 }, async () => {
@@ -92,7 +92,7 @@ test("a complog paired with a foreign build's dll/pdb is refused at load", { tim
     fs.writeFileSync(path.join(dirA, "Calc.cs"), SRC.replace("return a + b;", "return a + b + 1;"));
     const delta = await send({ cmd: "delta", csproj: csprojA, file: path.join(dirA, "Calc.cs") });
     assert.equal(delta.ok, true, `real edit on the matched pair must delta: ${delta.reason}`);
-    assert.ok((delta.md ?? "").length > 0, "delta came back empty");
+    assert.ok((delta.updates?.[0]?.md ?? "").length > 0, "delta came back empty");
   } finally {
     try {
       proc.stdin.write(JSON.stringify({ cmd: "shutdown" }) + "\n");
