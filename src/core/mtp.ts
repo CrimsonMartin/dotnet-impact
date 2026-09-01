@@ -3,7 +3,7 @@ import { TestOutcome } from "./trx";
 import { exec } from "./util";
 
 /**
- * Microsoft.Testing.Platform support (#23, Phase 1: correctness).
+ * Microsoft.Testing.Platform support: the exec fallback surfaces.
  *
  * MTP-native test projects (xunit v3 without the VSTest adapter, MSTest/NUnit
  * with their MTP runners enabled) are self-hosting executables. The VSTest
@@ -14,26 +14,28 @@ import { exec } from "./util";
  *   - `--logger trx --results-directory` is accepted and ignored — no TRX is
  *     written, so runs report ok/fail (exit codes are correct) with ZERO
  *     per-test outcomes;
- *   - vstest.console cannot host them, so warm sessions never exist;
+ *   - vstest.console cannot host them;
  *   - `--collect "Code Coverage"` is ignored — no report.
  *
- * The MTP app itself is cooperative, and runner-agnostic where it matters —
- * the output below is the platform's own device, shared by xunit v3 and
- * MSTest MTP:
+ * Impact therefore runs MTP projects through the platform's own surfaces.
+ * The PREFERRED path is the warm server-mode session (mtpSession.ts):
+ * resident app, stable test-node uids, per-class filtering, per-test
+ * outcomes, and hot-patchable hosts. THIS module is the fallback for when no
+ * warm session is available — the app's console device, shared by every MTP
+ * runner:
  *
- *   - `dotnet exec <dll> --list-tests` prints the standard
- *     "The following Tests are available:" listing (parseListedTests handles
- *     it unchanged);
+ *   - `dotnet exec <app.dll> --list-tests` prints the standard
+ *     "The following Tests are available:" listing (FQNs on xunit v3; bare
+ *     display names on MSTest, which cannot be attributed to classes);
  *   - a run prints one `failed <FQN> (<duration>)` line per failing test,
- *     indented failure details, and a `Test run summary:` block with
- *     total/failed/succeeded/skipped counts; exit 0 = pass, non-zero = fail.
+ *     indented failure details, and a `Test run summary:` block; exit 0 =
+ *     pass, non-zero = fail.
  *
- * Phase 1 runs MTP projects through those two surfaces: discovery lists via
- * the exe, runs execute the whole project (class filtering is runner-specific
- * on MTP; correctness over speed) and synthesize per-method outcomes — failed
- * methods from the run output, passed methods from the discovery listing
- * minus the failures. Hot patch and warm sessions are skipped loudly.
- * Phase 2 (an MTP server-mode session flavor) is scoped in docs/mtp-compat.md.
+ * The fallback executes the whole project per invocation and synthesizes
+ * per-method outcomes — failed methods from the run output, passed methods
+ * from the discovery listing minus the failures. Hot patch stays gated on
+ * this path: a fresh MTP process loads disk assemblies, so an "applied"
+ * patch would run stale code green.
  */
 
 export interface MtpRunParse {

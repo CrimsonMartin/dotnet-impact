@@ -1,79 +1,66 @@
-# Microsoft.Testing.Platform / xunit v3 compatibility (#23)
+# Microsoft.Testing.Platform / xunit v3 support
 
-Probed 2026-09-01, headless, against the compiled pipeline (Runner +
-SessionRunner + HotPatcher driven directly, the gif-scenario harness shape).
-Environment: .NET SDK 10.0.400 (Linux), xunit.v3 2.0.3,
-xunit.runner.visualstudio 3.1.0, MSTest 3.8.3, Microsoft.NET.Test.Sdk 17.13.0.
-Control scenario: classic xunit 2.9.0 + adapter 2.8.2.
+How impact handles test projects across the VSTest and Microsoft.Testing
+Platform (MTP) worlds. Verified against .NET SDK 10.0.400, xunit.v3 2.0.3,
+xunit.runner.visualstudio 3.1.0, MSTest 3.8.3 and MSTest.Sdk 4.1.0, with
+classic xunit 2.9 as the control.
 
-## Matrix — before Phase 1
+## Which pipeline a project gets
 
-| pipeline stage | xunit v2 (control) | xunit v3 + VSTest adapter | xunit v3 MTP-native | MSTest MTP |
-|---|---|---|---|---|
-| project builds; plain `dotnet test` | works | works | works (exit 0 pass / 1 fail) | works |
-| discovery (`dotnet test --list-tests`) | works | works | **fails: exits 0 with EMPTY stdout** — no listing is produced, so the tree shows no tests | same failure |
-| run outcomes (`--logger trx`) | works | works | **fails silently: `--logger trx --results-directory` accepted and ignored, 0 .trx written** — runs report ok/fail with zero per-test outcomes | same failure |
-| warm sessions (vstest.console) | works | works | **never available** — vstest cannot host an MTP app; every run logs `no warm testhosts` and takes the build path | same |
-| hot-patch fast path | works¹ | works¹ (identical behavior to v2 control) | n/a (no hosts) — but see the stale-green hazard below | n/a |
-| coverage (`--collect "Code Coverage"`) | works | works | **fails silently: collector ignored, no report** (refresh keeps existing rows, logs "no coverage produced") | same |
+`usesMtpRunner` flags MTP-native projects from the csproj: explicit MTP
+properties (`UseMicrosoftTestingPlatformRunner`,
+`TestingPlatformDotnetTestSupport`, `EnableMSTestRunner` and friends),
+`MSTest.Sdk`, or adapter-less `xunit.v3`. Everything else — including
+**xunit v3 with the VSTest adapter, which behaves identically to xunit v2
+everywhere** — takes the classic vstest pipeline unchanged.
 
-¹ Both VSTest scenarios reproduced a **pre-existing fast-path no-op bug**
-(identical in the v2 control, so unrelated to xunit v3): sequence
-*discovery-build → run-all → edit+save (build path, fresh baseline) →
-breaking edit+save* yields `no-op (engine: no effective changes;
-persistent=0 transient=0 rebuild=0)` → `applied 0 delta(s)` → the breaking
-edit stays green. Deterministic repro (single lib + test project, xunit v2
-or v3): drive the Runner through exactly `prepare → discoverAll` (which
-builds the solution) `→ runAffected(full) → whitespace edit +
-runAffected(changed)` (build path, fresh baseline+preload) `→ breaking edit
-+ runAffected(changed)` — the last run reports `fastpath=hit … 0 delta(s)`
-and stays green. Same zero-diagnostic no-op shape investigated in the
-v0.2.7 stale-baseline work, now reliably reproducible — for the fast-path
-owners, out of scope here.
+The VSTest surfaces are silently dark on MTP-native projects (`dotnet test
+--list-tests` exits 0 with empty output, `--logger trx` is accepted and
+ignored, vstest.console can't host the app, coverage collectors are
+ignored), so impact never uses them there.
 
-## What the MTP app itself offers (probe findings)
+## How MTP projects run
 
-- `dotnet exec <app.dll> --list-tests` prints the standard
-  `The following Tests are available:` listing. **xunit v3 lists full FQNs**
-  (parseListedTests handles it unchanged); **MSTest lists display names only**
-  (`Adds`), which cannot be mapped to classes.
-- A run prints one `failed <FQN> (<duration>)` line per failing test with
-  indented assertion details, then a `Test run summary:` block with
-  total/failed/succeeded/skipped counts. Exit 0 = pass, non-zero = fail.
-  This output is the platform's device, shared across runners.
-- `--report-trx` requires the extra `Microsoft.Testing.Extensions.TrxReport`
-  package (not present by default; unknown option without it). Filter options
-  are runner-specific (xunit: `--filter-class`/`--filter-method` work;
-  MTP-generic `--filter-query`/`--treenode-filter` need extensions).
-- `dotnet test` passthrough leaves a UTF-16 console-capture log under
-  `bin/**/TestResults/*.log` — summary counts only, no per-test records.
+**Warm server-mode sessions** (`src/core/mtpSession.ts`) are the primary
+path. The test app is launched once with `--server --client-host/--client-
+port`, connects back to a listener impact owns, and speaks LSP-framed
+JSON-RPC: `initialize`, then `testing/discoverTests` / `testing/runTests`
+with `testing/testUpdates/tests` streaming test nodes. That gives impact:
 
-## Matrix — after Phase 1 (this branch)
+- **discovery with class attribution** — nodes carry stable uids plus
+  `location.type`/`location.method` (xunit v3, MSTest 4+);
+- **per-class filtered runs** — requests carry the wanted nodes'
+  `{uid, display-name}`;
+- **per-test outcomes** — `execution-state` passed/failed/skipped with
+  `error.message`, `error.stacktrace`, and durations;
+- **hot patching** — the startup-hook env is injected at spawn, so the
+  resident app registers as a patchable host and EnC deltas apply to it
+  exactly as to vstest testhosts, including the capability handshake and
+  the generation-coherence gate. A rebuild replaces the dll on disk; the
+  session re-stats it on every use and recycles the process, which resets
+  the patch epoch.
+- **coverage refresh** — the warm-coverage instrumented mirrors run
+  through a dedicated MTP session fleet (no hook env: coverage hosts are
+  never patchable), with per-class `snapshot --reset` attribution as on
+  vstest.
 
-| pipeline stage | xunit v3 MTP-native | MSTest MTP |
-|---|---|---|
-| detection (`usesMtpRunner`) | flagged via MTP properties / MSTest.Sdk / adapter-less xunit.v3 | flagged |
-| discovery | **works** — listed through the app (`dotnet exec <dll> --list-tests`) | still empty (display names only, no FQNs) — Phase 2 |
-| run outcomes | **works** — the app runs whole-project, failures parsed from its `failed <FQN>` lines, passes synthesized from the discovery listing | run-level only: exit codes correct (red/green run state), no per-test rows — Phase 2 |
-| hot-patch fast path | **hard-gated**: `fastpath=off(mtp-project)` — a fresh MTP process loads disk assemblies, so an "applied" patch would run stale code green | same gate |
-| warm sessions | skipped with an explicit log line; ~1.3s/save via the build path | same |
-| per-class filtering | not attempted (runner-specific options); whole project runs — correctness over speed | same |
-| coverage refresh | unchanged: no report, existing rows kept, logged | same |
+**The exec fallback** (`src/core/mtp.ts`) covers any warm-session miss
+(spawn or protocol failure, or no session runner wired, as in the CLI):
+discovery through the app's `--list-tests`, whole-project runs through the
+app with per-method outcomes synthesized from its console output (failures
+from `failed <FQN>` lines, passes from the discovery listing). On this
+path the hot-patch fast path is gated off (`fastpath=off(mtp-project)`) —
+a fresh MTP process loads disk assemblies, so an "applied" patch would run
+stale code green.
 
-## Phase 2 scope (parity)
+## Current limitations
 
-MTP apps stay resident with `--server` (jsonrpc over stdin/stdout) — the
-natural analog of the vstest SessionRunner:
-
-- a second session flavor speaking the MTP server protocol: discovery and
-  per-test execution with **stable test node IDs** (fixes MSTest attribution
-  and per-class filtering runner-agnostically);
-- hot-patch env (`DOTNET_STARTUP_HOOKS`, `DOTNET_MODIFIABLE_ASSEMBLIES`)
-  injected at spawn — we own the process, so the existing hook/pipe pipeline
-  should carry over, re-enabling the fast path;
-- coverage: MTP's own `--coverage` extension or the warm instrumented-mirror
-  pipeline pointed at MTP hosts.
-
-Estimated shape: a `mtpSession.ts` sibling of `vstestSession.ts` plus a
-protocol client; the runner's per-project routing added in Phase 1 is the
-seam it plugs into.
+- **MSTest 3.x**: its server-mode nodes carry only uids and bare method
+  display names (no `location.*`), which cannot be attributed to classes.
+  Runs report run-level red/green with correct exit codes; per-test rows
+  and class filtering need MSTest 4+ (current), whose nodes carry full
+  location data.
+- Parameterized-test display shapes beyond the standard `Class.Method`
+  forms follow whatever the runner reports; attribution uses
+  `location.type` when present and falls back to splitting dotted display
+  names.

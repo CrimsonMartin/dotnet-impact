@@ -60,6 +60,7 @@ export class HotPatcher {
   private async prepareRunsettingsInner(): Promise<boolean> {
     const hook = await this.buildHelper(this.hookSrcDir, "ImpactHotPatch");
     if (!hook) return false;
+    this.hookDll = hook;
     fs.mkdirSync(this.hotDir, { recursive: true });
     fs.writeFileSync(
       this.runsettingsFile,
@@ -71,6 +72,23 @@ export class HotPatcher {
 </EnvironmentVariables></RunConfiguration></RunSettings>\n`
     );
     return true;
+  }
+
+  private hookDll: string | undefined;
+
+  /**
+   * The hook env as raw variables, for processes impact spawns directly (MTP
+   * server-mode apps take env at spawn; vstest gets the same values via the
+   * runsettings file). Null until prepareRunsettings has built the hook.
+   */
+  hookEnv(): Record<string, string> | null {
+    if (!this.hookDll) return null;
+    return {
+      DOTNET_MODIFIABLE_ASSEMBLIES: "debug",
+      DOTNET_STARTUP_HOOKS: this.hookDll,
+      IMPACT_HOTPATCH_PIPE: this.pipeBase,
+      IMPACT_HOTPATCH_DIR: this.hotDir,
+    };
   }
 
   /** Drop all delta state; call after any real build (baselines went stale). */
