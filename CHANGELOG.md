@@ -18,6 +18,13 @@
   now says `✗ build failed (N errors)` instead of the misleading
   `✗ 0 failing` when a run dies in the compiler.
 
+- Tests no longer run against stale binaries after a failed build: a test
+  project whose build (or a dependency's) fails has its affected tests
+  reported as skipped ("build failed") — grey in the explorer, never a
+  stale green — while unrelated projects that still build keep running
+  for real. Failure-first ordering ignores the skips, and coverage runs
+  skip the same way so stale hits can't poison the map.
+
 - Failed tests now carry an inline annotation at the failing assert line:
   the TRX stack trace is resolved to the first frame inside the repo
   (shadow-worktree paths mapped back to the workspace) and attached as the

@@ -740,10 +740,18 @@ function reportOutcomes(run: vscode.TestRun, outcomes: TestOutcome[], reported?:
     const classItem = findClassItem(cls) ?? ensureClassItem(cls);
     if (!classItem) continue;
 
-    const methodItem = ensureMethodItem(classItem, cls, methodFqn);
     const failed = results.filter((r) => !r.passed && !r.skipped);
     const duration = results.reduce((s, r) => s + (r.durationMs ?? 0), 0);
     const allSkipped = results.every((r) => r.skipped);
+    if (allSkipped && methodFqn === cls) {
+      // Class-level skip (no per-method data, e.g. "build failed" with an
+      // empty discovery cache): grey the class and its known children rather
+      // than inventing a phantom method item.
+      run.skipped(classItem);
+      classItem.children.forEach((m) => run.skipped(m));
+      continue;
+    }
+    const methodItem = ensureMethodItem(classItem, cls, methodFqn);
     let message: string | undefined;
     if (allSkipped) {
       run.skipped(methodItem);

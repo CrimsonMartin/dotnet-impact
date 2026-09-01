@@ -649,6 +649,7 @@ export class Runner {
     // Any build failure falls back to the plain full `dotnet build` of the
     // involved test projects, which is always correct.
     let buildMs = 0;
+    let failedBuildRels: string[] = [];
     if (!fastPatched) {
       // Windows keeps loaded assemblies locked — and every warm testhost
       // locks its dependency dlls too, not just its own test dll, so ALL
@@ -665,6 +666,7 @@ export class Runner {
       buildMs = Date.now() - tBuild;
       ok = ok && built.ok;
       output += built.output;
+      failedBuildRels = built.failedRels;
     }
     const tTest = Date.now();
 
@@ -686,6 +688,12 @@ export class Runner {
     ]);
 
     const runInvocation = async (inv: { rel: string; filter?: string; classes?: string[] }) => {
+      const skips = this.buildFailureSkips(failedBuildRels, inv.rel, inv.classes);
+      if (skips) {
+        this.logSink(`${inv.rel}: build failed — tests skipped, stale binaries not run`);
+        // ok stays governed by built.ok; the skips themselves aren't failures.
+        return { ok: true, outcomes: skips, output: "" };
+      }
       // MTP project: vstest can't host it and it ignores TRX loggers, so it
       // runs through Testing.Platform surfaces instead. Preferred: the warm
       // server-mode session (resident app, per-class filtering by test node
@@ -816,9 +824,10 @@ export class Runner {
   private async buildProjects(
     allRels: Set<string>,
     signal?: AbortSignal
-  ): Promise<{ ok: boolean; output: string }> {
+  ): Promise<{ ok: boolean; output: string; failedRels: string[] }> {
     let ok = true;
     let output = "";
+    const failedRels: string[] = [];
     if (!(await this.minimalBuild(allRels, signal))) {
       for (const rel of allRels) {
         if (signal?.aborted) break;
@@ -831,6 +840,7 @@ export class Runner {
         );
         if (res.code !== 0 && !signal?.aborted) {
           ok = false;
+          failedRels.push(rel);
           output += res.stdout + res.stderr;
           this.emitBuildDiagnostics(rel, res.stdout + res.stderr);
         } else if (res.code === 0) {
@@ -852,7 +862,46 @@ export class Runner {
         }
       }
     }
-    return { ok, output };
+    return { ok, output, failedRels };
+  }
+
+  /**
+   * A test project whose build (or a dependency's) just failed must not run:
+   * the only dlls on disk are from the previous successful build, and results
+   * against them would repaint the explorer with verdicts about code that no
+   * longer exists. Instead its mapped tests report as skipped ("build
+   * failed") — grey, not stale green — and, because failure bookkeeping
+   * ignores skipped outcomes, failure-first ordering is untouched. Returns
+   * null when the invocation is unaffected and should run normally.
+   */
+  private buildFailureSkips(
+    failedRels: string[],
+    rel: string,
+    classes: string[] | undefined
+  ): TestOutcome[] | null {
+    if (failedRels.length === 0) return null;
+    const failed = new Set(failedRels);
+    if (!this.relClosure(rel).some((r) => failed.has(r))) return null;
+    const skip = (classFqn: string, method: string): TestOutcome => ({
+      classFqn,
+      method,
+      passed: false,
+      skipped: true,
+      message: "build failed",
+    });
+    const wanted = classes ? new Set(classes) : null;
+    const outcomes: TestOutcome[] = [];
+    for (const m of this.discoveredMethodsFor(rel)) {
+      const cls = m.replace(/\.[^.]+$/, "");
+      if (wanted && !wanted.has(cls)) continue;
+      outcomes.push(skip(cls, m));
+    }
+    // No discovery cache yet: grey the classes themselves (method === class
+    // marks a class-level outcome for the explorer).
+    if (outcomes.length === 0 && classes) {
+      for (const cls of classes) outcomes.push(skip(cls, cls));
+    }
+    return outcomes;
   }
 
   /**
@@ -962,8 +1011,13 @@ export class Runner {
       ...[...byProject.entries()].map(([rel, classes]) => ({
         rel,
         filter: classFilter(classes) as string | undefined,
+        classes: classes as string[] | undefined,
       })),
-      ...fallbackRel.map((rel) => ({ rel, filter: undefined as string | undefined })),
+      ...fallbackRel.map((rel) => ({
+        rel,
+        filter: undefined as string | undefined,
+        classes: undefined as string[] | undefined,
+      })),
     ];
     let next = 0;
     await Promise.all(
@@ -973,6 +1027,15 @@ export class Runner {
           const i = next++;
           if (i >= invocations.length) return;
           const inv = invocations[i];
+          const skips = this.buildFailureSkips(built.failedRels, inv.rel, inv.classes);
+          if (skips) {
+            // Stale binaries would also poison the coverage rows, not just
+            // the verdicts; skip the invocation entirely.
+            this.logSink(`${inv.rel}: build failed — coverage run skipped, stale binaries not run`);
+            outcomes.push(...skips);
+            if (skips.length > 0) onPartial?.(skips);
+            continue;
+          }
           const res = await this.dotnetTestCoverage(inv.rel, inv.filter, signal);
           ok = ok && (res.ok || signal?.aborted === true);
           output += res.output;
