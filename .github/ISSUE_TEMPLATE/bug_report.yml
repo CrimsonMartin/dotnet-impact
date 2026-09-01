@@ -1,0 +1,58 @@
+name: Bug report
+description: Something in Impact misbehaved — a wrong run, stale results, a crash, or a slow path that should be fast.
+labels: [bug]
+body:
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      description: >-
+        Issues are public and stay in caches/mirrors even if edited or deleted later.
+        Stack traces, test names, file paths, and overlay-manifest listings from your
+        own solution often contain private namespaces and project names.
+      options:
+        - label: >-
+            I have redacted private code identifiers (namespaces, class/project names,
+            file paths) from everything below, e.g. replacing them with placeholders
+            like `ProjA`, `MyType.DoThing()`.
+          required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what Impact did, and what you expected instead.
+      placeholder: >-
+        Saved a method-body edit in a leaf project; the affected tests stayed green but
+        should have failed…
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence (redacted)
+      description: >-
+        Error text, Impact output-channel log lines (the `timing: fastpath=…` lines are
+        especially useful), or cache-dir observations — with private identifiers
+        replaced by placeholders.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Impact version
+      placeholder: e.g. 0.2.10 (from the Extensions pane, or `impact --version`)
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: "OS + .NET SDK + test framework, e.g. Windows 11 / .NET 10.0.1 / xUnit"
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: >-
+        Steps or the shape of the change that triggers it (kinds of edits, rough
+        solution size). A minimal public repro repo is gold but not required.
