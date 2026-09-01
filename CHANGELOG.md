@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.1
+
+- Fixed the class icon staying green when a failed build skipped its tests:
+  the explorer's class rollup treated "no failures" as passed, so an
+  all-skipped class got an explicit green check painted over its grey
+  method rows. The rollup now distinguishes skipped from passed — a class
+  whose every method skipped shows grey, one where anything really ran
+  and nothing failed shows green, and any real failure stays red.
+
 ## 0.4.0
 
 - Compile errors now surface as red squigglies in the editor — no C# Dev

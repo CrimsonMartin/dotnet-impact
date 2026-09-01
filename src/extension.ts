@@ -7,7 +7,7 @@ import { locateClasses, locateMethod, locateMethods, SourceLocation, stripNestin
 import { testProjects } from "./core/projects";
 import { KnownResult, pruneKnownResults, replayEvents } from "./core/replay";
 import { AffectedSet, DiagnosticsEvent, Runner, TestOutcome } from "./core/runner";
-import { failureLocation } from "./core/trx";
+import { classVerdicts, failureLocation } from "./core/trx";
 import { cacheDirFor, setDotnetPath, toRepoRelative } from "./core/util";
 import { WarmCoverage } from "./core/coverageSession";
 import { MtpSessionRunner } from "./core/mtpSession";
@@ -786,11 +786,17 @@ function reportOutcomes(run: vscode.TestRun, outcomes: TestOutcome[], reported?:
   }
 
   // Class rollup (VS Code also aggregates children, but explicit results keep
-  // classes green/red even when method children were just created).
+  // classes green/red even when method children were just created). The
+  // verdict must distinguish all-skipped from passed: an explicit passed here
+  // overrides VS Code's child aggregation, so calling it for a "build
+  // failed" skip painted the class green over grey methods (v0.4.0 bug).
+  const verdicts = classVerdicts(outcomes);
   for (const [cls, agg] of classResults) {
     const item = findClassItem(cls);
     if (!item) continue;
-    if (agg.passed) run.passed(item, agg.duration);
+    const verdict = verdicts.get(cls);
+    if (verdict === "passed") run.passed(item, agg.duration);
+    else if (verdict === "skipped") run.skipped(item);
   }
 }
 

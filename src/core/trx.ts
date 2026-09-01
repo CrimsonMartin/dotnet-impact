@@ -13,6 +13,42 @@ export interface TestOutcome {
   durationMs?: number;
 }
 
+/**
+ * Roll per-outcome results up to a class verdict the way the explorer groups
+ * them: theory cases collapse into one method (display args stripped), a
+ * method is skipped only when every case skipped, and the class is
+ *  - "failed":  any method really failed;
+ *  - "passed":  none failed and at least one actually ran;
+ *  - "skipped": every method skipped — e.g. "build failed", where painting
+ *    the class green would present stale binaries as a verdict (the v0.4.0
+ *    green-icon bug: skips have no failures, so a passed-only rollup read
+ *    them as passes).
+ */
+export function classVerdicts(outcomes: TestOutcome[]): Map<string, "passed" | "failed" | "skipped"> {
+  const byMethod = new Map<string, TestOutcome[]>();
+  for (const o of outcomes) {
+    const key = o.method.replace(/\(.*\)$/s, "");
+    if (!byMethod.has(key)) byMethod.set(key, []);
+    byMethod.get(key)!.push(o);
+  }
+  const verdicts = new Map<string, "passed" | "failed" | "skipped">();
+  for (const results of byMethod.values()) {
+    const cls = results[0].classFqn;
+    const mine = results.some((r) => !r.passed && !r.skipped)
+      ? "failed"
+      : results.every((r) => r.skipped)
+        ? "skipped"
+        : "passed";
+    const cur = verdicts.get(cls);
+    // Precedence: failed > passed > skipped.
+    verdicts.set(
+      cls,
+      cur === "failed" || mine === "failed" ? "failed" : cur === "passed" || mine === "passed" ? "passed" : "skipped"
+    );
+  }
+  return verdicts;
+}
+
 function decodeXml(s: string): string {
   return s
     .replace(/&quot;/g, '"')
