@@ -1,6 +1,6 @@
 import * as assert from "node:assert/strict";
 import { test } from "node:test";
-import { classesRecord, parseListedTests } from "../core/discover";
+import { classesRecord, hasBareListedNames, parseListedTests } from "../core/discover";
 
 test("VSTest format: method FQNs after marker, theory args stripped and deduped", () => {
   const stdout = [
@@ -51,6 +51,21 @@ test("MTP format (no marker): strict FQN lines accepted, chatter rejected", () =
 
 test("MTP format: two-segment lines are too ambiguous and skipped", () => {
   assert.deepEqual(parseListedTests("Class.Method"), []);
+});
+
+test("hasBareListedNames: NUnit/MSTest display-name listings detected; FQN and MTP listings are not", () => {
+  const bare = "Test run for /x/T.dll\nThe following Tests are available:\n    Adds\n    Muls\n";
+  assert.equal(hasBareListedNames(bare), true);
+  // Those bare names must also never enter the parsed method list.
+  assert.deepEqual(parseListedTests(bare), []);
+
+  const fqn = "The following Tests are available:\n    Ns.CalcTests.Adds\n";
+  assert.equal(hasBareListedNames(fqn), false);
+
+  const mixed = "The following Tests are available:\n    Ns.CalcTests.Adds\n    Muls\n";
+  assert.equal(hasBareListedNames(mixed), true, "a single bare entry means FQNs are incomplete");
+
+  assert.equal(hasBareListedNames("Ns.CalcTests.Adds\nchatter"), false, "marker-less MTP output is not the VSTest shape");
 });
 
 test("classesRecord collapses per-project methods to distinct classes", () => {

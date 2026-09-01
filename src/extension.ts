@@ -9,6 +9,7 @@ import { KnownResult, pruneKnownResults, replayEvents } from "./core/replay";
 import { AffectedSet, Runner, TestOutcome } from "./core/runner";
 import { cacheDirFor, setDotnetPath, toRepoRelative } from "./core/util";
 import { WarmCoverage } from "./core/coverageSession";
+import { MtpSessionRunner } from "./core/mtpSession";
 import { ExternalChangeBatcher } from "./core/externalWatch";
 import { HotPatcher } from "./core/hotpatch";
 import { waitForShadowLock, withShadowLock } from "./core/lock";
@@ -68,6 +69,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           ok ? hot.runsettingsFile : undefined
         );
         if (ok) runner!.hotpatch = hot;
+        // Warm sessions for MTP test apps (resident server-mode processes).
+        // With the hook env they register as patchable hosts, so MTP projects
+        // get the same fast path as vstest ones.
+        runner!.mtpSessions = new MtpSessionRunner((m) => output.appendLine(m), hot.hookEnv() ?? {});
         output.appendLine(
           ok
             ? "hot-patch: ready (runsettings prepared, delta service on demand)"
@@ -822,6 +827,7 @@ async function buildMapWithProgress(
 
 export function deactivate(): void {
   runner?.sessions?.dispose(true); // shadow worktree itself persists intentionally
+  runner?.mtpSessions?.dispose();
   runner?.hotpatch?.dispose();
   (runner?.coverageWarm as WarmCoverage | null)?.dispose?.();
 }

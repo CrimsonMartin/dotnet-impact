@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- CI integration (#24): `impact run --ci` makes a pipeline fail (exit 1)
+  where hook safety would soft-skip — a cold map or a held shadow lock —
+  so a PR job can never green-light untested code; local hook behavior is
+  unchanged. `impact affected --format json` emits a machine-readable
+  selection (`mapReady`, `classes`, `projects`, `changedFiles`) for
+  workflow branching, and `impact build-map --if-missing` is the cached-CI
+  no-op warmer. `docs/ci.md` carries a complete GitHub Actions recipe
+  (map cached across runs, affected-only PR builds, full-suite fallback).
+
 ## 0.2.10
 
 - Affected runs now also trigger on external file changes (#10): `git

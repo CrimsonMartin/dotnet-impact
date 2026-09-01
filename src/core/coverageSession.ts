@@ -2,6 +2,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { ClassCoverageResult, parseCoberturaHitFiles } from "./coverage";
+import { MtpSessionRunner } from "./mtpSession";
 import { SessionRunner } from "./vstestSession";
 import { cacheDirFor, classFilter, exec, resolveDotnet } from "./util";
 
@@ -33,6 +34,12 @@ export class WarmCoverage {
   private readonly covRoot: string;
   private readonly sessionId: string;
   private sessions: SessionRunner;
+  /**
+   * Dedicated warm fleet for MTP test apps' instrumented copies. Static
+   * instrumentation is runner-agnostic; only the process hosting the copy
+   * differs. No hook env: coverage hosts must never register as patchable.
+   */
+  private readonly mtpSessions = new MtpSessionRunner((m) => this.log(m));
   private broken = false;
   private toolPath: string | null = null;
   private serverReady = false;
@@ -60,7 +67,9 @@ export class WarmCoverage {
     firstPartyAssemblies: string[],
     testDlls: string[],
     classFqn: string,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    /** True when the project runs on Microsoft.Testing.Platform. */
+    mtp = false
   ): Promise<ClassCoverageResult | null> {
     if (this.broken || testDlls.length === 0) return null;
     if (!(await this.ensureServer())) return null;
@@ -77,7 +86,9 @@ export class WarmCoverage {
     let passed = true;
     for (const dll of instrDlls) {
       if (signal?.aborted) return null;
-      const r = await this.sessions.runFilter(dll, classFilter([classFqn]), signal);
+      const r = mtp
+        ? await this.mtpSessions.runFilter(dll, path.dirname(dll), [classFqn], signal)
+        : await this.sessions.runFilter(dll, classFilter([classFqn]), signal);
       if (!r) return null; // session miss: classic path covers every TFM
       passed = passed && r.ok;
       output += r.output;
@@ -97,6 +108,7 @@ export class WarmCoverage {
   /** Release warm hosts and stop the resident session. */
   dispose(): void {
     this.sessions.dispose();
+    this.mtpSessions.dispose();
     if (this.serverReady && this.toolPath) {
       this.serverReady = false;
       void exec(this.toolPath, ["shutdown", this.sessionId], this.cacheDir, 30_000, undefined, dotnetEnv()).catch(
