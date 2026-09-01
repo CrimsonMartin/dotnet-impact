@@ -18,6 +18,7 @@ function scaffold(): { root: string; repoRoot: string; info: ProjectInfo } {
     assemblyName: "Lib",
     references: [],
     isTestProject: false,
+    usesMtpRunner: false,
   };
   return { root, repoRoot, info };
 }

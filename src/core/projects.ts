@@ -12,6 +12,12 @@ export interface ProjectInfo {
   assemblyName: string;
   references: string[]; // absolute csproj paths
   isTestProject: boolean;
+  /**
+   * Test project running through Microsoft.Testing.Platform instead of
+   * VSTest (#23): no vstest hosting, no TRX logger, no --list-tests output —
+   * the runner routes these through the MTP app's own surfaces.
+   */
+  usesMtpRunner: boolean;
 }
 
 export interface ProjectGraph {
@@ -58,6 +64,24 @@ function findCsprojFiles(root: string): string[] {
   return out;
 }
 
+/** Property/package shapes that mark a csproj as MTP-native (no VSTest host). */
+const MTP_PROPS_RE =
+  /<(TestingPlatformDotnetTestSupport|UseMicrosoftTestingPlatformRunner|EnableMSTestRunner|EnableNUnitRunner|EnableAspireTestingPlatform)>\s*true\s*</i;
+const MSTEST_SDK_RE = /Sdk\s*=\s*"MSTest\.Sdk[/"]/i;
+const XUNIT_V3_RE = /PackageReference\s+Include\s*=\s*"xunit\.v3/i;
+const VSTEST_ADAPTER_RE =
+  /PackageReference\s+Include\s*=\s*"(xunit\.runner\.visualstudio|NUnit3TestAdapter|MSTest\.TestAdapter|Microsoft\.NET\.Test\.Sdk)"/i;
+
+/**
+ * True when the csproj runs its tests through Microsoft.Testing.Platform
+ * INSTEAD of VSTest (#23). xunit.v3 with the VSTest adapter present stays on
+ * the classic path (it hosts fine); without the adapter it is MTP-only.
+ */
+export function usesMtpRunner(csprojContent: string): boolean {
+  if (MTP_PROPS_RE.test(csprojContent) || MSTEST_SDK_RE.test(csprojContent)) return true;
+  return XUNIT_V3_RE.test(csprojContent) && !VSTEST_ADAPTER_RE.test(csprojContent);
+}
+
 const TEST_PACKAGE_RE =
   /PackageReference\s+Include\s*=\s*"(Microsoft\.NET\.Test\.Sdk|xunit[^"]*|NUnit[^"]*|MSTest[^"]*|Microsoft\.Testing\.Platform[^"]*)"/i;
 const PROJECT_REF_RE = /ProjectReference\s+Include\s*=\s*"([^"]+)"/gi;
@@ -88,7 +112,8 @@ export function buildProjectGraph(root: string): ProjectGraph {
       name,
       assemblyName: asmMatch ? asmMatch[1].trim() : name,
       references: refs,
-      isTestProject: TEST_PACKAGE_RE.test(content),
+      isTestProject: TEST_PACKAGE_RE.test(content) || usesMtpRunner(content),
+      usesMtpRunner: usesMtpRunner(content),
     });
   }
 
