@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.2
+
+- Changes made while VS Code was closed are now detected at startup (#33):
+  Impact records a digest of the source tree and, on activation, re-walks
+  and diffs it — edits, additions and deletions that landed from another
+  editor, a `git pull`, or a branch switch trigger the affected tests and
+  their rebuild, instead of the tree sitting on the previous session's
+  verdicts until the next save. A cold cache records a baseline rather
+  than treating everything as changed, edits already tested in a session
+  don't re-fire at the next startup, and `dotnetImpact.watchExternalChanges`
+  (which governs the same "changes Impact didn't cause" story in-session)
+  turns it off.
+
 ## 0.4.1
 
 - Fixed the class icon staying green when a failed build skipped its tests:

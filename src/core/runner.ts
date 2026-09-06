@@ -19,6 +19,7 @@ import {
   ProjectGraph,
   ProjectInfo,
   projectForFile,
+  sourceFingerprints,
   sourceStamp,
   stampNewestMs,
   testProjects,
@@ -326,6 +327,65 @@ export class Runner {
       }
     }
     return [...files];
+  }
+
+  /**
+   * Source files that changed since the last session looked at the tree (#33):
+   * edits, additions and deletions that landed while the extension wasn't
+   * running (another editor, `git pull`, a branch switch) produce no watcher
+   * event and no save, so without this the tree keeps showing the previous
+   * session's verdicts until the user happens to save something.
+   *
+   * Reading also re-records the digest: a change fires exactly once. A cold
+   * cache is a baseline, never "everything changed" — that would run the full
+   * suite the first time Impact opens a repo.
+   */
+  sourceChangesSinceLastSession(): string[] {
+    const digestPath = path.join(cacheDirFor(this.repoRoot), "source-digest.json");
+    const current = this.currentFingerprints();
+
+    let previous: Record<string, string> | undefined;
+    try {
+      const loaded = JSON.parse(fs.readFileSync(digestPath, "utf8"));
+      if (loaded?.version === 1 && loaded.files) previous = loaded.files;
+    } catch {
+      /* cold cache: baseline below */
+    }
+
+    const changed: string[] = [];
+    if (previous) {
+      for (const [file, fp] of current) if (previous[file] !== fp) changed.push(file);
+      // A deleted source changes the compilation just as much as an edited one.
+      for (const file of Object.keys(previous)) if (!current.has(file)) changed.push(file);
+    }
+
+    this.writeSourceDigest(current);
+    return changed;
+  }
+
+  private currentFingerprints(): Map<string, string> {
+    const current = new Map<string, string>();
+    for (const p of this.projectGraph().projects.values()) sourceFingerprints(this.repoRoot, p.dir, current);
+    return current;
+  }
+
+  /**
+   * Re-baseline the #33 digest after a run: edits this session already tested
+   * must not look like out-of-session changes at the next startup.
+   */
+  recordSourceDigest(): void {
+    this.writeSourceDigest(this.currentFingerprints());
+  }
+
+  private writeSourceDigest(files: Map<string, string>): void {
+    try {
+      const digestPath = path.join(cacheDirFor(this.repoRoot), "source-digest.json");
+      fs.mkdirSync(path.dirname(digestPath), { recursive: true });
+      fs.writeFileSync(digestPath, JSON.stringify({ version: 1, files: Object.fromEntries(files) }));
+    } catch (e) {
+      // Best-effort: a failure costs a repeated startup run, not correctness.
+      this.logSink(`source digest not recorded: ${(e as Error).message}`);
+    }
   }
 
   computeAffected(changedFiles: string[]): AffectedSet {

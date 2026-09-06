@@ -211,6 +211,35 @@ export function stampNewestMs(stamp: string): number {
   return Number.isFinite(newest) ? newest : Infinity;
 }
 
+/**
+ * Every source file under a project directory, repo-relative, paired with a
+ * "mtime:size" fingerprint — the file-level counterpart to sourceStamp(),
+ * for diffing a tree against how it looked in an earlier session (#33).
+ * Walks exactly what sourceStamp() stamps, so build output never registers.
+ */
+export function sourceFingerprints(root: string, dir: string, into: Map<string, string> = new Map()): Map<string, string> {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return into;
+  }
+  for (const e of entries) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) {
+      if (!SKIP_DIRS.has(e.name.toLowerCase()) && !isNestedRepo(p)) sourceFingerprints(root, p, into);
+    } else if (STAMP_FILE_RE.test(e.name)) {
+      try {
+        const s = fs.statSync(p);
+        into.set(path.relative(root, p).split(path.sep).join("/"), `${Math.round(s.mtimeMs)}:${s.size}`);
+      } catch {
+        /* vanished mid-walk (a build replacing outputs): skip */
+      }
+    }
+  }
+  return into;
+}
+
 export function sourceStamp(projectDir: string): string {
   let newest = 0;
   const rels: string[] = [];

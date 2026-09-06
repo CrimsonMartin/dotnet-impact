@@ -121,7 +121,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(controller, statusBar, output);
 
   populateTreeFromCache();
-  void eagerDiscover(); // background: build shadow, discover classes, refresh tree
+  void eagerDiscover().then(runStartupChanges); // discover first: the run needs the tree
 
   // When C# Dev Kit is present it registers its own test controller over the
   // same projects; staying a default profile there would make the Testing
@@ -303,6 +303,29 @@ function populateTreeFromCache(): void {
     /* first session */
   }
   rebuildTree(cached);
+}
+
+/**
+ * Run whatever changed while the extension wasn't running (#33) — another
+ * editor, `git pull`, a branch switch. Without this the tree would keep
+ * showing the previous session's verdicts until the user happened to save.
+ * Gated on the same setting as the in-session external watcher (#10): both
+ * answer "changes Impact didn't cause".
+ */
+async function runStartupChanges(): Promise<void> {
+  if (!runner) return;
+  const cfg = vscode.workspace.getConfiguration("dotnetImpact");
+  if (!cfg.get<boolean>("watchExternalChanges", true)) return;
+  try {
+    const changed = runner.sourceChangesSinceLastSession();
+    if (changed.length === 0) return;
+    output.appendLine(
+      `startup: ${changed.length} source file(s) changed while closed — running affected tests`
+    );
+    await executeRun(new vscode.TestRunRequest(), changed);
+  } catch (e) {
+    output.appendLine(`startup change check failed: ${String(e)}`);
+  }
 }
 
 /** Discover all test classes (freshness-skipped, parallel) and refresh the tree. */
@@ -557,6 +580,9 @@ async function doRun(
     updateStatus("error");
     output.appendLine(String(e));
   } finally {
+    // This session has now seen the tree as it stands; without re-baselining,
+    // edits tested here would look like out-of-session changes next startup (#33).
+    runner?.recordSourceDigest();
     releaseLock();
     run.end();
   }
@@ -638,6 +664,9 @@ async function doCoverageRun(request: vscode.TestRunRequest, signal: AbortSignal
     updateStatus("error");
     output.appendLine(String(e));
   } finally {
+    // This session has now seen the tree as it stands; without re-baselining,
+    // edits tested here would look like out-of-session changes next startup (#33).
+    runner?.recordSourceDigest();
     releaseLock();
     run.end();
   }
