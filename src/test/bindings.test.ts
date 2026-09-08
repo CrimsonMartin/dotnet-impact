@@ -15,6 +15,7 @@ import {
   learnedSelection,
   mineDelta,
   pruneBindings,
+  selectLearningTargets,
   shouldDrop,
 } from "../core/bindings";
 import { cacheDirFor } from "../core/util";
@@ -196,6 +197,47 @@ const ROWS = [
   { fqn: "Ns.C", source: "static" as const, abstractFiles: ["src/IRepo.cs"] },
   { fqn: "Ns.D", source: "coverage" as const, abstractFiles: [A] },
 ];
+
+test("selectLearningTargets: unresolved abstractions weighted by how many classes share them", () => {
+  const unmeasured = [
+    { classFqn: "Ns.Shared1", abstractFiles: [A] },
+    { classFqn: "Ns.Shared2", abstractFiles: [A] },
+    { classFqn: "Ns.Shared3", abstractFiles: [A] },
+    { classFqn: "Ns.Solo", abstractFiles: ["src/IRepo.cs"] },
+  ];
+  const r = selectLearningTargets({ unmeasured, measuredAbstractFiles: new Set(), table: {}, budget: 10 });
+  // All three A-sharers score 3 (measuring any one resolves A for all of
+  // them); the solo scores 1.
+  assert.deepEqual(r, ["Ns.Shared1", "Ns.Shared2", "Ns.Shared3", "Ns.Solo"]);
+});
+
+test("selectLearningTargets: budget caps, ordering is deterministic", () => {
+  const unmeasured = [
+    { classFqn: "Ns.B", abstractFiles: [A] },
+    { classFqn: "Ns.A", abstractFiles: [A] },
+    { classFqn: "Ns.C", abstractFiles: [A] },
+  ];
+  assert.deepEqual(
+    selectLearningTargets({ unmeasured, measuredAbstractFiles: new Set(), table: {}, budget: 2 }),
+    ["Ns.A", "Ns.B"]
+  );
+});
+
+test("selectLearningTargets: resolved abstractions are never sampled", () => {
+  const unmeasured = [
+    { classFqn: "Ns.A", abstractFiles: [A] }, // binding exists
+    { classFqn: "Ns.B", abstractFiles: ["src/IRepo.cs"] }, // measured class references it
+    { classFqn: "Ns.C", abstractFiles: ["src/IFresh.cs"] }, // unresolved
+  ];
+  const table: BindingTable = { [A.toLowerCase()]: [binding()] };
+  const r = selectLearningTargets({
+    unmeasured,
+    measuredAbstractFiles: new Set(["src/IRepo.cs"]),
+    table,
+    budget: 10,
+  });
+  assert.deepEqual(r, ["Ns.C"]);
+});
 
 test("learnedSelection: changed binding target selects static classes referencing the abstraction", () => {
   const table: BindingTable = { [A.toLowerCase()]: [binding()] };

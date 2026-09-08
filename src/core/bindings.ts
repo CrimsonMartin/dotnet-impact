@@ -240,6 +240,49 @@ export function learnedSelection(opts: {
   return { classes, covered };
 }
 
+/**
+ * Active-learning selection (#31 step 4): which UNMEASURED class's
+ * measurement would teach the most.
+ *
+ * An abstraction is UNRESOLVED when no binding covers it AND no measured
+ * class references it — a measured class's run (even one with an empty Δ)
+ * teaches that its abstractions expose no dynamic edge from that path, so
+ * sampling more classes that share it is wasted. Score(T) is the sum, over
+ * T's unresolved abstractions, of how many unmeasured classes share each:
+ * measuring T resolves that abstraction for all of them. Deterministic:
+ * score descending, FQN ascending; at most `budget` classes.
+ */
+export function selectLearningTargets(opts: {
+  unmeasured: Array<{ classFqn: string; abstractFiles: string[] }>;
+  /** Abstraction files referenced by any MEASURED class (resolved, no edge). */
+  measuredAbstractFiles: Set<string>;
+  table: BindingTable;
+  budget: number;
+}): string[] {
+  const known = new Set<string>(Object.keys(opts.table));
+  for (const a of opts.measuredAbstractFiles) known.add(a.toLowerCase());
+  const share = new Map<string, number>();
+  for (const c of opts.unmeasured)
+    for (const a of c.abstractFiles) {
+      const k = a.toLowerCase();
+      if (known.has(k)) continue;
+      share.set(k, (share.get(k) ?? 0) + 1);
+    }
+  return opts.unmeasured
+    .map((c) => {
+      let score = 0;
+      for (const a of c.abstractFiles) {
+        const k = a.toLowerCase();
+        if (!known.has(k)) score += share.get(k) ?? 0;
+      }
+      return { fqn: c.classFqn, score };
+    })
+    .filter((x) => x.score > 0)
+    .sort((x, y) => y.score - x.score || (x.fqn < y.fqn ? -1 : x.fqn > y.fqn ? 1 : 0))
+    .slice(0, opts.budget)
+    .map((x) => x.fqn);
+}
+
 /** Persisted per-repo store for learned bindings. */
 export class LearnedBindings {
   private table: BindingTable = {};

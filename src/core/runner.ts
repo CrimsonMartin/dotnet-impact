@@ -25,7 +25,7 @@ import {
   testProjects,
 } from "./projects";
 import { ImpactMap } from "./map";
-import { LearnedBindings, learnedSelection } from "./bindings";
+import { LearnedBindings, learnedSelection, selectLearningTargets } from "./bindings";
 import { collectCsFiles, parseRegistrations, resolveSeeds } from "./registrations";
 import { findBuiltDll, findBuiltDlls, StaticMapper } from "./staticmap";
 import { parseTrx, TestOutcome } from "./trx";
@@ -1438,6 +1438,10 @@ export class Runner {
    * grow the map organically.
    */
   static readonly COVERAGE_FRESH_MS = 7 * 24 * 3600 * 1000;
+  /** #31: default budget for the active-learning pass (classes per drain). */
+  static readonly LEARNING_BUDGET = 20;
+  /** #31: active-learning sampling budget (overridable; tests pin it small). */
+  learningBudget = Runner.LEARNING_BUDGET;
 
   queueRefreshFromOutcomes(outcomes: TestOutcome[], owners?: Record<string, string>): number {
     for (const o of outcomes) {
@@ -1470,6 +1474,19 @@ export class Runner {
   ): Promise<number> {
     if (!this.shadow) await this.prepare();
     let done = 0;
+    // #31: classes the active-learning pass already sampled this drain — a
+    // class whose measurement failed stays unmeasured and must not be
+    // re-selected forever.
+    const learningTried = new Set<string>();
+    const replenish = () => {
+      if (!this.learnedBindingsEnabled || this.pendingRefresh.size > 0 || opts.signal?.aborted) return;
+      for (const t of this.learningTargets(learningTried)) {
+        learningTried.add(t);
+        const entry = this.map.entry(t);
+        if (entry) this.pendingRefresh.set(t, entry.csproj);
+      }
+    };
+    replenish();
     while (this.pendingRefresh.size > 0 && !opts.signal?.aborted) {
       const [cls, csprojRel] = this.pendingRefresh.entries().next().value as [string, string];
       this.pendingRefresh.delete(cls);
@@ -1526,7 +1543,40 @@ export class Runner {
       } catch {
         /* leave the row as-is; the next full build-map covers it */
       }
+      // #31: queue drained — deliberately sample the unmeasured classes
+      // whose measurements would teach the most (unresolved abstractions,
+      // weighted by how many unmeasured classes share each). They flow
+      // through this same low-priority loop; a foreground run still
+      // preempts via the signal.
+      replenish();
     }
     return done;
+  }
+
+  /**
+   * #31 active learning: unmeasured classes whose measurements would teach
+   * the most. An abstraction counts as unresolved only while no binding
+   * covers it AND no measured class references it — a measured class's run
+   * (even an empty Δ) teaches that its abstractions expose no dynamic edge
+   * from that path. See selectLearningTargets for the scoring.
+   */
+  private learningTargets(tried: Set<string>): string[] {
+    const unmeasured: Array<{ classFqn: string; abstractFiles: string[] }> = [];
+    const measuredAbstractFiles = new Set<string>();
+    for (const cls of this.map.classes()) {
+      const e = this.map.entry(cls)!;
+      const abs = e.abstractFiles ?? [];
+      if ((e.source ?? "coverage") === "coverage") {
+        for (const a of abs) measuredAbstractFiles.add(a);
+      } else if (!tried.has(cls)) {
+        unmeasured.push({ classFqn: cls, abstractFiles: abs });
+      }
+    }
+    return selectLearningTargets({
+      unmeasured,
+      measuredAbstractFiles,
+      table: this.bindings.tableSnapshot,
+      budget: this.learningBudget,
+    });
   }
 }
