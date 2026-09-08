@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- The static map now records, per test class, the source files of directly
+  referenced interfaces and abstract classes (first step of the self-tuning
+  map, #31): this is the attribution surface for dynamic edges that static
+  analysis cannot see (DI bindings, reflection), and the helper's type index
+  lets the extension resolve type names found in DI registration calls back
+  to files. No behavior change yet — the data is collected, not consumed.
+
 ## 0.4.2
 
 - Changes made while VS Code was closed are now detected at startup (#33):

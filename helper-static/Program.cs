@@ -140,11 +140,18 @@ if (world.Count >= 20)
             capped.Add(node);
 }
 
-// BFS closure per test class -> file union.
+// BFS closure per test class -> file union. Alongside the closure, each test
+// class's DIRECT references to abstractions (interfaces / abstract classes):
+// the self-tuning map (#31) attributes dynamically-discovered files to the
+// abstractions a class references, so a learned binding transfers to every
+// other class referencing the same abstraction.
 var classes = new Dictionary<string, object>();
 foreach (var tc in testClasses)
 {
     var files = new SortedSet<string>(StringComparer.Ordinal);
+    var abstractFiles = new SortedSet<string>(StringComparer.Ordinal);
+    foreach (var e in tc.Edges)
+        if (e.IsInterface || e.IsAbstract) foreach (var f in e.Files) abstractFiles.Add(f);
     var seen = new HashSet<TypeNode> { tc };
     var queue = new Queue<TypeNode>();
     queue.Enqueue(tc);
@@ -158,12 +165,24 @@ foreach (var tc in testClasses)
             if (seen.Add(e)) queue.Enqueue(e);
         }
     }
-    classes[tc.Fqn] = new { csproj = tc.Csproj, files = files.ToArray() };
+    classes[tc.Fqn] = new { csproj = tc.Csproj, files = files.ToArray(), abstractFiles = abstractFiles.ToArray() };
+}
+
+// Solution type -> source files, for resolving registration-seed type names
+// (#31) back to files on the extension side. Files-only (types without PDB
+// source carry no selection signal).
+var types = new Dictionary<string, string[]>();
+foreach (var (fqn, nodes) in byName)
+{
+    var f = new SortedSet<string>(StringComparer.Ordinal);
+    foreach (var n in nodes) foreach (var file in n.Files) f.Add(file);
+    if (f.Count > 0) types[fqn] = f.ToArray();
 }
 
 Console.WriteLine(JsonSerializer.Serialize(new
 {
     classes,
+    types,
     skipped,
     capped = capped.Select(c => c.Fqn).OrderBy(f => f, StringComparer.Ordinal).ToArray(),
 }));
@@ -357,6 +376,16 @@ void LoadAssembly(AssemblyInput input)
             if (!testClasses.Contains(node)) testClasses.Add(node);
             node.IsTestClass = true;
         }
+
+        // Abstraction markers for the self-tuning map (#31): which of this
+        // node's DIRECTLY referenced types are interfaces / abstract classes.
+        // Static classes carry the Abstract flag (Abstract+Sealed) but are
+        // never DI targets, so exclude sealed types.
+        node.IsInterface = (td.Attributes & System.Reflection.TypeAttributes.Interface) != 0;
+        node.IsAbstract =
+            (td.Attributes & System.Reflection.TypeAttributes.Abstract) != 0 &&
+            (td.Attributes & System.Reflection.TypeAttributes.Sealed) == 0 &&
+            !node.IsInterface;
     }
 }
 
@@ -499,6 +528,8 @@ sealed class TypeNode
     public bool IsTestClass;
     public bool IsEnum;
     public bool IsConstOnly;
+    public bool IsInterface;
+    public bool IsAbstract;
     public readonly HashSet<string> Files = new(StringComparer.Ordinal);
     public readonly HashSet<string> RefNames = new(StringComparer.Ordinal);
     public readonly HashSet<TypeNode> Edges = new();

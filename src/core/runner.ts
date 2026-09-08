@@ -1368,7 +1368,7 @@ export class Runner {
       alive.get(row.csproj)!.add(cls);
       opts.onProgress?.(done, entries.length, cls);
       // refresh forces a clean static baseline over old coverage rows too.
-      if (this.map.updateStatic(cls, row.csproj, row.files, opts.refresh)) done++;
+      if (this.map.updateStatic(cls, row.csproj, row.files, opts.refresh, row.abstractFiles ?? [])) done++;
     }
 
     if (!cancelled) {
