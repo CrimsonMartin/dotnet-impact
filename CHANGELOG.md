@@ -8,6 +8,13 @@
   analysis cannot see (DI bindings, reflection), and the helper's type index
   lets the extension resolve type names found in DI registration calls back
   to files. No behavior change yet — the data is collected, not consumed.
+- Every coverage refresh now mines the gap between measured and static
+  coverage (the Δ): each file a run executes that the static closure missed
+  is attributed to the abstractions the class references, and the resulting
+  binding edges (e.g. `IService.cs ⇒ ServiceImpl.cs`) are recorded in a
+  per-repo store with confirmation/contradiction evidence. The store is
+  collected, not yet consumed — selection changes land with the query-time
+  application.
 
 ## 0.4.2
 
