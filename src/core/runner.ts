@@ -25,7 +25,7 @@ import {
   testProjects,
 } from "./projects";
 import { ImpactMap } from "./map";
-import { LearnedBindings } from "./bindings";
+import { LearnedBindings, learnedSelection } from "./bindings";
 import { findBuiltDll, findBuiltDlls, StaticMapper } from "./staticmap";
 import { parseTrx, TestOutcome } from "./trx";
 import { cacheDirFor, classFilter, exec, git, parseStatusZ, toRepoRelative } from "./util";
@@ -75,6 +75,13 @@ export class Runner {
   readonly map: ImpactMap;
   /** Learned binding edges (self-tuning map, #31): per-repo, mined in live refresh. */
   readonly bindings: LearnedBindings;
+  /**
+   * Apply learned bindings to selection (#31). On by default: edges only ADD
+   * files to static closures (over-selection), never remove. The extension
+   * mirrors the dotnetImpact.learnedBindings setting here; the CLI keeps the
+   * default.
+   */
+  learnedBindingsEnabled = true;
   private shadow: Shadow | null = null;
   private graph: ProjectGraph | null = null;
   private settingsFile: string | undefined;
@@ -404,8 +411,28 @@ export class Runner {
       .filter((f) => !/(^|\/)(bin|obj)\//i.test(f));
     const classes = this.map.affectedClasses(rel, unknown);
 
+    // #31: learned binding edges extend STATIC rows at query time (measured
+    // rows are ground truth). A changed file some class reaches via a
+    // binding is no longer "unknown" — its effective closure now touches
+    // it, so it stops triggering project-level fallback.
+    let unknownFiles = unknown;
+    if (this.learnedBindingsEnabled && this.bindings.count > 0) {
+      const { classes: learned, covered } = learnedSelection({
+        changedFiles: rel,
+        table: this.bindings.tableSnapshot,
+        classes: this.map.classes().map((fqn) => {
+          const e = this.map.entry(fqn)!;
+          return { fqn, source: e.source, abstractFiles: e.abstractFiles ?? [] };
+        }),
+      });
+      for (const c of learned) if (!classes.includes(c)) classes.push(c);
+      classes.sort();
+      if (covered.size > 0)
+        unknownFiles = unknown.filter((f) => !covered.has(f.toLowerCase()));
+    }
+
     const fallback = new Map<string, ProjectInfo>();
-    for (const f of unknown) {
+    for (const f of unknownFiles) {
       if (!FALLBACK_FILE_RE.test(f)) continue;
       const abs = path.join(this.repoRoot, f);
       // Non-.cs files (project files, config) only trigger fallback when they

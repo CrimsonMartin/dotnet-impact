@@ -61,6 +61,11 @@
           "default": true,
           "description": "After each affected run, re-collect coverage for the classes that ran (low-priority, background) so map rows stay fresh."
         },
+        "dotnetImpact.learnedBindings": {
+          "type": "boolean",
+          "default": true,
+          "description": "Self-tuning map (#31): apply binding edges learned from coverage runs (e.g. DI implementation files invisible to static analysis) when selecting tests for unmeasured classes. Edges only ADD files to impact closures — over-selection, never under-selection."
+        },
         "dotnetImpact.warmCoverageRefresh": {
           "type": "boolean",
           "default": true,

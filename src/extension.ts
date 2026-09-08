@@ -48,6 +48,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   output = vscode.window.createOutputChannel("Impact");
   runner = new Runner(repoRoot);
   runner.logSink = (m) => output.appendLine(m);
+  // Self-tuning map (#31): learned binding edges extend static closures at
+  // selection time. Safe direction only (adds tests, never removes).
+  runner.learnedBindingsEnabled =
+    vscode.workspace.getConfiguration("dotnetImpact").get<boolean>("learnedBindings", true);
 
   // Compiler errors from failed shadow builds become native red squigglies.
   buildDiags = vscode.languages.createDiagnosticCollection("impact");
