@@ -277,6 +277,27 @@ export class LearnedBindings {
     this.save();
   }
 
+  /**
+   * Seed parsed-registration edges (#31 step 3): added only where no binding
+   * (mined or parsed) already covers the same pair — mined evidence wins.
+   * Returns how many were added.
+   */
+  seedParsed(
+    edges: Array<{ from: string; to: string }>,
+    now: string = new Date().toISOString()
+  ): number {
+    let added = 0;
+    for (const { from, to } of edges) {
+      const k = from.toLowerCase();
+      if (!this.table[k]) this.table[k] = [];
+      if (this.table[k].some((b) => b.to.toLowerCase() === to.toLowerCase())) continue;
+      this.table[k].push({ to, source: "parsed", confirms: 1, contradicts: 0, lastSeen: now, evidence: [] });
+      added++;
+    }
+    if (added > 0) this.save();
+    return added;
+  }
+
   /** Staleness decay (buildMap time). */
   decay(nowMs = Date.now()): void {
     this.table = decayBindings(this.table, nowMs);

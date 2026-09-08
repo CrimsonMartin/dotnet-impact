@@ -23,6 +23,14 @@
   extended; a learned-covered file stops triggering project-level fallback.
   `dotnetImpact.learnedBindings` (default on) turns the tier off; the CLI
   gets it for free since selection is shared.
+- Map builds now also SEED bindings from statically-visible DI
+  registrations in source (`AddScoped<IService, ServiceImpl>()` and the
+  `TryAdd*`/`AddSingleton`/`AddTransient`/Autofac `RegisterType` family,
+  plus the `AddScoped<I>(new Impl())` form), resolved against the static
+  map's type index — the transfer effect works on a fresh repo with zero
+  test runs. Mined evidence wins over seeds; ambiguous or unresolvable type
+  names yield no edge. Factory-lambda and convention-based registrations
+  remain mining's job.
 
 ## 0.4.2
 

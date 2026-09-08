@@ -26,6 +26,7 @@ import {
 } from "./projects";
 import { ImpactMap } from "./map";
 import { LearnedBindings, learnedSelection } from "./bindings";
+import { collectCsFiles, parseRegistrations, resolveSeeds } from "./registrations";
 import { findBuiltDll, findBuiltDlls, StaticMapper } from "./staticmap";
 import { parseTrx, TestOutcome } from "./trx";
 import { cacheDirFor, classFilter, exec, git, parseStatusZ, toRepoRelative } from "./util";
@@ -1385,6 +1386,19 @@ export class Runner {
     const result = await this.staticMapper.compute(this.shadow!.dir, graph);
     if (!result) {
       return { mapped: 0, failed: [...failed, "static map computation failed"] };
+    }
+
+    // #31 step 3: seed bindings from statically-visible DI registrations —
+    // zero test runs. Mined evidence wins: seedParsed skips pairs a binding
+    // already covers. Best-effort: a parse failure must not block the map.
+    if (result.types && Object.keys(result.types).length > 0) {
+      try {
+        const edges = resolveSeeds(parseRegistrations(collectCsFiles(this.repoRoot)), result.types);
+        const added = this.bindings.seedParsed(edges);
+        if (added > 0) this.logSink(`learned bindings: seeded ${added} from DI registrations`);
+      } catch (e) {
+        this.logSink(`learned bindings: registration parse failed: ${(e as Error).message}`);
+      }
     }
 
     const entries = Object.entries(result.classes);

@@ -152,7 +152,7 @@ public class BTests
  * class calls it, so its MethodSpec-visible edge never reaches a test class).
  */
 export const TYPED_REGISTRATION_FILE = {
-  rel: "src/Lib/CompositionRoot.cs",
+  rel: "tests/T/CompositionRoot.cs",
   content: `namespace Demo;
 
 public static class CompositionRoot
