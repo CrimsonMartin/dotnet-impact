@@ -84,29 +84,38 @@ Two output additions:
    attribution precise (a class that reaches `IService` through a fixture
    doesn't get the binding attributed to it; the fixture's own closure or the
    fixture's classes cover that case). Conservative by design.
-2. **`registrations`**: DI registration pairs found in IL — calls to methods
-   named `AddScoped`/`AddSingleton`/`AddTransient`/`TryAdd*` (and Autofac
-   `RegisterType`) with exactly **two** generic type arguments, emitted as
-   `{ service: fqn, impl: fqn }`. Post-compilation IL makes these unambiguous
-   (fully qualified, no `using` resolution, no regex fragility). Pairs where
-   either type isn't a solution type are dropped.
+2. **Registration source (deviation, shipped)**: DI registration pairs are
+   parsed from **source text** (`src/core/registrations.ts`), not IL. Reason:
+   recent Roslyn (SDK 10) emits MethodSpec rows that make typed registrations
+   IL-visible, older SDKs don't — IL extraction is toolchain-dependent, while
+   a source pass over `AddScoped<IService, ServiceImpl>()` / `TryAdd*` /
+   `AddSingleton` / `AddTransient` / Autofac `RegisterType` (two-generic form,
+   plus `AddScoped<I>(new Impl())`) works on every toolchain. Names resolve
+   against the helper's type index (exact FQN → non-generic → UNIQUE short
+   name; ambiguous/unresolvable ⇒ no seed). Factory-lambda and convention-
+   based registrations are out of scope for the parser by design — they are
+   exactly what Δ-mining is for.
 
-`StaticMapper.compute` surfaces both; `Runner.buildMap` stores
-`abstractFiles` on static rows.
+`StaticMapper.compute` surfaces `abstractFiles` + `types`; `Runner.buildMap`
+stores `abstractFiles` on static rows and runs the registration seed.
 
 ### B. Δ-mining (hook in `Runner.refreshPending`)
 
 At the existing refresh point — after `cov.files` is resolved, **before**
 `this.map.update(...)` overwrites the static row:
 
-- First measurement of a class (row `source === "static"`):
-  `Δ(T) = measured(T) \ static(T)`. For each `B ∈ Δ(T)` and each
-  `A ∈ abstractFiles(T)` with `A ≠ B`: record evidence for binding `A ⇒ B`.
-  This is the only window where Δ exists — the overwrite destroys the static
-  baseline, so mining must precede it.
-- Re-measurement (row already coverage): no Δ; instead each known
-  `A ⇒ B` with `A ∈ abstractFiles(T)` gets `confirms++` if `B ∈ measured(T)`,
-  else `contradicts++`.
+- Baseline = the row this measurement replaces (static on first
+  measurement, the PREVIOUS coverage row on re-measurements). `Δ = measured
+  − baseline`. For each `B ∈ Δ` and each `A ∈ abstractFiles(T)` with `A ≠ B`:
+  record evidence for binding `A ⇒ B` (activate or re-confirm). This is the
+  only window where Δ exists — the overwrite destroys the baseline, so mining
+  must precede it. (Shipped refinement over the original "no Δ on
+  re-measurement": using the previous coverage row as baseline is what lets a
+  CHANGED world teach a new edge — when the convention flips to a different
+  implementation, the newly-appearing impl file is attributed and the old
+  impl's edge starts accumulating contradictions in the same measurements.)
+- Every measurement: each known `A ⇒ B` with `A ∈ abstractFiles(T)` gets
+  `confirms++` if `B ∈ measured(T)`, else `contradicts++`.
 
 All evidence math is a pure function in a new `src/core/bindings.ts`.
 
@@ -135,9 +144,22 @@ Single application point, so the VS Code extension and the CLI
 
 For each changed file `B`: existing inverted-index lookup selects classes as
 today, **plus** for each binding `A ⇒ B`, every class whose row is `source
-=== "static"` and whose `abstractFiles` contain `A` is added. Unknown-file
-fallback behavior unchanged (learned edges can only pull files *out* of the
-unknown list, never push them in).
+=== "static"` and whose `abstractFiles` contain `A` is added.
+
+**Covered status (fallback suppression) is earned, not assumed.** It is the
+ONE place a learned edge can reduce selection relative to the fallback, so:
+- a **parsed** seed (types named precisely) covers from the first sight;
+- a **mined** edge covers its target only from its SECOND confirmation
+  (`MINED_CONFIRM_TO_COVER = 2`). One-evidence mined edges still SELECT
+  classes (safe over-selection) but the target file keeps triggering the
+  project-level fallback — pre-#31 behavior, no under-selection possible.
+
+Rationale: Δ attribution credits EVERY abstraction the class references, so a
+single-measurement edge may be attached to the wrong abstraction; suppressing
+the fallback on such an edge would drop tests the fallback used to run. The
+second confirmation arrives with the next refresh of any class that exercises
+the binding (the fallback run itself queues them), so selection converges to
+precise within one test run.
 
 Kill switch: `dotnetImpact.learnedBindings` (default `true`), same
 `getConfiguration` pattern as `watchExternalChanges`.
@@ -194,8 +216,9 @@ existing fixture style (temp repo, real builds, real `Runner` — cf.
     re-measurement; drop rule boundary cases (`contradicts = 3` keeps,
     `4 > 2×1` drops, `4 vs confirms = 2` keeps); staleness decay at the
     30-day boundary; path prune.
-  - `effectiveFiles`: static row + edges ⇒ union; **coverage row + edges ⇒
-    unchanged** (the invariant, as a named test).
+  - Query-time invariant as named tests: a coverage row is never selected or
+    extended via a binding; covered requires a selected class AND a covering
+    edge (parsed, or mined with ≥ MINED_CONFIRM_TO_COVER).
 - **Integration test**: DI fixture repo (interface, container-registered impl,
   two test classes resolving through the container); warm-refresh class A;
   assert `learned-bindings.json` gained `IService.cs ⇒ ServiceImpl.cs` with
@@ -257,6 +280,10 @@ existing fixture style (temp repo, real builds, real `Runner` — cf.
   longer need blanket closure edges) — follow-up, explicitly deferred.
 - **Abstraction ambiguity**: none at the IL level (fully qualified types);
   the only resolution that happens in TS is file lookup, which is exact.
+- **Wrong-abstraction attribution**: Δ credits every referenced abstraction,
+  so a mined edge can land on the wrong one. Class selection on such an edge
+  is safe (over-selection); fallback suppression on it is not — hence the
+  MINED_CONFIRM_TO_COVER = 2 gate (see component D).
 
 ## Estimate
 

@@ -20,9 +20,21 @@
   binding's abstraction — the transfer effect the per-class hybrid could not
   produce (a DI implementation edit now runs tests that were never
   coverage-measured). Measured rows stay ground truth and are never
-  extended; a learned-covered file stops triggering project-level fallback.
-  `dotnetImpact.learnedBindings` (default on) turns the tier off; the CLI
-  gets it for free since selection is shared.
+  extended. `dotnetImpact.learnedBindings` (default on) turns the tier off;
+  the CLI gets it for free since selection is shared.
+- Fallback suppression is earned, not assumed. A "covered" file (one that
+  stops triggering project-level fallback) is the ONE place a learned edge
+  can reduce selection, so the rule is: a mined edge — which credits every
+  abstraction the class references and may land on the wrong one — selects
+  classes from the first confirmation but covers its target only from the
+  SECOND (`MINED_CONFIRM_TO_COVER`); a parsed registration seed names its
+  types precisely and covers immediately. In practice this is invisible in
+  the common case (the evidence class's measured row still names the target
+  file, so the fallback never triggers at all); it bites only when the
+  target leaves every row — e.g. right after a refactor re-measured the
+  evidence class — and then the pre-#31 fallback (whole project) still runs
+  until the second confirmation. No under-selection is possible at any
+  stage.
 - Map builds now also SEED bindings from statically-visible DI
   registrations in source (`AddScoped<IService, ServiceImpl>()` and the
   `TryAdd*`/`AddSingleton`/`AddTransient`/Autofac `RegisterType` family,
@@ -40,6 +52,21 @@
   samples flow through the existing low-priority warm pipeline and a
   foreground run still preempts them; sampling stops once every abstraction
   is resolved, and it honors the `dotnetImpact.learnedBindings` switch.
+- Map builds now maintain the store: edges unseen for 30 days decay out,
+  and edges whose abstraction or target file no longer exists in the tree
+  are pruned (dead paths from refactors). `impact status` reports the store
+  size with a mined/parsed breakdown when non-empty. Edges are evidence, not
+  facts: the mining baseline is the PREVIOUS row of any source (static on
+  first measurement, the previous coverage row on re-measurements), so a
+  changed world both contradicts stale edges (target no longer hit) and
+  attributes freshly-appearing files to new ones in the same measurements;
+  `contradicts >= 4 && contradicts > 2*confirms` drops an edge and reverts
+  selection — pinned by an e2e that flips the fixture's convention-based
+  registration to a second implementation and watches the learned edge die
+  and the fallback return while the new reality is learned.
+- `Runner.resyncShadow()` re-mirrors the real repo's uncommitted state into
+  the shadow worktree (used by the contradiction e2e after an out-of-band
+  edit; the watch path will use it too).
 
 ## 0.4.2
 

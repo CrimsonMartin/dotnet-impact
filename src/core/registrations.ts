@@ -97,8 +97,8 @@ export function resolveSeeds(
     if (!serviceFiles || !implFiles) continue;
     for (const from of serviceFiles)
       for (const to of implFiles) {
-        if (from === to) continue;
-        const key = from + "\u0000" + to;
+        if (from.toLowerCase() === to.toLowerCase()) continue; // same file (case-insensitive FS)
+        const key = from.toLowerCase() + "\u0000" + to.toLowerCase();
         if (seen.has(key)) continue;
         seen.add(key);
         out.push({ from, to });

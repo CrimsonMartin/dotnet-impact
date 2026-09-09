@@ -53,17 +53,24 @@ public interface IService
     string Do();
 }
 `,
+  // NOTE: keep ServiceImpl.cs free of any type that other implementations
+  // call (a shared helper here would be covered by every impl's run and the
+  // "impl file" would never leave a measurement's file set).
   "src/Lib/ServiceImpl.cs": `namespace Demo;
 
 public class ServiceImpl : IService
 {
-    public string Do() => "impl:" + RuntimeCounter.Next();
+    public string Do() => "impl";
 }
+`,
+  "src/Lib/ServiceOther.cs": `namespace Demo;
 
-public static class RuntimeCounter
+/// Alternate implementation of IService. The contradiction tests flip
+/// App.Register's convention to this type, so the learned ServiceImpl edge
+/// starts getting contradicted (and a fresh ServiceOther edge confirmed).
+public class ServiceOther : IService
 {
-    private static int _n;
-    public static int Next() => System.Threading.Interlocked.Increment(ref _n);
+    public string Do() => "other";
 }
 `,
   "src/FakeDi/FakeDi.csproj":
@@ -126,7 +133,7 @@ public class ATests
     {
         App.Register();
         IService svc = (IService)Demo.FakeDi.Container.Get(typeof(IService));
-        Assert.StartsWith("impl:", svc.Do());
+        Assert.False(string.IsNullOrEmpty(svc.Do()));
     }
 }
 `,
@@ -140,7 +147,7 @@ public class BTests
     {
         App.Register();
         IService svc = (IService)Demo.FakeDi.Container.Get(typeof(IService));
-        Assert.StartsWith("impl:", svc.Do());
+        Assert.False(string.IsNullOrEmpty(svc.Do()));
     }
 }
 `,

@@ -165,6 +165,17 @@ export class Runner {
     return this.shadow;
   }
 
+  /**
+   * Re-mirror the real repo's uncommitted state into the shadow worktree and
+   * bump the sync watermark. Used after the real tree changes out-of-band
+   * (the watch path, tests) so the next measurement sees current sources.
+   */
+  async resyncShadow(): Promise<void> {
+    if (!this.shadow) return;
+    await syncOverlay(this.shadow);
+    this.syncedAtMs = Date.now(); // watermark advances only on a successful sync
+  }
+
   projectGraph(): ProjectGraph {
     if (!this.graph) this.graph = buildProjectGraph(this.repoRoot);
     return this.graph;
@@ -913,6 +924,18 @@ export class Runner {
   }
 
   /** Minimal-rebuild first; any failure falls back to plain builds of the test projects. */
+  /**
+   * Build the given projects (repo-relative csproj paths) inside the shadow.
+   * Foreground runs do this before measuring; background refreshes assume the
+   * shadow is current. Exposed so out-of-band edits (watch path, tests) can
+   * bring the shadow up to date before a re-measurement.
+   */
+  async buildShadowProjects(rels: Iterable<string>): Promise<{ ok: boolean; failedRels: string[] }> {
+    if (!this.shadow) await this.prepare();
+    const r = await this.buildProjects(new Set(rels));
+    return { ok: r.ok, failedRels: r.failedRels };
+  }
+
   private async buildProjects(
     allRels: Set<string>,
     signal?: AbortSignal
@@ -1388,18 +1411,28 @@ export class Runner {
       return { mapped: 0, failed: [...failed, "static map computation failed"] };
     }
 
+    // #31: one tree walk serves both the registration seed and the dead-path
+    // prune below (collectCsFiles reads every file's text).
+    const csFiles = collectCsFiles(this.repoRoot);
+
     // #31 step 3: seed bindings from statically-visible DI registrations —
     // zero test runs. Mined evidence wins: seedParsed skips pairs a binding
     // already covers. Best-effort: a parse failure must not block the map.
     if (result.types && Object.keys(result.types).length > 0) {
       try {
-        const edges = resolveSeeds(parseRegistrations(collectCsFiles(this.repoRoot)), result.types);
+        const edges = resolveSeeds(parseRegistrations(csFiles), result.types);
         const added = this.bindings.seedParsed(edges);
         if (added > 0) this.logSink(`learned bindings: seeded ${added} from DI registrations`);
       } catch (e) {
         this.logSink(`learned bindings: registration parse failed: ${(e as Error).message}`);
       }
     }
+
+    // #31: staleness decay (edges unseen for 30 days drop) and dead-path
+    // prune (abstraction or target files gone from the tree) — run at map
+    // build so selection only ever sees live, current edges.
+    this.bindings.decay();
+    this.bindings.prune(new Set(csFiles.map((f) => f.rel.toLowerCase())));
 
     const entries = Object.entries(result.classes);
     /** Alive classes per project for pruning: static ∪ vstest discovery (their
@@ -1527,14 +1560,15 @@ export class Runner {
           this.logSink(`map refresh: no coverage produced for ${cls}; keeping existing row`);
           continue;
         }
-        // #31 mining window: Δ = measured − static exists only until
-        // map.update overwrites the static row — attribute it first.
+        // #31 mining window: Δ = measured − previous row (static on first
+        // measurement, the previous coverage row on re-measurements) exists
+        // only until map.update overwrites it — attribute it first.
         const entry = this.map.entry(cls);
         this.bindings.observeMeasurement({
           classFqn: cls,
           abstractFiles: entry?.abstractFiles ?? [],
           measuredFiles: files,
-          staticFiles: entry?.source === "static" ? entry.files : null,
+          staticFiles: entry?.files ?? null,
           now: new Date().toISOString(),
         });
         this.map.update(cls, csprojRel, files);
