@@ -15,6 +15,14 @@
   per-repo store with confirmation/contradiction evidence. The store is
   collected, not yet consumed — selection changes land with the query-time
   application.
+- Selection now applies the learned binding edges: editing a file that a
+  binding points at selects every unmeasured test class that references the
+  binding's abstraction — the transfer effect the per-class hybrid could not
+  produce (a DI implementation edit now runs tests that were never
+  coverage-measured). Measured rows stay ground truth and are never
+  extended; a learned-covered file stops triggering project-level fallback.
+  `dotnetImpact.learnedBindings` (default on) turns the tier off; the CLI
+  gets it for free since selection is shared.
 
 ## 0.4.2
 

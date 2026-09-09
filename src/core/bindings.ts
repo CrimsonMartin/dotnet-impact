@@ -194,6 +194,52 @@ export function effectiveFiles(
   return out;
 }
 
+/**
+ * Query-time application: which classes selected bindings extend.
+ *
+ * For each changed file that is a binding target, every class whose row is
+ * STATIC and whose abstractFiles contain the binding's abstraction is
+ * selected (measured rows are ground truth — never extended). A changed file
+ * that at least one such class reaches via a binding is "covered": its
+ * effective closure now touches it, so callers stop treating it as unknown
+ * (no project-level fallback). Returns both the selected classes and the
+ * covered files (lower-cased).
+ */
+export function learnedSelection(opts: {
+  changedFiles: string[];
+  table: BindingTable;
+  classes: Array<{
+    fqn: string;
+    source?: "static" | "coverage";
+    abstractFiles: string[];
+  }>;
+}): { classes: Set<string>; covered: Set<string> } {
+  const byTarget = new Map<string, string[]>(); // target(lower) -> abstractions
+  for (const [from, list] of Object.entries(opts.table))
+    for (const b of list) {
+      const k = b.to.toLowerCase();
+      if (!byTarget.has(k)) byTarget.set(k, []);
+      byTarget.get(k)!.push(from);
+    }
+  const classes = new Set<string>();
+  const covered = new Set<string>();
+  for (const f of opts.changedFiles) {
+    const abstractions = byTarget.get(f.toLowerCase());
+    if (!abstractions) continue;
+    let hit = false;
+    for (const cls of opts.classes) {
+      if ((cls.source ?? "coverage") !== "static") continue; // measured rows: ground truth
+      const refs = new Set(cls.abstractFiles.map((a) => a.toLowerCase()));
+      if (abstractions.some((a) => refs.has(a))) {
+        classes.add(cls.fqn);
+        hit = true;
+      }
+    }
+    if (hit) covered.add(f.toLowerCase());
+  }
+  return { classes, covered };
+}
+
 /** Persisted per-repo store for learned bindings. */
 export class LearnedBindings {
   private table: BindingTable = {};

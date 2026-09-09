@@ -12,6 +12,7 @@ import {
   DECAY_MS,
   effectiveFiles,
   LearnedBindings,
+  learnedSelection,
   mineDelta,
   pruneBindings,
   shouldDrop,
@@ -187,6 +188,37 @@ test("decayBindings: stale edges drop, fresh ones stay", () => {
   const t = decayBindings({ [A]: [binding(), old] }, NOW);
   assert.equal(t[A]!.length, 1);
   assert.equal(t[A]![0].lastSeen, nowIso);
+});
+
+const ROWS = [
+  { fqn: "Ns.A", source: "static" as const, abstractFiles: [A] },
+  { fqn: "Ns.B", source: "static" as const, abstractFiles: [A] },
+  { fqn: "Ns.C", source: "static" as const, abstractFiles: ["src/IRepo.cs"] },
+  { fqn: "Ns.D", source: "coverage" as const, abstractFiles: [A] },
+];
+
+test("learnedSelection: changed binding target selects static classes referencing the abstraction", () => {
+  const table: BindingTable = { [A.toLowerCase()]: [binding()] };
+  const r = learnedSelection({ changedFiles: [B], table, classes: ROWS });
+  assert.deepEqual([...r.classes].sort(), ["Ns.A", "Ns.B"]);
+  assert.deepEqual([...r.covered], [B.toLowerCase()]);
+});
+
+test("learnedSelection: measured rows are never extended; unrelated abstractions untouched", () => {
+  const table: BindingTable = { [A.toLowerCase()]: [binding()] };
+  const r = learnedSelection({ changedFiles: [B], table, classes: ROWS });
+  assert.ok(!r.classes.has("Ns.D"), "coverage row not selected via the binding");
+  assert.ok(!r.classes.has("Ns.C"), "class without the abstraction not selected");
+  // An unrelated changed file selects nothing.
+  const r2 = learnedSelection({ changedFiles: ["src/Unrelated.cs"], table, classes: ROWS });
+  assert.deepEqual(r2.classes, new Set());
+  assert.deepEqual(r2.covered, new Set());
+});
+
+test("learnedSelection: case-insensitive matching on both sides", () => {
+  const table: BindingTable = { [A.toLowerCase()]: [binding({ to: B.toUpperCase() })] };
+  const r = learnedSelection({ changedFiles: [B.toUpperCase()], table, classes: ROWS });
+  assert.deepEqual([...r.classes].sort(), ["Ns.A", "Ns.B"]);
 });
 
 test("pruneBindings: dead abstraction or target files drop the edge", () => {
