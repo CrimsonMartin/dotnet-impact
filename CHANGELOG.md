@@ -31,6 +31,15 @@
   test runs. Mined evidence wins over seeds; ambiguous or unresolvable type
   names yield no edge. Factory-lambda and convention-based registrations
   remain mining's job.
+- Idle refresh passes now actively learn: when the queued refreshes are
+  drained, the pass samples the unmeasured classes whose measurements would
+  teach the most — unmeasured classes that reference abstractions with no
+  binding AND no measured reference, scored by how many unmeasured classes
+  share each abstraction (measuring one resolves it for all of them),
+  budget 20 per drain (`Runner.learningBudget`), deterministic order. The
+  samples flow through the existing low-priority warm pipeline and a
+  foreground run still preempts them; sampling stops once every abstraction
+  is resolved, and it honors the `dotnetImpact.learnedBindings` switch.
 
 ## 0.4.2
 
