@@ -1,4 +1,7 @@
 import * as assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { test } from "node:test";
 import {
   applyMeasurement,
@@ -8,10 +11,12 @@ import {
   decayBindings,
   DECAY_MS,
   effectiveFiles,
+  LearnedBindings,
   mineDelta,
   pruneBindings,
   shouldDrop,
 } from "../core/bindings";
+import { cacheDirFor } from "../core/util";
 
 const A = "src/IService.cs"; // abstraction file
 const B = "src/ServiceImpl.cs"; // dynamic target
@@ -194,4 +199,46 @@ test("pruneBindings: dead abstraction or target files drop the edge", () => {
   assert.equal(Object.keys(t).length, 1);
   assert.equal(t[A.toLowerCase()]!.length, 1);
   assert.equal(t[A.toLowerCase()]![0].to, B);
+});
+
+test("LearnedBindings store: observeMeasurement attributes, keys, and persists", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "impact-bindings-store-"));
+  try {
+    const store = new LearnedBindings(root);
+    assert.equal(store.count, 0);
+    store.observeMeasurement({
+      classFqn: "Ns.T",
+      abstractFiles: [A],
+      measuredFiles: [B, A],
+      staticFiles: [A],
+      now: nowIso,
+    });
+    assert.equal(store.count, 1);
+    // Case-insensitive abstraction lookup; `to` keeps original case.
+    const edges = store.bindingsFor(A.toUpperCase());
+    assert.equal(edges.length, 1);
+    assert.equal(edges[0].to, B);
+    assert.equal(edges[0].source, "mined");
+    assert.equal(edges[0].confirms, 1);
+    assert.deepEqual(edges[0].evidence, ["Ns.T"]);
+
+    // Contradictions accumulate across store-level observations.
+    store.observeMeasurement({
+      classFqn: "Ns.U",
+      abstractFiles: [A],
+      measuredFiles: [A],
+      staticFiles: null,
+      now: nowIso,
+    });
+    assert.equal(store.bindingsFor(A)[0].contradicts, 1);
+
+    // Persistence: a second store over the same root sees the same table.
+    const reloaded = new LearnedBindings(root);
+    assert.equal(reloaded.count, 1);
+    assert.equal(reloaded.bindingsFor(A)[0].to, B);
+    assert.equal(reloaded.bindingsFor(A)[0].contradicts, 1);
+  } finally {
+    fs.rmSync(cacheDirFor(root), { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
