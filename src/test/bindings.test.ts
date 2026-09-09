@@ -10,10 +10,10 @@ import {
   CONTRADICT_MIN,
   decayBindings,
   DECAY_MS,
-  effectiveFiles,
   LearnedBindings,
   learnedSelection,
   mineDelta,
+  MINED_CONFIRM_TO_COVER,
   pruneBindings,
   selectLearningTargets,
   shouldDrop,
@@ -67,6 +67,11 @@ test("mineDelta: empty when measured ⊆ static, or without abstractions, or sel
   );
   // A file cannot be its own dynamic target.
   assert.deepEqual(mineDelta({ staticFiles: [], measuredFiles: ["a.cs"], abstractFiles: ["a.cs"] }), []);
+  // Same file under different case (case-insensitive FS) is still itself.
+  assert.deepEqual(
+    mineDelta({ staticFiles: [], measuredFiles: ["A.cs"], abstractFiles: ["a.cs"] }),
+    []
+  );
 });
 
 test("applyMeasurement: one Δ measurement activates an edge (confirms=1, evidence recorded)", () => {
@@ -163,27 +168,6 @@ test("applyMeasurement: an edge is dropped once sufficiently contradicted", () =
   assert.deepEqual(table, {});
 });
 
-test("effectiveFiles: extends static rows only — measured rows are ground truth", () => {
-  const table: BindingTable = { [A.toLowerCase()]: [binding()] };
-  // Static row: row files ∪ binding targets.
-  const staticSet = effectiveFiles(
-    { files: ["src/T.cs", "src/IService.cs"], source: "static" },
-    [A],
-    table
-  );
-  assert.deepEqual([...staticSet].sort(), ["src/IService.cs", B, "src/T.cs"]);
-  // Coverage row: unchanged, even though the class references the abstraction.
-  const covSet = effectiveFiles(
-    { files: ["src/T.cs"], source: "coverage" },
-    [A],
-    table
-  );
-  assert.deepEqual([...covSet], ["src/T.cs"]);
-  // Pre-marker row (source absent = coverage): unchanged.
-  const legacySet = effectiveFiles({ files: ["src/T.cs"] }, [A], table);
-  assert.deepEqual([...legacySet], ["src/T.cs"]);
-});
-
 test("decayBindings: stale edges drop, fresh ones stay", () => {
   const old = binding({ lastSeen: new Date(NOW - DECAY_MS - 1000).toISOString() });
   const t = decayBindings({ [A]: [binding(), old] }, NOW);
@@ -240,10 +224,64 @@ test("selectLearningTargets: resolved abstractions are never sampled", () => {
 });
 
 test("learnedSelection: changed binding target selects static classes referencing the abstraction", () => {
-  const table: BindingTable = { [A.toLowerCase()]: [binding()] };
+  // Confirmed twice (>= MINED_CONFIRM_TO_COVER) → the target is covered too.
+  const table: BindingTable = { [A.toLowerCase()]: [binding({ confirms: MINED_CONFIRM_TO_COVER })] };
   const r = learnedSelection({ changedFiles: [B], table, classes: ROWS });
   assert.deepEqual([...r.classes].sort(), ["Ns.A", "Ns.B"]);
   assert.deepEqual([...r.covered], [B.toLowerCase()]);
+});
+
+test("learnedSelection: covered is earned — mined needs 2 confirms, parsed covers at 1", () => {
+  // Single-evidence MINED edge: classes are selected (safe over-selection),
+  // but the target file is NOT covered — the project-level fallback still
+  // runs (the pre-#31 safety net; a one-measurement edge may be attributed
+  // to the wrong abstraction).
+  const mined1: BindingTable = { [A.toLowerCase()]: [binding({ confirms: 1 })] };
+  const r1 = learnedSelection({ changedFiles: [B], table: mined1, classes: ROWS });
+  assert.deepEqual([...r1.classes].sort(), ["Ns.A", "Ns.B"], "classes selected at confirms=1");
+  assert.deepEqual(r1.covered, new Set(), "one evidence: fallback still runs");
+
+  // Second confirmation grants covered.
+  const mined2: BindingTable = { [A.toLowerCase()]: [binding({ confirms: MINED_CONFIRM_TO_COVER })] };
+  const r2 = learnedSelection({ changedFiles: [B], table: mined2, classes: ROWS });
+  assert.deepEqual([...r2.covered], [B.toLowerCase()]);
+
+  // Parsed seeds name their types precisely: covered from the first sight.
+  const parsed: BindingTable = {
+    [A.toLowerCase()]: [
+      { to: B, source: "parsed", confirms: 1, contradicts: 0, lastSeen: nowIso, evidence: [] },
+    ],
+  };
+  const r3 = learnedSelection({ changedFiles: [B], table: parsed, classes: ROWS });
+  assert.deepEqual([...r3.classes].sort(), ["Ns.A", "Ns.B"]);
+  assert.deepEqual([...r3.covered], [B.toLowerCase()], "parsed seed covers immediately");
+
+  // Mixed edges on one target: the parsed edge grants covered even though
+  // the mined one hasn't earned it; a different abstraction's edge to a
+  // different file selects nothing for B.
+  const mixed: BindingTable = {
+    [A.toLowerCase()]: [
+      binding({ confirms: 1 }),
+      { to: B, source: "parsed", confirms: 1, contradicts: 0, lastSeen: nowIso, evidence: [] },
+    ],
+    "src/irepo.cs": [binding({ to: "src/OtherImpl.cs", confirms: 1 })],
+  };
+  const r4 = learnedSelection({ changedFiles: [B], table: mixed, classes: ROWS });
+  assert.deepEqual([...r4.classes].sort(), ["Ns.A", "Ns.B"], "only IService-referencers selected for B");
+  assert.deepEqual([...r4.covered], [B.toLowerCase()], "parsed edge grants covered");
+});
+
+test("learnedSelection: a target with no selectable class does not suppress the fallback", () => {
+  // Edge grants covered, but no class references the abstraction → nothing
+  // is selected → the file stays unknown (fallback must still run).
+  const parsed: BindingTable = {
+    "src/iunknown.cs": [
+      { to: B, source: "parsed", confirms: 1, contradicts: 0, lastSeen: nowIso, evidence: [] },
+    ],
+  };
+  const r = learnedSelection({ changedFiles: [B], table: parsed, classes: ROWS });
+  assert.deepEqual(r.classes, new Set());
+  assert.deepEqual(r.covered, new Set(), "no class selected: not covered");
 });
 
 test("learnedSelection: measured rows are never extended; unrelated abstractions untouched", () => {

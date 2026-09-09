@@ -14,7 +14,16 @@ import { cacheDirFor } from "./util";
  *
  * Asymmetric by design: bindings only ADD files to static rows
  * (over-selection = a few extra tests), never remove. Measured rows are
- * ground truth and are never extended (see effectiveFiles).
+ * ground truth and are never extended (see learnedSelection).
+ *
+ * One deliberate exception, MINED_CONFIRM_TO_COVER: a single-evidence MINED
+ * edge may still select classes (safe over-selection), but it does not grant
+ * "covered" status (suppression of the project-level fallback for its target
+ * file) until a second confirmation. Δ attribution credits EVERY abstraction
+ * the class references, so a one-measurement edge may be attached to the
+ * wrong abstraction; suppressing the fallback on such an edge could shrink
+ * selection (the fallback previously ran the whole project). Parsed seeds
+ * name their types precisely and cover from the first sight.
  */
 
 export interface Binding {
@@ -48,6 +57,12 @@ export const DECAY_MS = 30 * 24 * 3600 * 1000;
  * class whose tests never touch the DI path is weak evidence either way. */
 export const CONTRADICT_MIN = 4;
 export const CONTRADICT_RATIO = 2;
+/**
+ * How many confirmations a MINED edge needs before its target file counts as
+ * "covered" (suppressed out of the project-level fallback). Parsed edges
+ * cover immediately. See the module header for the rationale.
+ */
+export const MINED_CONFIRM_TO_COVER = 2;
 
 export function shouldDrop(b: Binding): boolean {
   return b.contradicts >= CONTRADICT_MIN && b.contradicts > CONTRADICT_RATIO * b.confirms;
@@ -70,8 +85,8 @@ export function mineDelta(opts: {
   for (const to of opts.measuredFiles) {
     if (staticSet.has(to)) continue;
     for (const from of opts.abstractFiles) {
-      if (from === to) continue;
-      const key = from + "\u0000" + to;
+      if (from.toLowerCase() === to.toLowerCase()) continue; // same file (case-insensitive FS)
+      const key = from.toLowerCase() + "\u0000" + to.toLowerCase();
       if (seen.has(key)) continue;
       seen.add(key);
       out.push({ from, to });
@@ -184,32 +199,22 @@ export function pruneBindings(table: BindingTable, existingFiles: Set<string>): 
 }
 
 /**
- * Files that select a class on a changed-file lookup: the row's files plus,
- * for STATIC rows only, the targets of every binding attached to an
- * abstraction the class references. Measured rows are ground truth and are
- * never extended (the existing invariant).
- */
-export function effectiveFiles(
-  entry: { files: string[]; source?: "static" | "coverage" },
-  abstractFiles: string[],
-  table: BindingTable
-): Set<string> {
-  const out = new Set(entry.files);
-  if ((entry.source ?? "coverage") !== "static") return out;
-  for (const a of abstractFiles) for (const b of table[a.toLowerCase()] ?? []) out.add(b.to);
-  return out;
-}
-
-/**
  * Query-time application: which classes selected bindings extend.
  *
  * For each changed file that is a binding target, every class whose row is
  * STATIC and whose abstractFiles contain the binding's abstraction is
- * selected (measured rows are ground truth — never extended). A changed file
- * that at least one such class reaches via a binding is "covered": its
- * effective closure now touches it, so callers stop treating it as unknown
- * (no project-level fallback). Returns both the selected classes and the
- * covered files (lower-cased).
+ * selected (measured rows are ground truth — never extended).
+ *
+ * A changed file that at least one such class reaches via a binding is
+ * "covered": its effective closure now touches it, so callers stop treating
+ * it as unknown (no project-level fallback). Covered status is the ONE place
+ * a learned edge can reduce selection relative to the fallback, so it is
+ * earned, not assumed (see MINED_CONFIRM_TO_COVER): a parsed seed covers from
+ * the first sight; a mined edge covers only from its second confirmation.
+ * Until then the target file still triggers the project-level fallback — the
+ * pre-#31 safety net — while the binding already selects its classes
+ * (over-selection, the safe direction). Returns both the selected classes
+ * and the covered files (lower-cased).
  */
 export function learnedSelection(opts: {
   changedFiles: string[];
@@ -220,28 +225,34 @@ export function learnedSelection(opts: {
     abstractFiles: string[];
   }>;
 }): { classes: Set<string>; covered: Set<string> } {
-  const byTarget = new Map<string, string[]>(); // target(lower) -> abstractions
+  const byTarget = new Map<
+    string,
+    Array<{ from: string; source: "mined" | "parsed"; confirms: number }>
+  >(); // target(lower) -> edges
   for (const [from, list] of Object.entries(opts.table))
     for (const b of list) {
       const k = b.to.toLowerCase();
       if (!byTarget.has(k)) byTarget.set(k, []);
-      byTarget.get(k)!.push(from);
+      byTarget.get(k)!.push({ from, source: b.source, confirms: b.confirms });
     }
   const classes = new Set<string>();
   const covered = new Set<string>();
   for (const f of opts.changedFiles) {
-    const abstractions = byTarget.get(f.toLowerCase());
-    if (!abstractions) continue;
+    const edges = byTarget.get(f.toLowerCase());
+    if (!edges) continue;
     let hit = false;
     for (const cls of opts.classes) {
       if ((cls.source ?? "coverage") !== "static") continue; // measured rows: ground truth
       const refs = new Set(cls.abstractFiles.map((a) => a.toLowerCase()));
-      if (abstractions.some((a) => refs.has(a))) {
+      if (edges.some((e) => refs.has(e.from))) {
         classes.add(cls.fqn);
         hit = true;
       }
     }
-    if (hit) covered.add(f.toLowerCase());
+    // Covered only when a class is actually selected AND some edge grants it:
+    // parsed (precise by construction) or mined with >= MINED_CONFIRM_TO_COVER.
+    if (hit && edges.some((e) => e.source === "parsed" || e.confirms >= MINED_CONFIRM_TO_COVER))
+      covered.add(f.toLowerCase());
   }
   return { classes, covered };
 }

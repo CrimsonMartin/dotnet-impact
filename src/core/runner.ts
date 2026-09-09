@@ -172,8 +172,8 @@ export class Runner {
    */
   async resyncShadow(): Promise<void> {
     if (!this.shadow) return;
-    this.syncedAtMs = Date.now();
     await syncOverlay(this.shadow);
+    this.syncedAtMs = Date.now(); // watermark advances only on a successful sync
   }
 
   projectGraph(): ProjectGraph {
@@ -1411,12 +1411,16 @@ export class Runner {
       return { mapped: 0, failed: [...failed, "static map computation failed"] };
     }
 
+    // #31: one tree walk serves both the registration seed and the dead-path
+    // prune below (collectCsFiles reads every file's text).
+    const csFiles = collectCsFiles(this.repoRoot);
+
     // #31 step 3: seed bindings from statically-visible DI registrations —
     // zero test runs. Mined evidence wins: seedParsed skips pairs a binding
     // already covers. Best-effort: a parse failure must not block the map.
     if (result.types && Object.keys(result.types).length > 0) {
       try {
-        const edges = resolveSeeds(parseRegistrations(collectCsFiles(this.repoRoot)), result.types);
+        const edges = resolveSeeds(parseRegistrations(csFiles), result.types);
         const added = this.bindings.seedParsed(edges);
         if (added > 0) this.logSink(`learned bindings: seeded ${added} from DI registrations`);
       } catch (e) {
@@ -1428,7 +1432,7 @@ export class Runner {
     // prune (abstraction or target files gone from the tree) — run at map
     // build so selection only ever sees live, current edges.
     this.bindings.decay();
-    this.bindings.prune(new Set(collectCsFiles(this.repoRoot).map((f) => f.rel.toLowerCase())));
+    this.bindings.prune(new Set(csFiles.map((f) => f.rel.toLowerCase())));
 
     const entries = Object.entries(result.classes);
     /** Alive classes per project for pruning: static ∪ vstest discovery (their

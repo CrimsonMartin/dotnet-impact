@@ -20,9 +20,21 @@
   binding's abstraction — the transfer effect the per-class hybrid could not
   produce (a DI implementation edit now runs tests that were never
   coverage-measured). Measured rows stay ground truth and are never
-  extended; a learned-covered file stops triggering project-level fallback.
-  `dotnetImpact.learnedBindings` (default on) turns the tier off; the CLI
-  gets it for free since selection is shared.
+  extended. `dotnetImpact.learnedBindings` (default on) turns the tier off;
+  the CLI gets it for free since selection is shared.
+- Fallback suppression is earned, not assumed. A "covered" file (one that
+  stops triggering project-level fallback) is the ONE place a learned edge
+  can reduce selection, so the rule is: a mined edge — which credits every
+  abstraction the class references and may land on the wrong one — selects
+  classes from the first confirmation but covers its target only from the
+  SECOND (`MINED_CONFIRM_TO_COVER`); a parsed registration seed names its
+  types precisely and covers immediately. In practice this is invisible in
+  the common case (the evidence class's measured row still names the target
+  file, so the fallback never triggers at all); it bites only when the
+  target leaves every row — e.g. right after a refactor re-measured the
+  evidence class — and then the pre-#31 fallback (whole project) still runs
+  until the second confirmation. No under-selection is possible at any
+  stage.
 - Map builds now also SEED bindings from statically-visible DI
   registrations in source (`AddScoped<IService, ServiceImpl>()` and the
   `TryAdd*`/`AddSingleton`/`AddTransient`/Autofac `RegisterType` family,
