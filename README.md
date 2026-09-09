@@ -43,7 +43,8 @@ and falls back to a minimal rebuild.
 
 ## Getting started
 
-1. Install the extension, open a .NET repo with test projects.
+1. Install [Impact](https://marketplace.visualstudio.com/items?itemName=crimsonmartin.impact)
+   from the VS Code Marketplace, open a .NET repo with test projects.
 2. The Testing panel populates with your tests (classes and methods) and an
    impact map builds in the background.
 3. Save a `.cs` file — affected tests run automatically. Or toggle the
