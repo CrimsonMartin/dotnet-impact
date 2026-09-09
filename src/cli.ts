@@ -208,6 +208,9 @@ async function main(): Promise<number> {
     }
     case "status": {
       console.log(`impact map: ${runner.map.classCount} test classes mapped`);
+      const b = runner.bindings.summary;
+      if (b.total > 0)
+        console.log(`learned bindings: ${b.total} (${b.mined} mined, ${b.parsed} parsed)`);
       return 0;
     }
     default:

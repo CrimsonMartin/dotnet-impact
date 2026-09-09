@@ -83,10 +83,16 @@ export function mineDelta(opts: {
 /**
  * Apply one class measurement to the table (pure).
  *
- * - First measurement (staticFiles given): Δ attribution ACTIVATES edges —
- *   one evidence class is enough (the #31 contract: a single measured class
- *   must transfer knowledge to never-measured ones; a false edge only costs
- *   extra tests).
+ * - Baseline present (a row — static or the previous coverage row): Δ =
+ *   measured − baseline attribution ACTIVATES edges for files newly seen
+ *   since the baseline — one evidence class is enough (the #31 contract: a
+ *   single measured class must transfer knowledge to never-measured ones; a
+ *   false edge only costs extra tests). Using the previous COVERAGE row as
+ *   baseline (not "static or nothing") is what lets a changed world teach a
+ *   new edge: when the convention flips to a different implementation, the
+ *   freshly-appearing impl file is attributed, the old impl's edge starts
+ *   accumulating contradictions, and the new reality is learned in the same
+ *   measurements.
  * - Every measurement: each known edge for a referenced abstraction is
  *   confirmed (target hit) or contradicted (target not hit). An edge
  *   activated by THIS measurement is not double-confirmed.
@@ -98,7 +104,7 @@ export function applyMeasurement(
     classFqn: string;
     abstractFiles: string[];
     measuredFiles: string[];
-    /** The static row this measurement replaces; null = re-measurement. */
+    /** The row this measurement replaces (static or previous coverage); null = no row. */
     staticFiles: string[] | null;
     now: string;
   }
@@ -303,6 +309,15 @@ export class LearnedBindings {
     let n = 0;
     for (const l of Object.values(this.table)) n += l.length;
     return n;
+  }
+
+  /** Total + per-source breakdown (status/telemetry). */
+  get summary(): { total: number; mined: number; parsed: number } {
+    let mined = 0;
+    let parsed = 0;
+    for (const l of Object.values(this.table))
+      for (const b of l) (b.source === "mined" ? mined++ : parsed++);
+    return { total: mined + parsed, mined, parsed };
   }
 
   /** All bindings attached to an abstraction file (case-insensitive). */

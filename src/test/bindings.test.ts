@@ -316,3 +316,63 @@ test("LearnedBindings store: observeMeasurement attributes, keys, and persists",
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("LearnedBindings store: summary, decay and prune maintain the table", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "impact-bindings-store-"));
+  try {
+    const store = new LearnedBindings(root);
+    store.seedParsed([{ from: A, to: B }], nowIso);
+    store.observeMeasurement({
+      classFqn: "Ns.T",
+      abstractFiles: ["src/IRepo.cs"],
+      measuredFiles: ["src/RepoImpl.cs", "src/IRepo.cs"],
+      staticFiles: ["src/IRepo.cs"],
+      now: nowIso,
+    });
+    // Mixed sources count separately in the status/telemetry summary.
+    assert.deepEqual(store.summary, { total: 2, mined: 1, parsed: 1 });
+
+    // Staleness decay: an edge unseen for >30 days drops, fresh ones stay.
+    store.decay(Date.parse(nowIso) + 10 * 24 * 3600 * 1000);
+    assert.equal(store.count, 2);
+    store.decay(Date.parse(nowIso) + 31 * 24 * 3600 * 1000);
+    assert.equal(store.count, 0, "all edges decayed past staleness");
+
+    // Path prune: dead targets and dead abstractions drop; live pairs keep.
+    store.seedParsed([{ from: A, to: B }, { from: A, to: "src/Gone.cs" }], nowIso);
+    store.seedParsed([{ from: "src/GoneAbs.cs", to: B }], nowIso);
+    const tree = new Set([A, B].map((f) => f.toLowerCase()));
+    store.prune(tree);
+    assert.equal(store.bindingsFor("src/GoneAbs.cs").length, 0, "dead abstraction row pruned");
+    assert.deepEqual(store.bindingsFor(A).map((b) => b.to), [B], "dead target pruned, live pair kept");
+
+    // Maintenance persists.
+    const reloaded = new LearnedBindings(root);
+    assert.equal(reloaded.count, 1);
+    assert.equal(reloaded.bindingsFor(A)[0].to, B);
+  } finally {
+    fs.rmSync(cacheDirFor(root), { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("applyMeasurement: a re-measurement with a coverage baseline attributes new files", () => {
+  // B6 semantics: the baseline is the previous row of ANY source. Files that
+  // newly appear since the previous coverage row are attributed (the world
+  // changed: the convention now binds a different implementation), while
+  // edges whose target is no longer hit start accumulating contradictions.
+  const table: BindingTable = {
+    [A.toLowerCase()]: [binding()], // IService -> ServiceImpl, mined earlier
+  };
+  const t = applyMeasurement(table, {
+    classFqn: "Ns.A",
+    abstractFiles: [A],
+    measuredFiles: [A, C], // C = the new implementation; B (old impl) absent
+    staticFiles: [A, B], // the previous coverage row
+    now: nowIso,
+  });
+  const edges = t[A.toLowerCase()]!;
+  assert.ok(edges.some((b) => b.to === C && b.source === "mined" && b.confirms === 1), "new file attributed to the abstraction");
+  const old = edges.find((b) => b.to === B)!;
+  assert.equal(old.contradicts, 1, "old impl's edge contradicted in the same measurement");
+});

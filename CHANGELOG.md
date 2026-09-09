@@ -40,6 +40,21 @@
   samples flow through the existing low-priority warm pipeline and a
   foreground run still preempts them; sampling stops once every abstraction
   is resolved, and it honors the `dotnetImpact.learnedBindings` switch.
+- Map builds now maintain the store: edges unseen for 30 days decay out,
+  and edges whose abstraction or target file no longer exists in the tree
+  are pruned (dead paths from refactors). `impact status` reports the store
+  size with a mined/parsed breakdown when non-empty. Edges are evidence, not
+  facts: the mining baseline is the PREVIOUS row of any source (static on
+  first measurement, the previous coverage row on re-measurements), so a
+  changed world both contradicts stale edges (target no longer hit) and
+  attributes freshly-appearing files to new ones in the same measurements;
+  `contradicts >= 4 && contradicts > 2*confirms` drops an edge and reverts
+  selection — pinned by an e2e that flips the fixture's convention-based
+  registration to a second implementation and watches the learned edge die
+  and the fallback return while the new reality is learned.
+- `Runner.resyncShadow()` re-mirrors the real repo's uncommitted state into
+  the shadow worktree (used by the contradiction e2e after an out-of-band
+  edit; the watch path will use it too).
 
 ## 0.4.2
 
