@@ -8,6 +8,13 @@ export interface MapEntry {
   /** How this row was produced; absent means "coverage" (pre-marker rows). */
   source?: "static" | "coverage";
   updatedAt: string;
+  /**
+   * Repo-relative files of types this class DIRECTLY references that are
+   * interfaces or abstract classes (self-tuning map, #31). A static fact
+   * independent of how the row was produced; absent on rows written before
+   * the field existed (treated as []).
+   */
+  abstractFiles?: string[];
 }
 
 export interface ImpactMapData {
@@ -48,10 +55,14 @@ export class ImpactMap {
   }
 
   update(classFqn: string, csproj: string, files: string[]): void {
+    const existing = this.data.entries[classFqn];
     this.data.entries[classFqn] = {
       csproj,
       files,
       source: "coverage",
+      // Direct-referenced abstractions are a static fact: keep them when a
+      // measured row replaces a static one (#31 mining needs them).
+      abstractFiles: existing?.abstractFiles,
       updatedAt: new Date().toISOString(),
     };
     this.inverted = null;
@@ -61,13 +72,20 @@ export class ImpactMap {
    * Write a statically-derived row. Static never clobbers measured coverage:
    * the write is skipped when a coverage row already exists (unless `force`).
    */
-  updateStatic(classFqn: string, csproj: string, files: string[], force = false): boolean {
+  updateStatic(
+    classFqn: string,
+    csproj: string,
+    files: string[],
+    force = false,
+    abstractFiles?: string[]
+  ): boolean {
     const existing = this.data.entries[classFqn];
     if (!force && existing && (existing.source ?? "coverage") === "coverage") return false;
     this.data.entries[classFqn] = {
       csproj,
       files,
       source: "static",
+      abstractFiles,
       updatedAt: new Date().toISOString(),
     };
     this.inverted = null;

@@ -4,8 +4,18 @@ import { ProjectGraph, ProjectInfo, testProjects } from "./projects";
 import { cacheDirFor, exec, toRepoRelative } from "./util";
 
 export interface StaticMapResult {
-  /** test class FQN -> { csproj (repo-relative), files (repo-relative) } */
-  classes: Record<string, { csproj: string; files: string[] }>;
+  /**
+   * test class FQN -> { csproj (repo-relative), files (repo-relative),
+   * abstractFiles: files of DIRECTLY referenced interfaces/abstract classes
+   * (self-tuning map, #31) }.
+   */
+  classes: Record<string, { csproj: string; files: string[]; abstractFiles?: string[] }>;
+  /**
+   * Solution top-level type FQN -> its source files. Lets the extension
+   * resolve type names found in DI registration calls back to files (#31).
+   * Absent on older helper builds.
+   */
+  types?: Record<string, string[]>;
   skipped: Array<{ assembly: string; reason: string }>;
 }
 

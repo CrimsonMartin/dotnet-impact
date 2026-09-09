@@ -12,3 +12,4 @@ helper-deltas/bin/
 helper-deltas/obj/
 helper-enc/bin/
 helper-enc/obj/
+core.*
