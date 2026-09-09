@@ -25,6 +25,7 @@ import {
   testProjects,
 } from "./projects";
 import { ImpactMap } from "./map";
+import { LearnedBindings } from "./bindings";
 import { findBuiltDll, findBuiltDlls, StaticMapper } from "./staticmap";
 import { parseTrx, TestOutcome } from "./trx";
 import { cacheDirFor, classFilter, exec, git, parseStatusZ, toRepoRelative } from "./util";
@@ -72,6 +73,8 @@ const FALLBACK_FILE_RE = /\.(cs|csproj|props|targets|config|resx|json|xml|razor|
 
 export class Runner {
   readonly map: ImpactMap;
+  /** Learned binding edges (self-tuning map, #31): per-repo, mined in live refresh. */
+  readonly bindings: LearnedBindings;
   private shadow: Shadow | null = null;
   private graph: ProjectGraph | null = null;
   private settingsFile: string | undefined;
@@ -121,6 +124,7 @@ export class Runner {
 
   constructor(readonly repoRoot: string) {
     this.map = new ImpactMap(repoRoot);
+    this.bindings = new LearnedBindings(repoRoot);
     this.lastFailures = this.loadLastFailures();
     this.staticMapper = new StaticMapper(
       repoRoot,
@@ -1465,6 +1469,16 @@ export class Runner {
           this.logSink(`map refresh: no coverage produced for ${cls}; keeping existing row`);
           continue;
         }
+        // #31 mining window: Δ = measured − static exists only until
+        // map.update overwrites the static row — attribute it first.
+        const entry = this.map.entry(cls);
+        this.bindings.observeMeasurement({
+          classFqn: cls,
+          abstractFiles: entry?.abstractFiles ?? [],
+          measuredFiles: files,
+          staticFiles: entry?.source === "static" ? entry.files : null,
+          now: new Date().toISOString(),
+        });
         this.map.update(cls, csprojRel, files);
         this.map.save();
         done++;
