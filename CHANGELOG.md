@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-## 0.4.4
+## 0.4.5
 
 - The static map now records, per test class, the source files of directly
   referenced interfaces and abstract classes (first step of the self-tuning
