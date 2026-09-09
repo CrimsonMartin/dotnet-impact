@@ -3,7 +3,10 @@ name: Release
 # Push a version tag (v0.1.0) to test, package, publish to the VS Code
 # Marketplace, and attach the .vsix to a GitHub release.
 #
-# Required repo secret: VSCE_PAT  (Azure DevOps PAT, Marketplace -> Manage scope)
+# Auth: Microsoft Entra ID via GitHub OIDC — no stored credential.
+# The federated credential is bound to this repo + the "release" environment,
+# so the job below MUST keep `environment: release`.
+#
 # Optional repo secret: OVSX_TOKEN (open-vsx.org token; skipped when absent)
 
 on:
@@ -12,10 +15,12 @@ on:
 
 permissions:
   contents: write
+  id-token: write        # required to mint the OIDC token for Entra
 
 jobs:
   release:
     runs-on: ubuntu-latest
+    environment: release # must match the federated credential subject
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -28,15 +33,36 @@ jobs:
         run: npm pkg set version="${GITHUB_REF_NAME#v}"
       - name: Package
         run: npx --yes @vscode/vsce package
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: 15353807-34d4-4f16-8eab-1f73d0fc4eb2
+          tenant-id: 618712c8-62d0-4426-a07d-b93f6b32e08b
+          allow-no-subscriptions: true   # this identity has no Azure subscription
+
       - name: Publish to VS Code Marketplace
-        run: npx --yes @vscode/vsce publish --packagePath *.vsix -p "$VSCE_PAT"
-        env:
-          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: |
+          for i in 1 2 3; do
+            if npx --yes @vscode/vsce publish \
+                 --azure-credential \
+                 --packagePath *.vsix \
+                 --skip-duplicate; then
+              exit 0
+            fi
+            [ "$i" = 3 ] && break
+            echo "::warning::publish attempt $i failed; retrying in $((i * 30))s"
+            sleep $((i * 30))
+          done
+          echo "::error::publish failed after 3 attempts"
+          exit 1
+
       - name: Publish to Open VSX (optional)
-        if: ${{ env.OVSX_TOKEN != '' }}
+        if: ${{ secrets.OVSX_TOKEN != '' }}
         run: npx --yes ovsx publish *.vsix -p "$OVSX_TOKEN"
         env:
           OVSX_TOKEN: ${{ secrets.OVSX_TOKEN }}
+
       - name: Attach vsix to GitHub release
         uses: softprops/action-gh-release@v2
         with:
