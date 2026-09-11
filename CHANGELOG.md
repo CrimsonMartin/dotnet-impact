@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Keep minor edits on the hot-patch path after background map refresh: the
+  classic coverage collector now instruments disposable output copies instead
+  of DLLs memory-mapped by foreground test hosts. This also isolates the
+  active-learning pass when warm coverage is unavailable.
+
 ## 0.4.5
 
 - The static map now records, per test class, the source files of directly

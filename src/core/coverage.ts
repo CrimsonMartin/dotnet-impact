@@ -81,71 +81,104 @@ ${modulePaths}
 
 /**
  * Run one test class with coverage collection and return the set of source
- * files its tests execute. Runs inside the shadow worktree.
+ * files its tests execute. Collects from disposable copies of each built
+ * target framework's output; the shadow's live assemblies stay untouched.
  */
 export async function collectClassCoverage(
   shadowDir: string,
   csproj: string,
+  testDlls: string[],
   classFqn: string,
   signal?: AbortSignal,
   settingsFile?: string
 ): Promise<ClassCoverageResult> {
-  const resultsDir = path.join(shadowDir, ".impact-results", classFqn.replace(/[^A-Za-z0-9_.]/g, "_"));
-
-  const run = (collector: string) => {
-    fs.rmSync(resultsDir, { recursive: true, force: true });
-    fs.mkdirSync(resultsDir, { recursive: true });
-    // --no-build: the only caller is live refresh, which runs right after an
-    // affected run built the project. Skipping the MSBuild spin-up matters.
-    return exec(
-      "dotnet",
-      [
-        "test",
-        csproj,
-        "--filter",
-        classFilter([classFqn]),
-        "--collect",
-        collector,
-        "--results-directory",
-        resultsDir,
-        ...(settingsFile ? ["--settings", settingsFile] : []),
-        "--nologo",
-        "--no-restore",
-        "--no-build",
-        "--verbosity",
-        "quiet",
-      ],
-      shadowDir,
-      10 * 60 * 1000,
-      signal
-    );
-  };
-
-  const first = preferredCollector();
-  let res = await run(first);
-  let reports = findCoberturaFiles(resultsDir);
-  // No report and no explicit choice yet: the MS collector may be missing from
-  // this project (old test SDK); try Coverlet once and stick with what works.
-  if (reports.length === 0 && first === COLLECTOR_MS && !signal?.aborted) {
-    res = await run(COLLECTOR_COVERLET);
-    reports = findCoberturaFiles(resultsDir);
-    if (reports.length > 0) noteWorkingCollector(COLLECTOR_COVERLET);
-  } else if (reports.length > 0) {
-    noteWorkingCollector(first);
-  }
-
+  const resultsRoot = path.join(shadowDir, ".impact-results");
+  fs.mkdirSync(resultsRoot, { recursive: true });
+  const scratch = fs.mkdtempSync(path.join(resultsRoot, "refresh-"));
   const files = new Set<string>();
-  for (const cobertura of reports) {
-    for (const f of parseCoberturaHitFiles(cobertura, shadowDir)) files.add(f);
-  }
-  fs.rmSync(resultsDir, { recursive: true, force: true });
+  let passed = testDlls.length > 0;
+  let output = "";
+  try {
+    // Collectors can rewrite assemblies in place, corrupting metadata that
+    // foreground hot-patch hosts have memory-mapped even after restoration.
+    // Run each TFM from a full output copy, just like the warm pipeline.
+    for (const [index, dll] of testDlls.entries()) {
+      if (signal?.aborted) break;
+      // Project-based dotnet test supplies collector/adapter paths through
+      // MSBuild. Preserve them when running copied DLLs directly; otherwise
+      // Microsoft.CodeCoverage (which lives in NuGet, not bin/) disappears.
+      // NuGet imports in multi-targeted projects are conditional on the TFM.
+      const tfm = path.dirname(dll).split(path.sep).reverse()
+        .find((part) => /^net(?:standard|coreapp)?\d+(?:\.\d+)*(?:-[a-z][a-z0-9.]*)?$/i.test(part));
+      const metadata = await exec(
+            "dotnet",
+            ["msbuild", csproj,
+              ...(tfm ? [`-p:TargetFramework=${tfm}`] : []),
+              "-getProperty:TraceDataCollectorDirectoryPath,VSTestTestAdapterPath"],
+            shadowDir,
+            60_000,
+            signal
+          );
+      const adapterPaths: string[] = [];
+      if (metadata?.code === 0) {
+        const properties = JSON.parse(metadata.stdout).Properties;
+        for (const key of ["TraceDataCollectorDirectoryPath", "VSTestTestAdapterPath"]) {
+          if (properties?.[key]) adapterPaths.push(properties[key]);
+        }
+      }
+      const copyDir = path.join(scratch, "bin", String(index));
+      const resultsDir = path.join(scratch, "results", String(index));
+      const run = (collector: string) => {
+        // A failed collector may leave instrumented files behind. Give the
+        // fallback collector a fresh copy too; never share links to live DLLs.
+        fs.rmSync(copyDir, { recursive: true, force: true });
+        fs.cpSync(path.dirname(dll), copyDir, { recursive: true, dereference: true });
+        fs.rmSync(resultsDir, { recursive: true, force: true });
+        fs.mkdirSync(resultsDir, { recursive: true });
+        return exec(
+          "dotnet",
+          [
+            "test",
+            path.join(copyDir, path.basename(dll)),
+            "--filter",
+            classFilter([classFqn]),
+            "--collect",
+            collector,
+            ...(adapterPaths.length > 0 ? ["--test-adapter-path", adapterPaths.join(";")] : []),
+            "--results-directory",
+            resultsDir,
+            ...(settingsFile ? ["--settings", settingsFile] : []),
+            "--nologo",
+            "--verbosity",
+            "quiet",
+          ],
+          shadowDir,
+          10 * 60 * 1000,
+          signal
+        );
+      };
 
-  return {
-    classFqn,
-    files: [...files].sort(),
-    passed: res.code === 0,
-    output: res.stdout + res.stderr,
-  };
+      const first = preferredCollector();
+      let res = await run(first);
+      let reports = findCoberturaFiles(resultsDir);
+      // No report: try Coverlet when the MS collector is unavailable.
+      if (reports.length === 0 && first === COLLECTOR_MS && !signal?.aborted) {
+        res = await run(COLLECTOR_COVERLET);
+        reports = findCoberturaFiles(resultsDir);
+        if (reports.length > 0) noteWorkingCollector(COLLECTOR_COVERLET);
+      } else if (reports.length > 0) {
+        noteWorkingCollector(first);
+      }
+      for (const cobertura of reports) {
+        for (const f of parseCoberturaHitFiles(cobertura, shadowDir)) files.add(f);
+      }
+      passed = passed && res.code === 0;
+      output += res.stdout + res.stderr;
+    }
+    return { classFqn, files: [...files].sort(), passed: passed && !signal?.aborted, output };
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
 }
 
 export function findCoberturaFiles(dir: string): string[] {

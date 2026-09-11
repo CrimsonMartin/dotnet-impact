@@ -1545,6 +1545,7 @@ export class Runner {
         cov ??= await collectClassCoverage(
           this.shadow!.dir,
           this.shadowPath(path.join(this.repoRoot, csprojRel)),
+          this.findTestDlls(csprojRel),
           cls,
           opts.signal,
           this.settingsFile
