@@ -129,6 +129,15 @@ export class Runner {
    * recorded as built (#16) or cached as discovered.
    */
   private syncedAtMs = 0;
+  /**
+   * True once buildMap has computed the static map from the current shadow
+   * state this session. When a later buildMap finds the shadow unchanged
+   * (WIN #1 stamp) AND this is set, the helper would produce identical
+   * output, so the whole static computation is skipped (the map in memory is
+   * already correct for this shadow). Reset is implicit: a changed shadow
+   * fails the stamp check and forces a real re-computation.
+   */
+  private staticMapCurrent = false;
 
   constructor(readonly repoRoot: string) {
     this.map = new ImpactMap(repoRoot);
@@ -1464,6 +1473,16 @@ export class Runner {
     }
     if (wantCancel()) return { mapped: 0, failed };
 
+    // No-change fast path (WIN #2): the build was skipped because the shadow
+    // is byte-for-byte the source state we last built from, and this session
+    // already computed the static map from that exact state. The helper is a
+    // pure function of the shadow (IL+PDBs+source), so re-running it would
+    // emit an identical map — skip the ~380ms re-computation entirely.
+    if (alreadyBuilt && this.staticMapCurrent) {
+      opts.onPhase?.("map current for this shadow — skipping static re-computation");
+      return { mapped: this.map.classCount, failed };
+    }
+
     // Static closure over the built assemblies.
     opts.onPhase?.("computing static impact map");
     const result = await this.staticMapper.compute(this.shadow!.dir, graph);
@@ -1514,6 +1533,7 @@ export class Runner {
       if (removed.length > 0) opts.onPhase?.(`pruned ${removed.length} stale map entries`);
     }
     this.map.save();
+    this.staticMapCurrent = true; // map now reflects this shadow state
     return { mapped: done, failed };
   }
 
