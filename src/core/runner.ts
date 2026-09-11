@@ -1372,11 +1372,68 @@ export class Runner {
 
     // Build phase: the closure needs every assembly. One solution build when
     // possible (dependency-correct, internally parallel), else per test project.
+    // Up-to-date shortcut: a no-op `dotnet build` of a large solution still
+    // costs ~435ms (process start + full msbuild evaluation). If the source
+    // stamp recorded after the last successful build still matches and every
+    // project's built outputs exist, the assemblies are current — skip.
+    const buildStampFile = path.join(cacheDirFor(this.repoRoot), "build-stamp.json");
+    // Walk the SHADOW, not the real repo: the DLLs are built from shadow
+    // contents, and shadow-mutating phases serialize on the shadow lock, so a
+    // pre-build walk is exactly the state the build will compile — one walk
+    // serves both the skip-check and the post-build record.
+    const shadowStamps = () => {
+      const st: Record<string, string> = {};
+      for (const p of graph.projects.values())
+        st[toRepoRelative(this.repoRoot, p.csproj)] = sourceStamp(this.shadowPath(p.dir));
+      return st;
+    };
+    const recordBuildStamp = (stamps: Record<string, string>) => {
+      try {
+        fs.mkdirSync(path.dirname(buildStampFile), { recursive: true });
+        fs.writeFileSync(buildStampFile, JSON.stringify({ v: 1, projects: stamps }));
+      } catch {
+        /* best-effort: the build itself is the source of truth */
+      }
+    };
+    const stampsBefore = shadowStamps();
+    let alreadyBuilt = false;
+    try {
+      const saved = JSON.parse(fs.readFileSync(buildStampFile, "utf8")) as {
+        v?: number;
+        projects?: Record<string, string>;
+      };
+      if (saved.v === 1 && saved.projects) {
+        // Stamps first (in-memory once walked): the dirty path pays only the
+        // walk, never the per-project bin scans.
+        let ok = true;
+        for (const p of graph.projects.values()) {
+          const rel = toRepoRelative(this.repoRoot, p.csproj);
+          if (saved.projects[rel] !== stampsBefore[rel]) {
+            ok = false;
+            break;
+          }
+        }
+        if (ok) {
+          for (const p of graph.projects.values()) {
+            if (findBuiltDlls(this.shadow!.dir, p, this.repoRoot).length === 0) {
+              ok = false;
+              break;
+            }
+          }
+        }
+        alreadyBuilt = ok;
+      }
+    } catch {
+      /* no stamp / vanished outputs → build */
+    }
     const sln = fs
       .readdirSync(this.repoRoot)
       .find((f) => f.toLowerCase().endsWith(".sln") || f.toLowerCase().endsWith(".slnx"));
     let builtOk = false;
-    if (sln) {
+    if (alreadyBuilt) {
+      opts.onPhase?.("solution up-to-date (source stamp unchanged) — skipping build");
+      builtOk = true;
+    } else if (sln) {
       opts.onPhase?.(`building solution ${sln}`);
       const res = await exec(
         "dotnet",
@@ -1387,6 +1444,7 @@ export class Runner {
       );
       builtOk = res.code === 0;
       if (!builtOk && !ctrl.signal.aborted) failed.push(`solution build: ${sln}`);
+      if (builtOk) recordBuildStamp(stampsBefore);
     }
     if (!builtOk) {
       let built = 0;
@@ -1401,6 +1459,8 @@ export class Runner {
           ctrl.signal
         );
       }
+      // Fallback builds are best-effort (no per-project success signal) —
+      // don't record a stamp, so the up-to-date shortcut stays off here.
     }
     if (wantCancel()) return { mapped: 0, failed };
 

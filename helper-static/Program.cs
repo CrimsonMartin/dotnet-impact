@@ -15,11 +15,24 @@
 // method bodies (calls, field access, typeof, generic instantiations). The result is
 // a safe superset of dynamic coverage: every file a test class *could* reach.
 
+using System.Diagnostics;
 using System.Reflection.Emit;
 using System.Reflection.Metadata;
 using System.Reflection.Metadata.Ecma335;
 using System.Reflection.PortableExecutable;
 using System.Text.Json;
+
+// Phase timing (stderr, off unless IMPACT_STATIC_PHASES=1) — perf campaign H1.
+bool PhaseTimers = Environment.GetEnvironmentVariable("IMPACT_STATIC_PHASES") == "1";
+Stopwatch PhaseSw = Stopwatch.StartNew();
+double PhasePrev = 0;
+void Mark(string name)
+{
+    if (!PhaseTimers) return;
+    var now = PhaseSw.Elapsed.TotalMilliseconds;
+    Console.Error.WriteLine($"[phase] {name}: {now - PhasePrev:F1}ms");
+    PhasePrev = now;
+}
 
 string? repoRoot = null, assembliesPath = null;
 var godPercent = 30; // cap expansion through types referenced by >=N% of all types
@@ -35,6 +48,7 @@ if (repoRoot == null || assembliesPath == null)
     return 2;
 }
 repoRoot = Path.GetFullPath(repoRoot);
+Mark("startup");
 
 var inputs = JsonSerializer.Deserialize<List<AssemblyInput>>(
     File.ReadAllText(assembliesPath),
@@ -57,6 +71,8 @@ foreach (var input in inputs)
     }
 }
 
+Mark("load-assemblies");
+
 // Resolve edges now that every solution type is known.
 foreach (var node in world.Values)
 {
@@ -68,6 +84,7 @@ foreach (var node in world.Values)
         }
     }
 }
+Mark("edge-resolution");
 
 // Name-graph union for enum / const-holder types: consumers inline their
 // values, so the consumer IL carries no TypeRef and the defining file is
@@ -121,6 +138,7 @@ if (nameCandidates.Count > 0)
         }
     }
 }
+Mark("name-graph-union");
 
 // God-type cap: a hub type referenced by a large share of the world drags its
 // entire dependency fan into every closure (~7x over-selection measured on a
@@ -139,6 +157,7 @@ if (world.Count >= 20)
         if (count >= threshold && !node.IsTestClass)
             capped.Add(node);
 }
+Mark("god-cap");
 
 // BFS closure per test class -> file union. Alongside the closure, each test
 // class's DIRECT references to abstractions (interfaces / abstract classes):
@@ -167,6 +186,7 @@ foreach (var tc in testClasses)
     }
     classes[tc.Fqn] = new { csproj = tc.Csproj, files = files.ToArray(), abstractFiles = abstractFiles.ToArray() };
 }
+Mark("bfs-closure");
 
 // Solution type -> source files, for resolving registration-seed type names
 // (#31) back to files on the extension side. Files-only (types without PDB
@@ -179,13 +199,17 @@ foreach (var (fqn, nodes) in byName)
     if (f.Count > 0) types[fqn] = f.ToArray();
 }
 
-Console.WriteLine(JsonSerializer.Serialize(new
+Mark("types-map");
+var json = JsonSerializer.Serialize(new
 {
     classes,
     types,
     skipped,
     capped = capped.Select(c => c.Fqn).OrderBy(f => f, StringComparer.Ordinal).ToArray(),
-}));
+});
+Mark("json-serialize");
+Console.WriteLine(json);
+Mark("emit");
 return 0;
 
 void LoadAssembly(AssemblyInput input)
