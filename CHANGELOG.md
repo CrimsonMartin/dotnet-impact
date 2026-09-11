@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.4.6
+
 - Keep minor edits on the hot-patch path after background map refresh: the
   classic coverage collector now instruments disposable output copies instead
   of DLLs memory-mapped by foreground test hosts. This also isolates the
