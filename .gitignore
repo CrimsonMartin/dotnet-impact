@@ -12,4 +12,6 @@ helper-deltas/bin/
 helper-deltas/obj/
 helper-enc/bin/
 helper-enc/obj/
+bench/results/
+.pi/
 core.*
