@@ -13,9 +13,18 @@ import { dotnetOrNull, scaffoldDiRepo } from "./di-fixture";
  * H12: the resident static-map helper. One long-lived `dotnet` process per
  * repo serves line-JSON map requests; per-assembly parse results are cached
  * by (path, mtime, size), so a partial rebuild re-parses only the assemblies
- * that changed. These tests cover: resident == one-shot equivalence, cache
- * warm behavior, mtime-based invalidation, crash recovery, the one-shot
- * fallback, serialization of concurrent requests, and dispose.
+ * that changed.
+ *
+ * The resident is spawned lazily and warmed in the background: the first
+ * compute is the plain one-shot (the pre-H12 cost, exactly), and a background
+ * warm request pre-populates the parse cache so the next compute is
+ * incremental. `mapper.residentReady()` resolves when that warm has settled;
+ * tests that observe the resident await it first.
+ *
+ * These tests cover: first-compute == one-shot equivalence, resident ==
+ * one-shot equivalence, cache warm behavior, mtime-based invalidation, crash
+ * recovery, the one-shot fallback, serialization of concurrent requests,
+ * and dispose.
  *
  * Tests share one mapper (and thus one resident process) in order; the final
  * test disposes it.
@@ -77,24 +86,33 @@ function oneShot(root: string): Record<string, unknown> {
   return JSON.parse(out);
 }
 
-test("resident: cold map equals the one-shot map", { timeout: 900_000 }, () => {
+test("resident: first compute is the plain one-shot, then the background warm parses everything", {
+  timeout: 900_000,
+}, async () => {
   const f = fixture();
-  return f.mapper.compute(f.root, buildProjectGraph(f.root)).then((residentMap) => {
-    assert.ok(residentMap, `compute failed; logs: ${f.logs.join(" | ")}`);
-    // The DI fixture has exactly two test classes.
-    const classes = Object.keys(residentMap.classes).sort();
-    assert.deepEqual(classes, ["Demo.Tests.ATests", "Demo.Tests.BTests"]);
-    const direct = oneShot(f.root);
-    assert.deepEqual(residentMap.classes, direct.classes);
-    assert.deepEqual(residentMap.types, direct.types);
-    const stats = f.mapper.residentHelper?.lastStats;
-    assert.equal(
-      stats?.parsed,
-      3,
-      `cold: all three assemblies parsed (stats=${JSON.stringify(stats)}; logs: ${f.logs.slice(-8).join(" | ")})`
-    );
-    assert.equal(stats?.cached, 0, `cold: nothing cached (stats=${JSON.stringify(stats)})`);
-  });
+  const firstMap = await f.mapper.compute(f.root, buildProjectGraph(f.root));
+  assert.ok(firstMap, `compute failed; logs: ${f.logs.join(" | ")}`);
+  // The DI fixture has exactly two test classes.
+  const classes = Object.keys(firstMap.classes).sort();
+  assert.deepEqual(classes, ["Demo.Tests.ATests", "Demo.Tests.BTests"]);
+  const direct = oneShot(f.root);
+  assert.deepEqual(firstMap.classes, direct.classes);
+  assert.deepEqual(firstMap.types, direct.types);
+  // The first compute is the one-shot path; by now the background warm has
+  // parsed all three assemblies into the resident's cache.
+  await f.mapper.residentReady();
+  const stats = f.mapper.residentHelper?.lastStats;
+  assert.equal(
+    stats?.parsed,
+    3,
+    `warm: all three assemblies parsed (stats=${JSON.stringify(stats)}; logs: ${f.logs.slice(-8).join(" | ")})`
+  );
+  assert.equal(stats?.cached, 0, `warm: nothing cached yet (stats=${JSON.stringify(stats)})`);
+  // And the resident serves the SAME map as the one-shot produced.
+  const servedMap = await f.mapper.compute(f.root, buildProjectGraph(f.root));
+  assert.ok(servedMap);
+  assert.deepEqual(servedMap.classes, firstMap.classes);
+  assert.deepEqual(servedMap.types, firstMap.types);
 });
 
 test("resident: second request is fully served from the parse cache", { timeout: 600_000 }, () => {
@@ -133,9 +151,11 @@ test("resident: rebuilding one assembly re-parses only that one", { timeout: 600
   });
 });
 
-test("resident: a crashed helper recovers transparently", { timeout: 600_000 }, () => {
+test("resident: a crashed helper recovers transparently", { timeout: 600_000 }, async () => {
   const f = fixture();
-  return f.mapper.compute(f.root, buildProjectGraph(f.root)).then(async () => {
+  await f.mapper.residentReady();
+  await f.mapper.compute(f.root, buildProjectGraph(f.root));
+  {
     const helper = f.mapper.residentHelper;
     assert.ok(helper?.pid, "resident process is running");
     const oldPid = helper.pid;
@@ -150,7 +170,7 @@ test("resident: a crashed helper recovers transparently", { timeout: 600_000 }, 
     assert.ok(revived);
     const pid = f.mapper.residentHelper?.pid;
     assert.ok(pid && pid !== oldPid, "a fresh resident process is serving");
-  });
+  }
 });
 
 test("resident disabled: the one-shot fallback maps correctly and spawns nothing", { timeout: 600_000 }, async () => {
@@ -169,6 +189,10 @@ test("resident disabled: the one-shot fallback maps correctly and spawns nothing
 
 test("resident: concurrent requests are serialized and both correct", { timeout: 600_000 }, async () => {
   const f = fixture();
+  // The previous test disposed the resident: this first compute one-shots and
+  // starts the background warm; wait for the warm before the concurrent pair.
+  await f.mapper.compute(f.root, buildProjectGraph(f.root));
+  await f.mapper.residentReady();
   const graph = buildProjectGraph(f.root);
   const [a, b] = await Promise.all([
     f.mapper.compute(f.root, graph),
@@ -181,6 +205,7 @@ test("resident: concurrent requests are serialized and both correct", { timeout:
 
 test("resident: an idle helper retires itself and the next request respawns", { timeout: 600_000 }, async () => {
   const f = fixture();
+  await f.mapper.residentReady();
   const first = await f.mapper.compute(f.root, buildProjectGraph(f.root));
   assert.ok(first);
   const helper = f.mapper.residentHelper!;
@@ -203,9 +228,11 @@ test("resident: an idle helper retires itself and the next request respawns", { 
   assert.notEqual(f.mapper.residentHelper?.pid, pid, "a fresh process serves the next request");
 });
 
-test("resident: dispose kills the helper process", { timeout: 600_000 }, () => {
+test("resident: dispose kills the helper process", { timeout: 600_000 }, async () => {
   const f = fixture();
-  return f.mapper.compute(f.root, buildProjectGraph(f.root)).then(async () => {
+  await f.mapper.residentReady();
+  await f.mapper.compute(f.root, buildProjectGraph(f.root));
+  {
     const pid = f.mapper.residentHelper?.pid;
     assert.ok(pid, "resident process is running");
     f.mapper.dispose(); // final test: tears down the shared resident
@@ -217,7 +244,7 @@ test("resident: dispose kills the helper process", { timeout: 600_000 }, () => {
       alive = false;
     }
     assert.equal(alive, false, "helper process is gone after dispose");
-  });
+  }
 });
 
 /* The DI fixture's built dll paths. */

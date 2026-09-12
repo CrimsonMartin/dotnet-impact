@@ -138,7 +138,12 @@ export class StaticMapper {
    */
   /** Resident helper (H12); swapped when the helper binary or shadow changes. */
   private resident?: ResidentStaticHelper;
-  /** The live resident helper (diagnostics/tests); undefined until first compute. */
+  /** Background warm in flight (spawning + pre-parsing), if any. */
+  private warming?: ResidentStaticHelper;
+  private residentWarm?: Promise<void>;
+  /** Consecutive failed warms; >=3 disables the resident for this session. */
+  private warmFailures = 0;
+  /** The live resident helper (diagnostics/tests); undefined until the first background warm completes. */
   get residentHelper(): ResidentStaticHelper | undefined {
     return this.resident;
   }
@@ -146,10 +151,60 @@ export class StaticMapper {
   residentDisabled = false;
 
   /**
+   * Resolves when the background warm has settled (resident ready, or the
+   * warm failed and a retry is possible). Tests use this to observe the
+   * resident without racing the warm.
+   */
+  residentReady(): Promise<void> {
+    return this.residentWarm ?? Promise.resolve();
+  }
+
+  /**
+   * Spawn the resident in the background and pre-parse the current
+   * assemblies with a full map request. The first compute of a session stays
+   * one-shot (exactly the pre-H12 cost — no spawn or request overhead on the
+   * user's critical path); the warm runs while the user still has the first
+   * map open, so the NEXT compute (the first save) is already incremental.
+   * The warm request's map result is discarded — the value is the populated
+   * per-assembly parse cache. If a concurrent build races a read, the C# side
+   * reports the affected assembly as skipped; the other assemblies' cached
+   * entries stay valid.
+   */
+  private startResidentWarm(
+    helper: { dll: string; stamp: string },
+    shadowDir: string,
+    assemblies: Array<{ csproj: string; dll: string; isTest: boolean }>
+  ): void {
+    if (this.resident || this.residentWarm || this.residentDisabled) return;
+    this.residentWarm = (async () => {
+      const r = new ResidentStaticHelper(helper.dll, helper.stamp, shadowDir, this.log);
+      this.warming = r;
+      let ok = false;
+      try {
+        ok = (await r.mapRequest(shadowDir, assemblies)) !== null;
+      } catch {
+        ok = false;
+      }
+      this.warming = undefined;
+      if (ok) {
+        this.warmFailures = 0;
+        this.resident = r;
+        this.residentWarm = undefined; // warm settled; next failure can retry
+      } else {
+        r.dispose();
+        this.warmFailures += 1;
+        if (this.warmFailures >= 3) this.residentDisabled = true;
+        this.residentWarm = undefined; // allow a retry on the next compute
+      }
+    })();
+  }
+
+  /**
    * Resident path (H12): a long-lived helper process reuses the parsed IL
    * graph of unchanged assemblies, so a rebuild that touched a subset of the
-   * solution re-parses only those. Returns null on any failure so the caller
-   * falls through to the one-shot process (never worse than pre-H12).
+   * solution re-parses only those. Only used once the resident is warm (see
+   * startResidentWarm); returns null on any failure so the caller falls
+   * through to the one-shot process (never worse than pre-H12).
    */
   private async tryResident(
     helper: { dll: string; stamp: string },
@@ -163,12 +218,13 @@ export class StaticMapper {
         this.resident.stamp !== helper.stamp ||
         this.resident.shadowDir !== shadowDir)
     ) {
+      // Helper binary or shadow root changed: the cache is meaningless — a
+      // fresh process serves this request (its first parse is cold either
+      // way; there is nothing a background warm could pre-heat against).
       this.resident.dispose();
-      this.resident = undefined;
-    }
-    if (!this.resident) {
       this.resident = new ResidentStaticHelper(helper.dll, helper.stamp, shadowDir, this.log);
     }
+    if (!this.resident) return null; // no warm resident yet → caller one-shots
     const served = await this.resident.mapRequest(shadowDir, assemblies);
     if (!served) return null;
     for (const s of served.map.skipped ?? []) {
@@ -181,6 +237,8 @@ export class StaticMapper {
   dispose(): void {
     this.resident?.dispose();
     this.resident = undefined;
+    this.warming?.dispose();
+    this.warming = undefined;
   }
 
   async compute(shadowDir: string, graph: ProjectGraph): Promise<StaticMapResult | null> {
@@ -208,7 +266,18 @@ export class StaticMapper {
     const servedMap = await this.tryResident(helper, shadowDir, assemblies);
     if (servedMap) return servedMap;
 
-    // One-shot fallback (the pre-H12 path; also used when the resident helper
+    if (this.resident) {
+      // Resident existed but failed to serve this request: retire it; the
+      // warm below starts a fresh one for subsequent computes.
+      this.resident.dispose();
+      this.resident = undefined;
+    }
+    // No warm resident: stay one-shot for THIS compute (exactly the pre-H12
+    // cost). The background warm starts AFTER the one-shot returns (see
+    // below) so its full-solution parse never contends for CPU with the
+    // user's critical path.
+
+    // One-shot path (the pre-H12 path; also used when the resident helper
     // cannot start or is unhealthy).
     const inputFile = path.join(cacheDirFor(this.repoRoot), "staticmap-input.json");
     fs.mkdirSync(path.dirname(inputFile), { recursive: true });
@@ -229,6 +298,11 @@ export class StaticMapper {
       for (const s of parsed.skipped ?? []) {
         this.log(`static map skipped ${path.basename(s.assembly)}: ${s.reason}`);
       }
+      // Deferred spawn: the critical path is done — now warm a resident in
+      // the background (full map request, result discarded; the value is the
+      // populated per-assembly parse cache) so the NEXT compute — the first
+      // save — is already incremental.
+      this.startResidentWarm(helper, shadowDir, assemblies);
       return parsed;
     } catch (e) {
       this.log(`static map output unparseable: ${String(e)}`);
