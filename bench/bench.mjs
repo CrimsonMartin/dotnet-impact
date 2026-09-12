@@ -101,6 +101,21 @@ for (let pass = 1; pass <= runs; pass++) {
     rec["discoverAll"] = disc.ms;
     const mapRes = await timed(() => runner.buildMap({ discovered: disc.value }));
     rec["buildMap"] = mapRes.ms;
+    // Second buildMap with no source change in between: the steady-state
+    // refresh / extension-reload path (up-to-date assemblies).
+    rec["buildMap_warm"] = (await timed(() => runner.buildMap({ discovered: disc.value }))).ms;
+
+    // buildMap_dirty_leaf: the shadow was just fully built by the op above;
+    // edit a LEAF test-project file (nothing references the test projects) and
+    // rebuild the map. Only T2's DLL is rebuilt, so the resident static-map
+    // helper (H12) re-parses one assembly and reuses the other ten's cached
+    // parsed graphs. (Placed before edit_cycle so no Core edit is pending.)
+    {
+      const leafFile = path.join(root, "tests/T2/T2_5Tests.cs");
+      fs.appendFileSync(leafFile, `\n// impact-bench-leaf-${pass}-${Date.now()}\n`);
+      const leaf = await timed(() => runner.buildMap({ discovered: disc.value }));
+      rec["buildMap_dirty_leaf"] = leaf.ms;
+    }
 
     // computeAffected: 100 random queries
     const csFiles = listCs(root);
@@ -144,6 +159,9 @@ for (let pass = 1; pass <= runs; pass++) {
     rec["refreshPending"] = ref.ms;
   } finally {
     try { runner.sessions?.dispose(); } catch { /* already gone */ }
+    // Retire the resident static-map helper (H12) so it does not accumulate
+    // across passes — mirrors the extension's deactivate().
+    try { runner.staticMapper?.dispose?.(); } catch { /* already gone */ }
     try { hot.dispose(); } catch { /* already gone */ }
   }
   passes.push(rec);
@@ -181,6 +199,8 @@ const result = {
     projectGraph: summary("projectGraph"),
     discoverAll: summary("discoverAll"),
     buildMap: summary("buildMap"),
+    buildMap_warm: summary("buildMap_warm"),
+    buildMap_dirty_leaf: summary("buildMap_dirty_leaf"),
     computeAffected_100: summary("computeAffected"),
     resync: summary("resync"),
     refreshPending_2: summary("refreshPending"),
