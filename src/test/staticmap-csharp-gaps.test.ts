@@ -122,8 +122,12 @@ test("static map: name-graph union survives file-read errors", { timeout: 600_00
   try {
     w("src/Lib/Status.cs", `namespace Demo;\n\npublic enum OrderStatus { New = 1 }\n`);
     w("src/Lib/Lib.csproj", '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>');
+    // The reference makes Lib build as part of T's build — the helper input
+    // below requires a built Lib.dll. T's own code never mentions the enum,
+    // so no name-graph edge to it exists (the point of the test).
     w("tests/T/T.csproj", `<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup>
+  <ItemGroup><ProjectReference Include="../../src/Lib/Lib.csproj" /></ItemGroup>
   <ItemGroup><PackageReference Include="xunit" Version="2.9.0" /></ItemGroup>
 </Project>`);
     w("tests/T/T.cs", `using Xunit;
@@ -179,9 +183,16 @@ public class Tests
       { csproj: "tests/T/T.csproj", dll: testDll!, isTest: true },
     ]);
 
-    const libSkipped = result.skipped.find((s) => s.assembly.includes("Lib.dll"));
-    assert.ok(libSkipped, "non-test assembly should be skipped");
+    // Contract: non-test assemblies are parsed (their types still serve as
+    // IL-edge targets) but produce NO class entries. `skipped` is only for
+    // assemblies that could not be parsed (not built / no portable pdb / load
+    // error) — a healthy non-test assembly is not "skipped".
+    assert.equal(result.classes["Demo.Lib"], undefined, "no class entry for the non-test assembly's type");
     assert.ok(result.classes["Demo.Tests.Tests"], "test class from T.dll is mapped");
+    assert.ok(
+      result.classes["Demo.Tests.Tests"].files.includes("src/Lib/Lib.cs"),
+      "non-test assembly's types still reachable via IL edges"
+    );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -202,17 +213,28 @@ test("static map: same FQN across assemblies merges correctly", { timeout: 600_0
     w("src/LibA/LibA.csproj", '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>');
     w("src/LibB/Config.cs", `namespace Demo.Common;\npublic class Config { public string Version() => "1"; }\n`);
     w("src/LibB/LibB.csproj", '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>');
+    // Extern aliases disambiguate the same FQN in the C# source (CS0104)
+    // while the emitted IL still references the identical FQN from BOTH
+    // assemblies — exactly the case the helper's byName merge resolves.
     w("tests/T/T.csproj", `<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup>
-  <ItemGroup><ProjectReference Include="../../src/LibA/LibA.csproj" /></ItemGroup>
-  <ItemGroup><ProjectReference Include="../../src/LibB/LibB.csproj" /></ItemGroup>
+  <ItemGroup><ProjectReference Include="../../src/LibA/LibA.csproj"><Aliases>libA</Aliases></ProjectReference></ItemGroup>
+  <ItemGroup><ProjectReference Include="../../src/LibB/LibB.csproj"><Aliases>libB</Aliases></ProjectReference></ItemGroup>
   <ItemGroup><PackageReference Include="xunit" Version="2.9.0" /></ItemGroup>
 </Project>`);
-    w("tests/T/Tests.cs", `using Xunit;
+    w("tests/T/Tests.cs", `extern alias libA;
+extern alias libB;
+using Xunit;
 namespace Demo.Tests;
 public class Tests
 {
-    [Fact] public void Both() => Assert.NotNull(new Demo.Common.Config());
+    [Fact] public void Both()
+    {
+        var a = new libA::Demo.Common.Config();
+        var b = new libB::Demo.Common.Config();
+        Assert.NotNull(a.Name());
+        Assert.NotNull(b.Version());
+    }
 }`);
 
     buildProject(dotnet, root, "tests/T/T.csproj");
@@ -246,12 +268,15 @@ test("static map: --god-percent parameter controls hub cap threshold", { timeout
 
   const { root, w } = scaffold();
   try {
+    // 20 workers so the world (20 workers + Hub + test class) clears the
+    // helper's god-cap minimum of 20 world types.
     w("src/Lib/Hub.cs", `namespace Demo;\npublic static class Hub { public static string Tag() => "hub"; }\n`);
-    for (let i = 0; i < 10; i++)
+    for (let i = 0; i < 20; i++)
       w(`src/Lib/Worker${i}.cs`, `namespace Demo;\npublic class Worker${i} { public string Go() => Hub.Tag(); }\n`);
     w("src/Lib/Lib.csproj", '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>');
     w("tests/T/T.csproj", `<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup>
+  <ItemGroup><ProjectReference Include="../../src/Lib/Lib.csproj" /></ItemGroup>
   <ItemGroup><PackageReference Include="xunit" Version="2.9.0" /></ItemGroup>
 </Project>`);
     w("tests/T/Tests.cs", `using Xunit;
@@ -310,15 +335,19 @@ test("static map: MentionsWord does not match substrings (word boundary)", { tim
     // should NOT get an edge to the enum.
     w("src/Lib/OrderStatus.cs", `namespace Demo;\n\npublic enum OrderStatus { New = 1, Shipped = 2 }\n`);
     w("src/Lib/Lib.csproj", '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>');
+    // Reference so Lib builds with T (the helper input requires Lib.dll).
     w("tests/T/T.csproj", `<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup>
+  <ItemGroup><ProjectReference Include="../../src/Lib/Lib.csproj" /></ItemGroup>
   <ItemGroup><PackageReference Include="xunit" Version="2.9.0" /></ItemGroup>
 </Project>`);
     w("tests/T/Tests.cs", `using Xunit;
 namespace Demo.Tests;
 
-// This class has a type named MyStatusType which shares "Status"
-// but NOT "OrderStatus" as a whole word.
+// A consumer type whose name shares only the substring "Status" with the
+// enum — not the enum's full name as a whole word.
+// (No enum names may appear in this file, comment included: the name-graph
+// union scans raw file text.)
 public class StatusType { public int x; }
 
 public class Tests
@@ -363,12 +392,13 @@ test("static map: nested test class [Fact] folds into top-level FQN", { timeout:
   <ItemGroup><ProjectReference Include="../../src/Lib/Lib.csproj" /></ItemGroup>
   <ItemGroup><PackageReference Include="xunit" Version="2.9.0" /></ItemGroup>
 </Project>`);
+    // Note: xunit's FactAttribute only targets methods ([AttributeUsage(
+    // AttributeTargets.Method)]) — it cannot decorate the nested class.
     w("tests/T/Tests.cs", `using Xunit;
 namespace Demo.Tests;
 
 public class Outer
 {
-    [Fact]
     public class Nested
     {
         [Fact]
@@ -385,10 +415,13 @@ public class Outer
       { csproj: "tests/T/T.csproj", dll: testDll!, isTest: true },
     ]);
 
-    const nestedKey = "Demo.Tests.Outer+Nested";
-    assert.ok(result.classes[nestedKey], `nested class mapped: ${JSON.stringify(Object.keys(result.classes))}`);
-    const files = result.classes[nestedKey].files;
-    assert.ok(files.includes("src/Lib/Calc.cs"), "nested class closure includes referenced lib");
+    // The helper folds a nested [Fact] class into its top-level declaring
+    // type's FQN — the entry is the outer class, not the nested one.
+    const outerKey = "Demo.Tests.Outer";
+    assert.ok(result.classes[outerKey], `top-level FQN mapped (nested [Fact] folded in): ${JSON.stringify(Object.keys(result.classes))}`);
+    assert.equal(result.classes["Demo.Tests.Outer+Nested"], undefined, "nested class is folded, not a separate entry");
+    const files = result.classes[outerKey].files;
+    assert.ok(files.includes("src/Lib/Calc.cs"), "folded closure includes referenced lib");
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -459,18 +492,32 @@ test("static map: abstractFiles excludes sealed static types", { timeout: 600_00
   <ItemGroup><ProjectReference Include="../../src/Lib/Lib.csproj" /></ItemGroup>
   <ItemGroup><PackageReference Include="xunit" Version="2.9.0" /></ItemGroup>
 </Project>`);
+    // IFoo and StaticSealed are referenced from the test code so they are in
+    // the closure: IFoo (interface) must appear in abstractFiles, while
+    // StaticSealed (static+sealed) must NOT.
     w("tests/T/Tests.cs", `using Xunit;
 namespace Demo.Tests;
 public class Tests
 {
-    [Fact] public void Refs() => new Demo.AbstractBarConcrete();
-    // StaticSealed is static+sealed — should NOT be in abstractFiles
+    [Fact] public void Refs()
+    {
+        // Direct references so all three lib types are in tc.Edges:
+        // IFoo (interface) + AbstractBar (abstract) must land in
+        // abstractFiles; StaticSealed (static+sealed) must not. The IFoo
+        // cast feeds an interface call so the compiler keeps the castclass
+        // in the IL (a discarded cast can be elided).
+        Demo.AbstractBar bar = new AbstractBarConcrete();
+        bar.Execute();
+        ((Demo.IFoo)new AbstractBarConcrete()).Go();
+        Assert.Equal(42, Demo.StaticSealed.Value);
+    }
 }
 
-// Concrete implementation of AbstractBar
-public class AbstractBarConcrete : Demo.AbstractBar
+// Concrete implementation of AbstractBar (and IFoo)
+public class AbstractBarConcrete : Demo.AbstractBar, Demo.IFoo
 {
     public override void Execute() {}
+    public void Go() {}
 }`);
 
     buildProject(dotnet, root, "tests/T/T.csproj");
