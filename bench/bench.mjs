@@ -105,6 +105,23 @@ for (let pass = 1; pass <= runs; pass++) {
     // refresh / extension-reload path (up-to-date assemblies).
     rec["buildMap_warm"] = (await timed(() => runner.buildMap({ discovered: disc.value }))).ms;
 
+    // buildMap_dirty_leaf: the per-save map-refresh flow for a LEAF test
+    // project (nothing references the test projects): file saved -> prepare()
+    // resyncs the one changed file into the shadow -> buildMap() sees the new
+    // source stamp, rebuilds only T2, and recomputes the map. The resident
+    // static-map helper (H12) re-parses just T2 and reuses the other ten's
+    // cached parsed graphs. (Placed before edit_cycle so no Core edit is
+    // pending.)
+    {
+      const leafFile = path.join(root, "tests/T2/T2_5Tests.cs");
+      fs.appendFileSync(leafFile, `\n// impact-bench-leaf-${pass}-${Date.now()}\n`);
+      const leaf = await timed(async () => {
+        await runner.prepare(); // per-save resync (changed file -> shadow)
+        return runner.buildMap({ discovered: disc.value });
+      });
+      rec["buildMap_dirty_leaf"] = leaf.ms;
+    }
+
     // computeAffected: 100 random queries
     const csFiles = listCs(root);
     const files = Array.from({ length: 100 }, () => csFiles[Math.floor(Math.random() * csFiles.length)]);
@@ -147,6 +164,9 @@ for (let pass = 1; pass <= runs; pass++) {
     rec["refreshPending"] = ref.ms;
   } finally {
     try { runner.sessions?.dispose(); } catch { /* already gone */ }
+    // Retire the resident static-map helper (H12) so it does not accumulate
+    // across passes — mirrors the extension's deactivate().
+    try { runner.staticMapper?.dispose?.(); } catch { /* already gone */ }
     try { hot.dispose(); } catch { /* already gone */ }
   }
   passes.push(rec);
@@ -185,6 +205,7 @@ const result = {
     discoverAll: summary("discoverAll"),
     buildMap: summary("buildMap"),
     buildMap_warm: summary("buildMap_warm"),
+    buildMap_dirty_leaf: summary("buildMap_dirty_leaf"),
     computeAffected_100: summary("computeAffected"),
     resync: summary("resync"),
     refreshPending_2: summary("refreshPending"),

@@ -980,5 +980,6 @@ export function deactivate(): void {
   runner?.sessions?.dispose(true); // shadow worktree itself persists intentionally
   runner?.mtpSessions?.dispose();
   runner?.hotpatch?.dispose();
+  runner?.staticMapper?.dispose(); // resident static-map helper (H12)
   (runner?.coverageWarm as WarmCoverage | null)?.dispose?.();
 }
