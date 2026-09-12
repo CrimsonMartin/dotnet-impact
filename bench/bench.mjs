@@ -101,6 +101,9 @@ for (let pass = 1; pass <= runs; pass++) {
     rec["discoverAll"] = disc.ms;
     const mapRes = await timed(() => runner.buildMap({ discovered: disc.value }));
     rec["buildMap"] = mapRes.ms;
+    // Second buildMap with no source change in between: the steady-state
+    // refresh / extension-reload path (up-to-date assemblies).
+    rec["buildMap_warm"] = (await timed(() => runner.buildMap({ discovered: disc.value }))).ms;
 
     // computeAffected: 100 random queries
     const csFiles = listCs(root);
@@ -181,6 +184,7 @@ const result = {
     projectGraph: summary("projectGraph"),
     discoverAll: summary("discoverAll"),
     buildMap: summary("buildMap"),
+    buildMap_warm: summary("buildMap_warm"),
     computeAffected_100: summary("computeAffected"),
     resync: summary("resync"),
     refreshPending_2: summary("refreshPending"),

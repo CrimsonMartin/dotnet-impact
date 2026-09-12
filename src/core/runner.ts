@@ -129,6 +129,15 @@ export class Runner {
    * recorded as built (#16) or cached as discovered.
    */
   private syncedAtMs = 0;
+  /**
+   * True once buildMap has computed the static map from the current shadow
+   * state this session. When a later buildMap finds the shadow unchanged
+   * (WIN #1 stamp) AND this is set, the helper would produce identical
+   * output, so the whole static computation is skipped (the map in memory is
+   * already correct for this shadow). Reset is implicit: a changed shadow
+   * fails the stamp check and forces a real re-computation.
+   */
+  private staticMapCurrent = false;
 
   constructor(readonly repoRoot: string) {
     this.map = new ImpactMap(repoRoot);
@@ -1372,11 +1381,68 @@ export class Runner {
 
     // Build phase: the closure needs every assembly. One solution build when
     // possible (dependency-correct, internally parallel), else per test project.
+    // Up-to-date shortcut: a no-op `dotnet build` of a large solution still
+    // costs ~435ms (process start + full msbuild evaluation). If the source
+    // stamp recorded after the last successful build still matches and every
+    // project's built outputs exist, the assemblies are current — skip.
+    const buildStampFile = path.join(cacheDirFor(this.repoRoot), "build-stamp.json");
+    // Walk the SHADOW, not the real repo: the DLLs are built from shadow
+    // contents, and shadow-mutating phases serialize on the shadow lock, so a
+    // pre-build walk is exactly the state the build will compile — one walk
+    // serves both the skip-check and the post-build record.
+    const shadowStamps = () => {
+      const st: Record<string, string> = {};
+      for (const p of graph.projects.values())
+        st[toRepoRelative(this.repoRoot, p.csproj)] = sourceStamp(this.shadowPath(p.dir));
+      return st;
+    };
+    const recordBuildStamp = (stamps: Record<string, string>) => {
+      try {
+        fs.mkdirSync(path.dirname(buildStampFile), { recursive: true });
+        fs.writeFileSync(buildStampFile, JSON.stringify({ v: 1, projects: stamps }));
+      } catch {
+        /* best-effort: the build itself is the source of truth */
+      }
+    };
+    const stampsBefore = shadowStamps();
+    let alreadyBuilt = false;
+    try {
+      const saved = JSON.parse(fs.readFileSync(buildStampFile, "utf8")) as {
+        v?: number;
+        projects?: Record<string, string>;
+      };
+      if (saved.v === 1 && saved.projects) {
+        // Stamps first (in-memory once walked): the dirty path pays only the
+        // walk, never the per-project bin scans.
+        let ok = true;
+        for (const p of graph.projects.values()) {
+          const rel = toRepoRelative(this.repoRoot, p.csproj);
+          if (saved.projects[rel] !== stampsBefore[rel]) {
+            ok = false;
+            break;
+          }
+        }
+        if (ok) {
+          for (const p of graph.projects.values()) {
+            if (findBuiltDlls(this.shadow!.dir, p, this.repoRoot).length === 0) {
+              ok = false;
+              break;
+            }
+          }
+        }
+        alreadyBuilt = ok;
+      }
+    } catch {
+      /* no stamp / vanished outputs → build */
+    }
     const sln = fs
       .readdirSync(this.repoRoot)
       .find((f) => f.toLowerCase().endsWith(".sln") || f.toLowerCase().endsWith(".slnx"));
     let builtOk = false;
-    if (sln) {
+    if (alreadyBuilt) {
+      opts.onPhase?.("solution up-to-date (source stamp unchanged) — skipping build");
+      builtOk = true;
+    } else if (sln) {
       opts.onPhase?.(`building solution ${sln}`);
       const res = await exec(
         "dotnet",
@@ -1387,6 +1453,7 @@ export class Runner {
       );
       builtOk = res.code === 0;
       if (!builtOk && !ctrl.signal.aborted) failed.push(`solution build: ${sln}`);
+      if (builtOk) recordBuildStamp(stampsBefore);
     }
     if (!builtOk) {
       let built = 0;
@@ -1401,8 +1468,20 @@ export class Runner {
           ctrl.signal
         );
       }
+      // Fallback builds are best-effort (no per-project success signal) —
+      // don't record a stamp, so the up-to-date shortcut stays off here.
     }
     if (wantCancel()) return { mapped: 0, failed };
+
+    // No-change fast path (WIN #2): the build was skipped because the shadow
+    // is byte-for-byte the source state we last built from, and this session
+    // already computed the static map from that exact state. The helper is a
+    // pure function of the shadow (IL+PDBs+source), so re-running it would
+    // emit an identical map — skip the ~380ms re-computation entirely.
+    if (alreadyBuilt && this.staticMapCurrent) {
+      opts.onPhase?.("map current for this shadow — skipping static re-computation");
+      return { mapped: this.map.classCount, failed };
+    }
 
     // Static closure over the built assemblies.
     opts.onPhase?.("computing static impact map");
@@ -1454,6 +1533,7 @@ export class Runner {
       if (removed.length > 0) opts.onPhase?.(`pruned ${removed.length} stale map entries`);
     }
     this.map.save();
+    this.staticMapCurrent = true; // map now reflects this shadow state
     return { mapped: done, failed };
   }
 
