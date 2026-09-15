@@ -168,7 +168,22 @@ export function testProjects(graph: ProjectGraph): ProjectInfo[] {
   return [...graph.projects.values()].filter((p) => p.isTestProject);
 }
 
-const STAMP_FILE_RE = /\.(cs|csproj|props|targets|razor|cshtml|resx|config|json)$/i;
+/**
+ * File types whose change can alter a build's output: code that compiles,
+ * and content MSBuild may copy to the output directory (`None`/`Content`
+ * with `CopyToOutputDirectory`) or embed. The freshness stamp is the
+ * "does this project need rebuilding?" signal for the minimal build, the
+ * build-skip shortcut, discovery caching, and the startup change digest —
+ * so it must not be blind to content files. A fixture xml edited under a
+ * `CopyToOutputDirectory` glob used to leave the stamp unchanged, the
+ * project skipped its rebuild, and the test compared against the STALE
+ * fixture in the build output while a direct `dotnet test` in the working
+ * tree passed (#43). The list is intentionally a superset of the build-
+ * relevant set in runner.ts (FALLBACK_FILE_RE): extra extensions cost a
+ * cheap incremental no-op rebuild at worst, a missed one costs a red lie.
+ */
+const STAMP_FILE_RE =
+  /\.(cs|csproj|props|targets|razor|cshtml|resx|config|json|xml|xsl|xsd|txt|sql|tsql|csv|md|html|htm|yml|yaml)$/i;
 
 /**
  * Freshness stamp for a project INCLUDING everything it transitively
@@ -195,11 +210,13 @@ export function transitiveSourceStamp(
 }
 
 /**
- * Freshness stamp for a project directory: newest source mtime + file count +
- * a digest of the relative paths. Count catches deletions; the path digest
- * catches moves — dragging a file into a subfolder preserves both its mtime
- * and the count, and a stamp blind to paths kept serving the pre-move FQNs
- * from the discovery cache (#17). Discovery can be skipped while the stamp holds.
+ * Freshness stamp for a project directory: newest source/content mtime +
+ * file count + a digest of the relative paths. Count catches deletions; the
+ * path digest catches moves — dragging a file into a subfolder preserves both
+ * its mtime and the count, and a stamp blind to paths kept serving the
+ * pre-move FQNs from the discovery cache (#17). Discovery can be skipped
+ * while the stamp holds. "Source" means STAMP_FILE_RE — code AND build
+ * content, so fixture edits invalidate just like code edits (#43).
  */
 /**
  * The newest source mtime encoded in a sourceStamp(). Unparseable stamps
@@ -212,10 +229,12 @@ export function stampNewestMs(stamp: string): number {
 }
 
 /**
- * Every source file under a project directory, repo-relative, paired with a
- * "mtime:size" fingerprint — the file-level counterpart to sourceStamp(),
- * for diffing a tree against how it looked in an earlier session (#33).
- * Walks exactly what sourceStamp() stamps, so build output never registers.
+ * Every source/content file under a project directory, repo-relative, paired
+ * with a "mtime:size" fingerprint — the file-level counterpart to
+ * sourceStamp(), for diffing a tree against how it looked in an earlier
+ * session (#33). Walks exactly what sourceStamp() stamps, so build output
+ * never registers — and content files count, so out-of-session fixture edits
+ * are visible at startup just like code edits (#43).
  */
 export function sourceFingerprints(root: string, dir: string, into: Map<string, string> = new Map()): Map<string, string> {
   let entries: fs.Dirent[];
