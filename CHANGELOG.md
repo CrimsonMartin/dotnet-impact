@@ -1,22 +1,6 @@
 # Changelog
 
-## 0.4.7
-
-- Performance: `buildMap` no longer pays the static-map rebuild cost when
-  nothing changed — a source-stamp shadow skips no-op solution builds (H1)
-  and skips static-map recomputation when the shadow is unchanged (H1b).
-- Performance: a resident incremental static-map helper (H12) now maintains
-  the map incrementally; the spawn is deferred until after the first one-shot
-  so cold start is unaffected.
-- Bench: new performance bench harness for large-repo tuning; the
-  `dirty_leaf` op now uses the realistic per-save flow (resync before
-  buildMap).
-- Tests: ~215 new edge-case and unit tests across runner-core, staticmap,
-  hotpatch, coverage, sessions/MTP parse, self-tuning store, worktree, and
-  cli/lock/discovery areas; fixed 7 staticmap-csharp-gaps tests broken under
-  dotnet 10.
-
-## Unreleased
+## 0.4.8
 
 - Fix: content files (xml fixtures and other non-code files under
   `CopyToOutputDirectory`) now invalidate the project freshness stamp
@@ -33,6 +17,22 @@
   plus an e2e regression driving the real build path with the issue's
   exact repro (modified tracked fixture + new untracked fixture +
   dependency edit).
+
+## 0.4.7
+
+- Performance: `buildMap` no longer pays the static-map rebuild cost when
+  nothing changed — a source-stamp shadow skips no-op solution builds (H1)
+  and skips static-map recomputation when the shadow is unchanged (H1b).
+- Performance: a resident incremental static-map helper (H12) now maintains
+  the map incrementally; the spawn is deferred until after the first one-shot
+  so cold start is unaffected.
+- Bench: new performance bench harness for large-repo tuning; the
+  `dirty_leaf` op now uses the realistic per-save flow (resync before
+  buildMap).
+- Tests: ~215 new edge-case and unit tests across runner-core, staticmap,
+  hotpatch, coverage, sessions/MTP parse, self-tuning store, worktree, and
+  cli/lock/discovery areas; fixed 7 staticmap-csharp-gaps tests broken under
+  dotnet 10.
 
 ## 0.4.6
 
