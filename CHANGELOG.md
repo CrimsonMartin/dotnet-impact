@@ -18,6 +18,22 @@
 
 ## Unreleased
 
+- Fix: content files (xml fixtures and other non-code files under
+  `CopyToOutputDirectory`) now invalidate the project freshness stamp
+  exactly like code edits (#43). A fixture edit used to leave the stamp
+  unchanged, so the minimal build skipped the test project's rebuild and
+  the build output kept the stale fixture — impact reported false
+  failures while a direct `dotnet test` in the working tree passed, and a
+  new untracked fixture never reached the build output at all. The stamp
+  (and the startup change digest) now cover the common fixture/content
+  extensions: xml, xsl, xsd, txt, sql, tsql, csv, md, html, htm, yml,
+  yaml.
+- Tests: unit coverage for content-file stamping (edit/add/delete,
+  extension matrix, transitive stamp, bin/obj exclusion, startup digest)
+  plus an e2e regression driving the real build path with the issue's
+  exact repro (modified tracked fixture + new untracked fixture +
+  dependency edit).
+
 ## 0.4.6
 
 - Keep minor edits on the hot-patch path after background map refresh: the

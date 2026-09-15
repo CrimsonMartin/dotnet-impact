@@ -253,6 +253,49 @@ test("sourceFingerprints: skips non-source file extensions", () => {
   }
 });
 
+// #43: content files (fixtures under CopyToOutputDirectory) must register in
+// the startup digest exactly like code edits — an out-of-session fixture edit
+// must fire the startup change run, or the tree keeps stale verdicts.
+test("sourceFingerprints: content files (xml, txt, sql, csv, md, yml) are fingerprinted", () => {
+  const root = scaffoldDir();
+  try {
+    fs.mkdirSync(path.join(root, "src", "Fixtures"), { recursive: true });
+    for (const name of ["data.xml", "notes.txt", "seed.sql", "rows.csv", "readme.md", "conf.yml"])
+      fs.writeFileSync(path.join(root, "src", "Fixtures", name), "x");
+    const fps = new Map<string, string>();
+    sourceFingerprints(root, path.join(root, "src"), fps);
+    for (const name of ["data.xml", "notes.txt", "seed.sql", "rows.csv", "readme.md", "conf.yml"])
+      assert.ok(fps.has(`src/Fixtures/${name}`), `${name} should be fingerprinted`);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("sourceFingerprints: a content edit changes the fingerprint", () => {
+  const root = scaffoldDir();
+  try {
+    fs.mkdirSync(path.join(root, "src", "Fixtures"), { recursive: true });
+    const f = path.join(root, "src", "Fixtures", "data.xml");
+    fs.writeFileSync(f, "<v>1</v>");
+    const before = new Map<string, string>();
+    sourceFingerprints(root, path.join(root, "src"), before);
+    const fp1 = before.get("src/Fixtures/data.xml")!;
+    // Different size AND explicitly-later mtime (same-ms rewrites are
+    // indistinguishable — same convention as the sourceStamp tests).
+    fs.writeFileSync(f, "<v>22</v>");
+    fs.utimesSync(f, new Date(), new Date(Date.now() + 5000));
+    const after = new Map<string, string>();
+    sourceFingerprints(root, path.join(root, "src"), after);
+    assert.notEqual(
+      after.get("src/Fixtures/data.xml"),
+      fp1,
+      "a content edit must change the fingerprint"
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 /* ------------------------------------------------------------------ */
 /*  sourceStamp — directory stamping                                  */
 /* ------------------------------------------------------------------ */
@@ -315,6 +358,122 @@ test("sourceStamp: file rename changes stamp (path digest)", () => {
     fs.renameSync(path.join(root, "src", "A.cs"), path.join(root, "src", "B.cs"));
     const s2 = sourceStamp(path.join(root, "src"));
     assert.notEqual(s1, s2, "file rename should change stamp");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/*  #43 — content files must invalidate the stamp exactly like code.          */
+
+test("sourceStamp: editing a content file (xml) changes the stamp", () => {
+  const root = scaffoldDir();
+  try {
+    fs.mkdirSync(path.join(root, "src", "Fixtures"), { recursive: true });
+    fs.writeFileSync(path.join(root, "src", "Calc.cs"), "code");
+    fs.writeFileSync(path.join(root, "src", "Fixtures", "data.xml"), "<v>1</v>");
+    const s1 = sourceStamp(path.join(root, "src"));
+    // Edit, then force a later mtime (write resets mtime; same-ms rewrites
+    // are indistinguishable — same convention as the sourceStamp tests).
+    fs.writeFileSync(path.join(root, "src", "Fixtures", "data.xml"), "<v>2</v>");
+    fs.utimesSync(
+      path.join(root, "src", "Fixtures", "data.xml"),
+      new Date(),
+      new Date(Date.now() + 5000)
+    );
+    const s2 = sourceStamp(path.join(root, "src"));
+    assert.notEqual(s1, s2, "a content-file edit must change the stamp");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("sourceStamp: adding a new untracked content file changes the stamp", () => {
+  const root = scaffoldDir();
+  try {
+    fs.mkdirSync(path.join(root, "src", "Fixtures"), { recursive: true });
+    fs.writeFileSync(path.join(root, "src", "Fixtures", "data.xml"), "<v>1</v>");
+    const s1 = sourceStamp(path.join(root, "src"));
+    fs.writeFileSync(path.join(root, "src", "Fixtures", "extra.xml"), "<v>new</v>");
+    const s2 = sourceStamp(path.join(root, "src"));
+    assert.notEqual(s1, s2, "a new content file must change the stamp");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("sourceStamp: deleting a content file changes the stamp", () => {
+  const root = scaffoldDir();
+  try {
+    fs.mkdirSync(path.join(root, "src", "Fixtures"), { recursive: true });
+    fs.writeFileSync(path.join(root, "src", "Fixtures", "data.xml"), "<v>1</v>");
+    const s1 = sourceStamp(path.join(root, "src"));
+    fs.rmSync(path.join(root, "src", "Fixtures", "data.xml"));
+    const s2 = sourceStamp(path.join(root, "src"));
+    assert.notEqual(s1, s2, "a deleted content file must change the stamp");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("sourceStamp: covers the common fixture/content extensions", () => {
+  const root = scaffoldDir();
+  try {
+    fs.mkdirSync(path.join(root, "src"), { recursive: true });
+    const names = ["a.xml", "b.xsl", "c.xsd", "d.txt", "e.sql", "f.tsql", "g.csv", "h.md", "i.html", "j.htm", "k.yml", "l.yaml"];
+    for (const n of names) fs.writeFileSync(path.join(root, "src", n), "x");
+    names.forEach((n, i) => {
+      const before = sourceStamp(path.join(root, "src"));
+      fs.appendFileSync(path.join(root, "src", n), "y");
+      // Each file gets a distinct, provably-later mtime (write resets
+      // mtime; same-ms rewrites are indistinguishable).
+      fs.utimesSync(path.join(root, "src", n), new Date(), new Date(Date.now() + 10000 * (i + 1)));
+      const after = sourceStamp(path.join(root, "src"));
+      assert.notEqual(before, after, `editing ${n} must change the stamp`);
+    });
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("sourceStamp: build outputs still never count (bin/obj segments)", () => {
+  const root = scaffoldDir();
+  try {
+    fs.mkdirSync(path.join(root, "src", "obj", "Debug"), { recursive: true });
+    fs.mkdirSync(path.join(root, "src", "bin", "Debug"), { recursive: true });
+    fs.writeFileSync(path.join(root, "src", "A.cs"), "code");
+    fs.writeFileSync(path.join(root, "src", "obj", "Debug", "gen.xml"), "<g/>");
+    fs.writeFileSync(path.join(root, "src", "bin", "Debug", "data.xml"), "<d/>");
+    const s1 = sourceStamp(path.join(root, "src"));
+    fs.utimesSync(path.join(root, "src", "obj", "Debug", "gen.xml"), new Date(), new Date(Date.now() + 5000));
+    fs.utimesSync(path.join(root, "src", "bin", "Debug", "data.xml"), new Date(), new Date(Date.now() + 5000));
+    const s2 = sourceStamp(path.join(root, "src"));
+    assert.equal(s1, s2, "bin/obj churn must never invalidate the stamp");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("transitiveSourceStamp: a content edit in a dependency changes the referencing stamp", () => {
+  const root = scaffoldDir();
+  try {
+    fs.mkdirSync(path.join(root, "A", "Fixtures"), { recursive: true });
+    fs.mkdirSync(path.join(root, "B"), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, "A", "A.csproj"),
+      '<Project Sdk="Microsoft.NET.Sdk"></Project>'
+    );
+    fs.writeFileSync(path.join(root, "A", "Lib.cs"), "code");
+    fs.writeFileSync(path.join(root, "A", "Fixtures", "data.xml"), "<v>1</v>");
+    fs.writeFileSync(
+      path.join(root, "B", "B.csproj"),
+      '<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><ProjectReference Include="../A/A.csproj" /></ItemGroup></Project>'
+    );
+    fs.writeFileSync(path.join(root, "B", "Tests.cs"), "code");
+    const s1 = transitiveSourceStamp(buildProjectGraph(root), path.join(root, "B", "B.csproj"));
+    fs.writeFileSync(path.join(root, "A", "Fixtures", "data.xml"), "<v>2</v>");
+    fs.utimesSync(path.join(root, "A", "Fixtures", "data.xml"), new Date(), new Date(Date.now() + 5000));
+    const s2 = transitiveSourceStamp(buildProjectGraph(root), path.join(root, "B", "B.csproj"));
+    assert.notEqual(s1, s2, "a content edit in a dependency must change the transitive stamp");
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
