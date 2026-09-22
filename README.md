@@ -47,8 +47,11 @@ and falls back to a minimal rebuild.
    from the VS Code Marketplace, open a .NET repo with test projects.
 2. The Testing panel populates with your tests (classes and methods) and an
    impact map builds in the background.
-3. Save a `.cs` file — affected tests run automatically. Or toggle the
-   continuous-run "eye" on the *Affected tests* profile.
+3. Live testing is on: save a `.cs` file and affected tests run automatically.
+   The **eye** in the Testing toolbar pauses and resumes it — open eye =
+   live, crossed eye = paused. Pausing cancels the in-flight run at once;
+   resuming runs whatever changed while paused. Every new window starts
+   live. (`Impact: Toggle live testing` in the command palette does the same.)
 
 Works with xUnit, NUnit, and MSTest via `dotnet test` / VSTest. Coverage runs
 (native VS Code coverage view) are built in via the *Coverage* profile.

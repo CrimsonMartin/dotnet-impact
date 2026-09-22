@@ -269,22 +269,36 @@ export class HotPatcher {
     }
 
     // Push every delta to every live testhost. A dead pipe (stale pid file,
-    // pid reuse) just drops that host; a live host REFUSING a delta is an
-    // inconsistency and forces the build path + reset.
+    // pid reuse) just drops that host; a live host REFUSING a delta for an
+    // assembly it actually loaded is an inconsistency and forces the build
+    // path + reset. A host whose reference closure doesn't CONTAIN the
+    // delta's assembly answers "not-loaded" (byte 2): a skip — its tests
+    // can't be affected by an assembly it can't even resolve. (One it merely
+    // hasn't touched yet is loaded on demand and patched, so it can never
+    // pick up the stale on-disk dll later.) Treating the skip as a rejection
+    // is what killed the fast path in multi-test-project repos ("rejected
+    // delta for all changes": every save refused by every OTHER project's host).
     let patchedHosts = 0;
+    const survivors: string[] = []; // pid files that stayed live and unrefused
     for (const host of hosts) {
+      const tally: HostPushTally = {
+        host: path.basename(host.pidFile),
+        applied: 0,
+        skipped: 0,
+        rejected: false,
+      };
       let connected = true;
       for (const d of deltas) {
-        let okPush: boolean;
+        let status: number;
         try {
-          okPush = await this.push(host, d).catch(async () => {
+          status = await this.push(host, d).catch(async () => {
             // One retry covers the hook's brief re-accept window.
             await new Promise((r) => setTimeout(r, 120));
             return this.push(host, d);
           });
         } catch (e) {
           connected = false; // dead host: prune registration, skip it
-          this.log(`hotpatch: host ${path.basename(host.pidFile)} unreachable (${(e as Error).message}); pruned`);
+          this.log(`hotpatch: host ${tally.host} unreachable (${(e as Error).message}); pruned`);
           try {
             fs.rmSync(host.pidFile, { force: true });
           } catch {
@@ -292,13 +306,21 @@ export class HotPatcher {
           }
           break;
         }
-        if (!okPush) {
-          this.log(`hotpatch: testhost rejected delta; using build path`);
+        tallyReply(tally, classifyHookReply(status));
+        if (tally.rejected) {
+          this.log(`hotpatch: testhost ${tally.host} rejected delta for ${d.assembly}; using build path`);
           this.reset(); // patched state may now be inconsistent across hosts
           return false;
         }
       }
-      if (connected) patchedHosts++;
+      if (!connected) continue;
+      survivors.push(host.pidFile);
+      if (hostPatched(tally)) patchedHosts++;
+      else if (tally.skipped > 0) {
+        this.log(
+          `hotpatch: host ${tally.host} skipped ${tally.skipped} delta(s) — assemblies not part of that host`
+        );
+      }
     }
     if (deltas.length > 0 && patchedHosts === 0) {
       // Nothing accepted the patch: fresh testhosts would load stale disk
@@ -309,8 +331,12 @@ export class HotPatcher {
     }
     if (deltas.length > 0) {
       this.gen++;
-      for (const host of hosts) {
-        if (fs.existsSync(host.pidFile)) this.hostGen.set(host.pidFile, this.gen);
+      // Every survivor is coherent at the new generation: applied hosts got
+      // the delta; skip-only hosts were never affected by it (the touched
+      // assemblies aren't in them). A mid-epoch host (re)start still shows
+      // up as a NEW pid file and trips the coherence gate as before.
+      for (const pidFile of survivors) {
+        if (fs.existsSync(pidFile)) this.hostGen.set(pidFile, this.gen);
       }
     }
     // A clean emit proves the touched projects compile: clear any squigglies
@@ -361,15 +387,23 @@ export class HotPatcher {
     return hosts;
   }
 
+  /**
+   * Push one delta to one host. Resolves with the hook's RAW reply byte
+   * (1 = applied, 2 = assembly not loaded, 0 = apply failed) — the caller
+   * classifies it via classifyHookReply. Older hooks (pre byte-2) only ever
+   * answer 1 or 0, so "not loaded" degrades to "rejected" there, exactly as
+   * before the protocol change; the hook rebuilds itself on source change,
+   * so byte-2 is live after the first extension update.
+   */
   private push(
     host: { pipeName: string },
     d: { assembly: string; md: Buffer; il: Buffer; pdb: Buffer }
-  ): Promise<boolean> {
+  ): Promise<number> {
     const pipePath =
       process.platform === "win32"
         ? `\\\\.\\pipe\\${host.pipeName}`
         : path.join(os.tmpdir(), `CoreFxPipe_${host.pipeName}`);
-    return new Promise<boolean>((resolve, reject) => {
+    return new Promise<number>((resolve, reject) => {
       const sock = net.connect(pipePath, () => {
         const name = Buffer.from(d.assembly, "utf8");
         const parts: Buffer[] = [];
@@ -382,7 +416,7 @@ export class HotPatcher {
       });
       sock.on("data", (buf) => {
         sock.end();
-        resolve(buf[0] === 1);
+        resolve(buf[0]);
       });
       sock.on("error", reject);
       setTimeout(() => reject(new Error("hotpatch pipe timeout")), 5000);
@@ -564,6 +598,49 @@ export class HotPatcher {
 }
 
 export type { BuildDiagnostic, DiagnosticsEvent };
+
+/**
+ * Per-host tally across one save's multi-delta push. `applied` counts
+ * deltas the host accepted; `skipped` counts deltas for assemblies the host
+ * never loaded (its tests can't be affected by them); `rejected` marks a
+ * genuine apply failure — fatal for the whole save (build path + reset).
+ */
+export interface HostPushTally {
+  host: string;
+  applied: number;
+  skipped: number;
+  rejected: boolean;
+}
+
+/** Fold one host's reply for one delta into its running tally. */
+export function tallyReply(t: HostPushTally, reply: "applied" | "not-loaded" | "rejected"): void {
+  if (reply === "rejected") {
+    t.rejected = true;
+  } else if (reply === "applied") {
+    t.applied++;
+  } else {
+    // The host never loaded this delta's assembly: its tests cannot be
+    // affected by it. A skip, not a failure — rejecting here is what
+    // aborted every multi-project save to the build path.
+    t.skipped++;
+  }
+}
+
+/** A host counts as patched (accepted the save's changes) iff it applied at least one delta. */
+export function hostPatched(t: HostPushTally): boolean {
+  return t.applied > 0;
+}
+
+/**
+ * Map a raw hook reply byte to a push outcome:
+ *   1 = applied · 2 = assembly not loaded (a skip) · anything else = rejected.
+ * Unknown bytes fail safe to rejected (build path), never to "applied".
+ */
+export function classifyHookReply(status: number): "applied" | "not-loaded" | "rejected" {
+  if (status === 1) return "applied";
+  if (status === 2) return "not-loaded";
+  return "rejected";
+}
 
 /**
  * Map a delta-service file path (the compilation runs in the shadow worktree)
