@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.4.9
+
+- Live testing has its own **eye** in the Testing toolbar, and it reads the
+  obvious way: **open eye = live** (saves run affected tests), **crossed
+  eye = paused**. Pausing cancels the in-flight run immediately; resuming
+  runs whatever changed while paused (the cancelled run's files included).
+  Every window starts live. VS Code's built-in continuous-run eye is no
+  longer used — it draws an open eye while off and a crossed eye while on,
+  with fixed tooltips, and an extension cannot change either — so the
+  profile no longer advertises continuous run. `Impact: Toggle live
+  testing` (command id `dotnetImpact.toggleLiveTesting`, formerly
+  `toggleAutoRun`) plus `Pause`/`Resume` commands mirror the eye.
+- The `dotnetImpact.autoRunOnSave` setting is gone: the eye is the single
+  save→run switch. External changes (git checkout/pull) follow it too:
+  they run while live and wait for resume while paused.
+- Fix: a run cancelled by a pause (or a newer save) no longer re-baselines
+  the startup digest, so edits paused away and then closed on still run at
+  the next startup. The Testing view's cancel button now aborts an explicit
+  run.
+- Fix: the "recovering shadow after the previous failed/aborted run" line
+  is gone. A cancelled run needs no recovery: the next `prepare()` always
+  re-mirrors sources, msbuild self-heals a half-built obj, and an aborted
+  build already resets the hot-patch epoch.
+- Fix: the hot-patch push protocol distinguishes "assembly not part of this
+  host" (status 2, a skip) from a genuine apply failure (0). In a repo with
+  several test projects each testhost has only its own reference closure,
+  so the old binary protocol made every other host "reject" a delta and
+  forced the build path for nearly every save. A referenced assembly the
+  host has not loaded yet is loaded on demand and patched rather than
+  skipped, so a host can never pick up the stale on-disk dll later.
+- Status bar: back to the beaker; clicking it shows the Impact output.
+- Tests: the eye's pause/resume/pending semantics and the 3-state push
+  protocol are unit-tested.
+
 ## 0.4.8
 
 - Fix: content files (xml fixtures and other non-code files under

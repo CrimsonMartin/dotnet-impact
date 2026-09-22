@@ -12,6 +12,7 @@ import { cacheDirFor, setDotnetPath, toRepoRelative } from "./core/util";
 import { WarmCoverage } from "./core/coverageSession";
 import { MtpSessionRunner } from "./core/mtpSession";
 import { ExternalChangeBatcher } from "./core/externalWatch";
+import { LiveTesting } from "./core/liveTesting";
 import { HotPatcher } from "./core/hotpatch";
 import { waitForShadowLock, withShadowLock } from "./core/lock";
 import { SessionRunner } from "./core/vstestSession";
@@ -22,8 +23,11 @@ let externalBatcher: ExternalChangeBatcher | undefined;
 let statusBar: vscode.StatusBarItem;
 let output: vscode.OutputChannel;
 let mapBuildCancelled = false;
-/** Active continuous-run sessions; while > 0 the plain auto-run-on-save listener stands down. */
-let continuousSessions = 0;
+/**
+ * The Impact eye (Testing toolbar): open = live testing on, crossed = paused.
+ * Semantics live in core/liveTesting; this is the only save→run switch.
+ */
+let liveTesting: LiveTesting | undefined;
 
 /** Build-error squigglies parsed from failed msbuild output. */
 let buildDiags: vscode.DiagnosticCollection | undefined;
@@ -121,6 +125,37 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   updateStatus("idle");
   statusBar.show();
 
+  // The Impact eye. VS Code's own continuous-run eye is deliberately NOT
+  // used: it draws an open eye while OFF and a crossed eye while ON, with
+  // fixed tooltips, and an extension cannot change either. This one is
+  // contributed to the same toolbar (package.json view/title) and driven by
+  // the dotnetImpact.liveTesting context key, so the glyph reads the obvious
+  // way: open eye = live, crossed eye = paused.
+  liveTesting = new LiveTesting({
+    run: (files) =>
+      void executeRun(new vscode.TestRunRequest(), files).catch((e) =>
+        output.appendLine(`live testing run failed: ${String(e)}`)
+      ),
+    abortInFlight: () => {
+      const run = activeRun;
+      if (!run) return null;
+      run.ctrl.abort();
+      return { files: run.files };
+    },
+    onChange: (on) => {
+      void vscode.commands.executeCommand("setContext", "dotnetImpact.liveTesting", on);
+      updateStatus(on ? "live testing on" : "live testing paused");
+      output.appendLine(
+        on
+          ? "live testing: ON — changes made while paused run now; saves run affected tests"
+          : "live testing: PAUSED — in-flight run cancelled; changes wait for resume"
+      );
+    },
+    debounceMs: () => vscode.workspace.getConfiguration("dotnetImpact").get<number>("debounceMs", 1500),
+  });
+  void vscode.commands.executeCommand("setContext", "dotnetImpact.liveTesting", true);
+  context.subscriptions.push({ dispose: () => liveTesting?.dispose() });
+
   controller = vscode.tests.createTestController("dotnetImpact", "Impact (affected tests)");
   context.subscriptions.push(controller, statusBar, output);
 
@@ -132,13 +167,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // view's Run All execute every test twice. Non-default keeps Impact's tree
   // runnable explicitly while Dev Kit owns Run All.
   const devKitPresent = !!vscode.extensions.getExtension("ms-dotnettools.csdevkit");
-  const profile = controller.createRunProfile(
+  // No supportsContinuousRun: the Impact eye above is the live-testing switch.
+  controller.createRunProfile(
     "Affected tests",
     vscode.TestRunProfileKind.Run,
     (request, token) => runHandler(request, token),
     !devKitPresent
   );
-  profile.supportsContinuousRun = true;
 
   // Explicit "run with coverage" (the button Dev Kit users lose): collector
   // run feeding VS Code's native coverage view. Never the default profile —
@@ -160,32 +195,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       output.appendLine(`impact map: ${runner!.map.classCount} test classes mapped`);
       output.appendLine(`discovered: ${classOwners.size} test classes`);
     }),
-    vscode.commands.registerCommand("dotnetImpact.toggleAutoRun", async () => {
-      const cfg = vscode.workspace.getConfiguration("dotnetImpact");
-      await cfg.update("autoRunOnSave", !cfg.get<boolean>("autoRunOnSave", true));
-    })
+    vscode.commands.registerCommand("dotnetImpact.pauseLiveTesting", () => liveTesting?.pause()),
+    vscode.commands.registerCommand("dotnetImpact.resumeLiveTesting", () => liveTesting?.resume()),
+    vscode.commands.registerCommand("dotnetImpact.toggleLiveTesting", () => liveTesting?.toggle())
   );
 
-  // Auto-run on save outside of an explicit continuous-run session, if enabled.
-  let debounce: NodeJS.Timeout | undefined;
-  const pending = new Set<string>();
   context.subscriptions.push(
     vscode.workspace.onDidSaveTextDocument((doc) => {
       if (!/\.(cs|razor|cshtml)$/i.test(doc.fileName)) return;
       // Recorded unconditionally: the save's own watcher echo must never
-      // masquerade as an external change, whatever the settings say.
+      // masquerade as an external change, paused or not.
       externalBatcher?.noteSave(doc.fileName);
-      if (continuousSessions > 0) return; // continuous run already watches saves
-      if (!vscode.workspace.getConfiguration("dotnetImpact").get<boolean>("autoRunOnSave", true))
-        return;
-      pending.add(doc.fileName);
-      if (debounce) clearTimeout(debounce);
-      const ms = vscode.workspace.getConfiguration("dotnetImpact").get<number>("debounceMs", 300);
-      debounce = setTimeout(() => {
-        const files = [...pending];
-        pending.clear();
-        void executeRun(new vscode.TestRunRequest(), files);
-      }, ms);
+      liveTesting?.noteSave(doc.fileName);
     })
   );
 
@@ -206,9 +227,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     isDirtyInEditor: (abs) =>
       vscode.workspace.textDocuments.some((d) => d.uri.fsPath === abs && d.isDirty),
     onBatch: (files) => {
-      if (continuousSessions > 0) return;
-      output.appendLine(`external change: ${files.length} file(s) — running affected`);
-      void executeRun(new vscode.TestRunRequest(), files);
+      output.appendLine(
+        `external change: ${files.length} file(s) — ${
+          liveTesting?.on ? "running affected" : "queued until live testing resumes"
+        }`
+      );
+      liveTesting?.noteChanged(files);
     },
   });
   const fsWatcher = vscode.workspace.createFileSystemWatcher("**/*.{cs,razor,cshtml}");
@@ -443,22 +467,7 @@ async function runHandler(
   token: vscode.CancellationToken
 ): Promise<void> {
   if (!runner || !controller) return;
-
-  if (request.continuous) {
-    // Native continuous run: watch saves until the user toggles the eye off.
-    continuousSessions++;
-    const listener = vscode.workspace.onDidSaveTextDocument(async (doc) => {
-      if (!/\.(cs|razor|cshtml)$/i.test(doc.fileName)) return;
-      await executeRun(request, [doc.fileName]);
-    });
-    token.onCancellationRequested(() => {
-      continuousSessions--;
-      listener.dispose();
-    });
-    return;
-  }
-
-  await executeRun(request, undefined);
+  await executeRun(request, undefined, token);
 }
 
 /** Per-run line coverage details, served lazily via loadDetailedCoverage. */
@@ -478,10 +487,14 @@ let runChain: Promise<void> = Promise.resolve();
 let refreshAbort: AbortController | undefined;
 let refreshing = false;
 
-/** Run either explicitly requested test items, or the affected set for changed files. */
+/**
+ * Run either explicitly requested test items, or the affected set for changed
+ * files. `token` is the Testing view's cancel button for explicit runs.
+ */
 async function executeRun(
   request: vscode.TestRunRequest,
-  changedFiles: string[] | undefined
+  changedFiles: string[] | undefined,
+  token?: vscode.CancellationToken
 ): Promise<void> {
   if (!runner || !controller) return;
 
@@ -495,6 +508,7 @@ async function executeRun(
     }
   }
   const ctrl = new AbortController();
+  token?.onCancellationRequested(() => ctrl.abort());
   const mine = { ctrl, files: changedFiles };
   activeRun = mine;
 
@@ -525,6 +539,8 @@ async function doRun(
     return;
   }
   try {
+    // prepare() re-mirrors the real repo's uncommitted state every time, so a
+    // run cancelled mid-build (pause, newer save) needs no special recovery.
     await runner!.prepare();
     let affected: AffectedSet;
     if (changedFiles) {
@@ -585,8 +601,10 @@ async function doRun(
     output.appendLine(String(e));
   } finally {
     // This session has now seen the tree as it stands; without re-baselining,
-    // edits tested here would look like out-of-session changes next startup (#33).
-    runner?.recordSourceDigest();
+    // edits tested here would look like out-of-session changes next startup
+    // (#33). A cancelled run saw nothing: its edits stay "unseen", so a pause
+    // followed by a window close still runs them at the next startup.
+    if (!signal.aborted) runner?.recordSourceDigest();
     releaseLock();
     run.end();
   }
@@ -641,7 +659,6 @@ async function doCoverageRun(request: vscode.TestRunRequest, signal: AbortSignal
     const result = await runner!.runCoverage(affected, signal, (partial) =>
       reportOutcomes(run, partial, reported)
     );
-
     if (result.cancelled) {
       updateStatus("superseded");
     } else {
@@ -669,8 +686,10 @@ async function doCoverageRun(request: vscode.TestRunRequest, signal: AbortSignal
     output.appendLine(String(e));
   } finally {
     // This session has now seen the tree as it stands; without re-baselining,
-    // edits tested here would look like out-of-session changes next startup (#33).
-    runner?.recordSourceDigest();
+    // edits tested here would look like out-of-session changes next startup
+    // (#33). A cancelled run saw nothing: its edits stay "unseen", so a pause
+    // followed by a window close still runs them at the next startup.
+    if (!signal.aborted) runner?.recordSourceDigest();
     releaseLock();
     run.end();
   }

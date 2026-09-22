@@ -7,7 +7,17 @@
 // code with no rebuild and no testhost restart.
 //
 // Frame (little-endian lengths): [nameLen][utf8 assembly simple name]
-//   [mdLen][md] [ilLen][il] [pdbLen][pdb]  ->  reply: 1 byte (1 ok, 0 fail)
+//   [mdLen][md] [ilLen][il] [pdbLen][pdb]  ->  reply: 1 byte
+//     1 = applied · 2 = assembly not part of this host (a skip for the
+//         caller, NOT a failure) · 0 = apply failed. The distinction
+//         matters: in a repo with several test projects each testhost only
+//         has ITS project's reference closure, and a single failure byte
+//         made every such host "reject" deltas meant for other projects,
+//         forcing the build path for every save outside shared bottom libs.
+//
+// An assembly that is referenced but not loaded YET is loaded on demand and
+// patched (1), never skipped: a skip would let the host pick up the stale
+// on-disk dll later and run old code without anyone knowing.
 //
 // The pipe name comes from IMPACT_HOTPATCH_PIPE; without it the hook is inert.
 
@@ -71,6 +81,27 @@ internal sealed class StartupHook
         }
     }
 
+    /// <summary>
+    /// The loaded assembly with this simple name, or — when the host has not
+    /// touched it yet — the result of resolving it through the host's own
+    /// probing (testhost runs with the test project's deps.json, so every
+    /// referenced assembly resolves). Null only when it is not referenced.
+    /// </summary>
+    private static Assembly? FindOrLoad(string name)
+    {
+        var loaded = AppDomain.CurrentDomain.GetAssemblies()
+            .FirstOrDefault(a => string.Equals(a.GetName().Name, name, StringComparison.OrdinalIgnoreCase));
+        if (loaded != null) return loaded;
+        try
+        {
+            return Assembly.Load(new AssemblyName(name));
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     private static void Serve(string pipeName)
     {
         // .NET on Unix unlinks the pipe's socket file when a connection is
@@ -116,20 +147,27 @@ internal sealed class StartupHook
                 {
                     return; // client hung up
                 }
-                byte status = 0;
-                try
+                byte status;
+                var asm = FindOrLoad(name);
+                if (asm == null)
                 {
-                    var asm = AppDomain.CurrentDomain.GetAssemblies()
-                        .FirstOrDefault(a => string.Equals(a.GetName().Name, name, StringComparison.OrdinalIgnoreCase));
-                    if (asm != null)
+                    // Not in this host's reference closure: its tests can't
+                    // be affected by the delta. Say so explicitly, so the
+                    // caller skips this host instead of aborting the save.
+                    status = 2;
+                }
+                else
+                {
+                    status = 0;
+                    try
                     {
                         MetadataUpdater.ApplyUpdate(asm, md, il, pdb);
                         status = 1;
                     }
-                }
-                catch (Exception e)
-                {
-                    Console.Error.WriteLine($"[impact-hotpatch] apply failed for {name}: {e.Message}");
+                    catch (Exception e)
+                    {
+                        Console.Error.WriteLine($"[impact-hotpatch] apply failed for {name}: {e.Message}");
+                    }
                 }
                 writer.Write(status);
                 writer.Flush();

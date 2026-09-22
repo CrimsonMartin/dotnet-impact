@@ -47,11 +47,17 @@ and falls back to a minimal rebuild.
    from the VS Code Marketplace, open a .NET repo with test projects.
 2. The Testing panel populates with your tests (classes and methods) and an
    impact map builds in the background.
-3. Save a `.cs` file — affected tests run automatically. Or toggle the
-   continuous-run "eye" on the *Affected tests* profile.
+3. Live testing is on: save a `.cs` file and affected tests run automatically.
+   The **eye** in the Testing toolbar pauses and resumes it — open eye =
+   live, crossed eye = paused. Pausing cancels the in-flight run at once;
+   resuming runs whatever changed while paused. Every new window starts
+   live. (`Impact: Toggle live testing` in the command palette does the same.)
 
-Works with xUnit, NUnit, and MSTest via `dotnet test` / VSTest. Coverage runs
-(native VS Code coverage view) are built in via the *Coverage* profile.
+Works with xUnit, NUnit, and MSTest, both classic VSTest projects and
+Microsoft.Testing.Platform apps (xunit.v3, MSTest.Sdk, the native NUnit/MSTest
+runners). Coverage runs (native VS Code coverage view) are built in via the
+*Coverage* profile; `Impact: Run affected tests now` runs everything
+uncommitted on demand.
 
 The first run on a repo pays a one-time setup: a full build, the impact map,
 and a small local build of the helper services. After that, saves are fast.
@@ -62,11 +68,16 @@ The same engine ships as a CLI for hooks and coding agents:
 
 ```
 impact build-map                  # build or refresh the map (background/overnight)
+impact build-map --if-missing     # no-op when a map already exists (CI warmer)
 impact affected [file ...]        # print affected test classes (--format json for scripts)
 impact run [file ...]             # run affected tests; exit 1 on failure
 impact run --staged               # pre-commit mode (index only)
 impact run --base <ref>           # everything the branch changed
+impact status                     # map size and learned bindings
 ```
+
+With no files and no `--base`/`--staged`, `affected` and `run` use the dirty
+tree (everything uncommitted).
 
 Exit codes are the contract: 0 pass/nothing affected, 1 failure, 2 usage.
 Infrastructure never blocks a commit — no map yet or shadow busy warns and
@@ -100,9 +111,31 @@ Actions workflow: [docs/ci.md](docs/ci.md).
   tests the map doesn't predict. Non-`.cs` and unmapped files fall back to
   project-level selection.
 - `.csproj` / config edits use the project-graph fallback, not the map.
-- A changed **public/internal signature** always takes the rebuild path:
-  hot-patching it would leave dependent assemblies green against an API that
-  no longer compiles, so Impact refuses and rebuilds instead.
+- A changed **public/internal signature** takes the rebuild path unless every
+  project that consumes it is already in the hot-patch session (has a
+  baseline from an earlier build). With all consumers present the engine
+  recompiles them as part of the same delta; with any consumer missing it
+  refuses, because a hot patch would leave that assembly green against an
+  API that no longer compiles.
+
+## Settings
+
+All under `dotnetImpact.*`; defaults shown.
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `debounceMs` | `1500` | Quiet time after the last save before affected tests run. |
+| `watchExternalChanges` | `true` | Also run on changes that land on disk without a save (git checkout/pull, other editors). |
+| `externalDebounceMs` | `1000` | Burst window for those external changes: one git operation becomes one run. |
+| `persistentTestSessions` | `true` | Keep warm testhosts alive between runs (the hot-patch fast path needs this). |
+| `autoBuildMap` | `true` | Build/refresh the impact map in the background when unmapped test classes exist. |
+| `liveMapRefresh` | `true` | After each run, re-measure coverage for the classes that ran to keep map rows fresh. |
+| `warmCoverageRefresh` | `true` | Collect that coverage through a resident `dotnet-coverage` session (installed on first use). |
+| `learnedBindings` | `true` | Apply binding edges learned from coverage (DI implementations etc.) when selecting tests; only ever adds tests. |
+| `surfaceBuildWarnings` | `"auto"` | Show build warnings as squigglies; `auto` = only when the C# extension isn't installed. Errors always show. |
+| `testProjectGlobs` | `["**/*Test*.csproj", "**/*.Tests.csproj"]` | Which csproj files count as test projects. |
+| `dotnetPath` | `""` | Explicit `dotnet` executable; empty = auto-detect. |
+| `maxParallelCoverageRuns` | `0` | Parallel `--list-tests` discovery runs; `0` = cores minus 2, max 12. |
 
 ## Development
 
@@ -112,6 +145,9 @@ npm run compile     # or: npm run watch
 npm test            # unit tests (node --test)
 ```
 
-Launch with F5 (Extension Development Host). All state lives under
-`~/.impact/<repo>-<hash>/` — delete that folder to reset everything (then
-`git worktree prune` in the repo).
+Launch with F5 (Extension Development Host). To try a build in your normal
+VS Code instead: `npx @vscode/vsce package` then
+`code --install-extension impact-*.vsix --force` and reload the window.
+
+All state lives under `~/.impact/<repo>-<hash>/` — delete that folder to
+reset everything (then `git worktree prune` in the repo).
