@@ -22,10 +22,10 @@ jobs:
     runs-on: ubuntu-latest
     environment: release # must match the federated credential subject
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
       - run: npm ci
       - run: npm test
@@ -35,7 +35,7 @@ jobs:
         run: npx --yes @vscode/vsce package
 
       - name: Azure login (OIDC)
-        uses: azure/login@v2
+        uses: azure/login@v3
         with:
           client-id: 15353807-34d4-4f16-8eab-1f73d0fc4eb2
           tenant-id: 618712c8-62d0-4426-a07d-b93f6b32e08b
@@ -70,7 +70,7 @@ jobs:
           npx --yes ovsx publish *.vsix -p "$OVSX_TOKEN"
 
       - name: Attach vsix to GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: "*.vsix"
           generate_release_notes: true
