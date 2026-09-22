@@ -151,7 +151,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           : "live testing: PAUSED — in-flight run cancelled; changes wait for resume"
       );
     },
-    debounceMs: () => vscode.workspace.getConfiguration("dotnetImpact").get<number>("debounceMs", 300),
+    debounceMs: () => vscode.workspace.getConfiguration("dotnetImpact").get<number>("debounceMs", 1500),
   });
   void vscode.commands.executeCommand("setContext", "dotnetImpact.liveTesting", true);
   context.subscriptions.push({ dispose: () => liveTesting?.dispose() });

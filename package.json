@@ -146,11 +146,6 @@
           "type": "number",
           "default": 0,
           "description": "Concurrent 'dotnet test --list-tests' runs during test discovery. 0 = auto (cores minus 2, max 12). Map building itself is static analysis and needs no throttle."
-        },
-        "dotnetImpact\\": {
-          "debounceMs": {
-            "default": 300
-          }
         }
       }
     }
