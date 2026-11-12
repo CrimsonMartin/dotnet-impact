@@ -157,7 +157,7 @@
     "vscode:prepublish": "npm run compile"
   },
   "dependencies": {
-    "fast-xml-parser": "^5.11.0"
+    "fast-xml-parser": "^5.12.0"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
